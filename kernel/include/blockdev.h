@@ -1,0 +1,27 @@
+#pragma once
+#include "kernel.h"
+
+struct blockdev {
+    char name[16];
+    char model[48];
+    uint64_t sectors;
+    uint32_t sector_size;
+    uint64_t start_lba;              /* partition offset within parent */
+    struct blockdev *parent;
+    int (*read)(struct blockdev *d, uint64_t lba, uint32_t count, void *buf);
+    int (*write)(struct blockdev *d, uint64_t lba, uint32_t count, const void *buf);
+    void *priv;
+    const char *fs_type;
+    const char *bus;                 /* "SATA" / "NVMe" */
+    struct vnode *vn;
+};
+void blockdev_register(struct blockdev *d);   /* registers the disk, scans partitions */
+int blockdev_count(void);
+struct blockdev *blockdev_at(int i);
+struct blockdev *blockdev_find(const char *name);
+int blockdev_read(struct blockdev *d, uint64_t lba, uint32_t count, void *buf);
+int blockdev_write(struct blockdev *d, uint64_t lba, uint32_t count, const void *buf);
+int blockdev_read_bytes(struct blockdev *d, uint64_t off, void *buf, size_t n);
+int blockdev_write_bytes(struct blockdev *d, uint64_t off, const void *buf, size_t n);
+void ahci_init(void);
+void nvme_init(void);

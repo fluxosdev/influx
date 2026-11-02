@@ -1,0 +1,18 @@
+# build output
+/build/
+*.o
+*.d
+*.elf
+*.iso
+*.img
+*.fnt
+*.tar
+
+# editor / OS junk
+.vscode/
+.idea/
+*.swp
+*~
+.DS_Store
+compile_commands.json
+.cache/
