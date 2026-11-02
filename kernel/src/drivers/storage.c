@@ -1,3 +1,4 @@
+#include "audio.h"
 #include "blockdev.h"
 #include "fs.h"
 #include "string.h"
@@ -7,7 +8,7 @@
 struct vnode *btrfs_mount(struct blockdev *d);
 struct vnode *fat32_mount(struct blockdev *d);
 
-void drivers_init(void) { gpu_init(); }
+void drivers_init(void) { gpu_init(); audio_init(); }
 
 void storage_init(void) {
     extern void fb_boot_progress(const char *);
@@ -24,7 +25,7 @@ void storage_init(void) {
         if (!root) root = fat32_mount(d);
         if (!root) continue;
         char mp[64];
-        snprintf(mp, sizeof mp, "/mnt/%s", d->name);
+        snprintf(mp, sizeof mp, d->esp ? "/mnt/.%s" : "/mnt/%s", d->name);   /* dot-name hides the ESP */
         vfs_mkdir("/mnt");
         /* an installed inFlux root volume becomes the persistent home directory */
         struct vnode *marker = NULL;

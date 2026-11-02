@@ -40,6 +40,12 @@ void idt_init(void) {
 
 void irq_register(uint8_t vec, irq_handler_t h, void *ctx) { handlers[vec].h = h; handlers[vec].ctx = ctx; }
 
+/* 0x20-0x2F legacy IRQs, 0x40 the LAPIC timer; devices get 0x50 and up */
+int irq_alloc_vector(void) {
+    static int next = 0x50;
+    return next < 0xF0 ? next++ : 0;
+}
+
 static void dump_regs(struct regs *r) {
     kprintf("RIP=%016lx CS=%04lx RFLAGS=%08lx RSP=%016lx SS=%04lx\n", r->rip, r->cs, r->rflags, r->rsp, r->ss);
     kprintf("RAX=%016lx RBX=%016lx RCX=%016lx RDX=%016lx\n", r->rax, r->rbx, r->rcx, r->rdx);
@@ -64,6 +70,10 @@ void isr_dispatch(struct regs *r) {
         if (current_thread) kprintf("thread '%s' pid %d\n", current_thread->name, current_thread->proc ? current_thread->proc->pid : -1);
         panic("unhandled exception");
     }
+    /* the interrupted thread's vector registers are live and unsaved (simd_ok) */
+    struct thread *t = current_thread;
+    if (t) t->irq_depth++;
     if (handlers[r->int_no].h) handlers[r->int_no].h(r, handlers[r->int_no].ctx);
     else if (r->int_no != VEC_SPURIOUS) { lapic_eoi(); }
+    if (t) t->irq_depth--;
 }

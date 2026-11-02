@@ -90,6 +90,8 @@ static void add_dev(struct blockdev *d) {
     kprintf("blockdev: /dev/%s %s%s%s (%s)\n", d->name, d->parent ? "partition of " : "", d->parent ? d->parent->name : d->model, d->parent ? "" : "", sz);
 }
 
+static const uint8_t GUID_ESP[16] = { 0x28, 0x73, 0x2A, 0xC1, 0x1F, 0xF8, 0xD2, 0x11, 0xBA, 0x4B, 0x00, 0xA0, 0xC9, 0x3E, 0xC9, 0x3B };
+
 static void scan_partitions(struct blockdev *d) {
     uint8_t *sec = kmalloc(d->sector_size * 2);
     if (blockdev_read(d, 1, 1, sec) == 0 && !memcmp(sec, "EFI PART", 8)) {
@@ -105,7 +107,7 @@ static void scan_partitions(struct blockdev *d) {
                 struct blockdev *p = kzalloc(sizeof *p);
                 snprintf(p->name, sizeof p->name, "%s%s%d", d->name, isdigit(d->name[strlen(d->name) - 1]) ? "p" : "", idx++);
                 p->parent = d; p->start_lba = e->first; p->sectors = e->last - e->first + 1; p->sector_size = d->sector_size;
-                p->read = d->read; p->write = d->write; p->bus = d->bus;
+                p->read = d->read; p->write = d->write; p->bus = d->bus; p->esp = !memcmp(e->type, GUID_ESP, 16);
                 for (int k = 0; k < 36 && e->name[k] && k < 47; k++) p->model[k] = (char)e->name[k];
                 add_dev(p);
             }
@@ -119,7 +121,7 @@ static void scan_partitions(struct blockdev *d) {
             struct blockdev *p = kzalloc(sizeof *p);
             snprintf(p->name, sizeof p->name, "%s%s%d", d->name, isdigit(d->name[strlen(d->name) - 1]) ? "p" : "", i + 1);
             p->parent = d; p->start_lba = start; p->sectors = count; p->sector_size = d->sector_size;
-            p->read = d->read; p->write = d->write; p->bus = d->bus;
+            p->read = d->read; p->write = d->write; p->bus = d->bus; p->esp = e[4] == 0xEF;
             snprintf(p->model, sizeof p->model, "MBR type 0x%02x", e[4]);
             add_dev(p);
         }

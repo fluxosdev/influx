@@ -1,5 +1,7 @@
 #include "arch.h"
+#include "acpi.h"
 #include "io.h"
+#include "string.h"
 
 static struct pci_device devices[64];
 static int ndev;
@@ -30,6 +32,8 @@ static void probe(uint8_t bus, uint8_t slot, uint8_t func) {
     d->class_code = cls >> 24; d->subclass = (cls >> 16) & 0xFF; d->prog_if = (cls >> 8) & 0xFF;
     d->irq_line = pci_read32(bus, slot, func, 0x3C) & 0xFF;
     uint8_t hdr = (pci_read32(bus, slot, func, 0x0C) >> 16) & 0x7F;
+    d->header_type = hdr;
+    if (hdr == 1) d->secondary_bus = (pci_read32(bus, slot, func, 0x18) >> 8) & 0xFF;
     int nbars = hdr == 0 ? 6 : 2;
     for (int i = 0; i < nbars; i++) {
         uint32_t b = pci_read32(bus, slot, func, 0x10 + i * 4);
@@ -68,6 +72,71 @@ void pci_enable_bus_master(struct pci_device *d) {
     cmd |= (1 << 2) | (1 << 1) | (1 << 0);   /* bus master, memory, io */
     cmd &= ~(1 << 10);                        /* enable INTx */
     pci_write16(d->bus, d->slot, d->func, 4, cmd);
+}
+
+uint8_t pci_find_cap(struct pci_device *d, uint8_t id) {
+    if (!(pci_read16(d->bus, d->slot, d->func, 0x06) & (1 << 4))) return 0;
+    uint8_t p = pci_read32(d->bus, d->slot, d->func, 0x34) & 0xFC;
+    for (int guard = 0; p && guard < 48; guard++) {
+        uint32_t v = pci_read32(d->bus, d->slot, d->func, p);
+        if ((v & 0xFF) == id) return p;
+        p = (v >> 8) & 0xFC;
+    }
+    return 0;
+}
+
+/* INTx lines can be shared, so every installed handler goes through a
+ * dispatcher that calls all handlers on the vector and then sends the EOI. */
+struct pci_irq { uint32_t gsi; bool msi; int vector, n; irq_handler_t h[4]; void *ctx[4]; };
+static struct pci_irq pirqs[16];
+static int npirqs;
+
+static void pci_irq_dispatch(struct regs *r, void *p) {
+    struct pci_irq *pi = p;
+    for (int i = 0; i < pi->n; i++) pi->h[i](r, pi->ctx[i]);
+    lapic_eoi();
+}
+
+static struct pci_irq *pirq_new(void) {
+    if (npirqs >= (int)ARRAY_LEN(pirqs)) return NULL;
+    struct pci_irq *pi = &pirqs[npirqs];
+    if (!(pi->vector = irq_alloc_vector())) return NULL;
+    npirqs++;
+    irq_register(pi->vector, pci_irq_dispatch, pi);
+    return pi;
+}
+
+bool pci_irq_install(struct pci_device *d, irq_handler_t h, void *ctx, bool allow_msi, char *how, size_t how_len) {
+    uint8_t msi = allow_msi ? pci_find_cap(d, 0x05) : 0;
+    if (msi) {
+        struct pci_irq *pi = pirq_new();
+        if (!pi) { snprintf(how, how_len, "no free vector"); return false; }
+        pi->msi = true; pi->h[0] = h; pi->ctx[0] = ctx; pi->n = 1;
+        uint16_t ctl = pci_read16(d->bus, d->slot, d->func, msi + 2);
+        pci_write32(d->bus, d->slot, d->func, msi + 4, 0xFEE00000u | (lapic_id() << 12));
+        if (ctl & (1 << 7)) { pci_write32(d->bus, d->slot, d->func, msi + 8, 0); pci_write16(d->bus, d->slot, d->func, msi + 12, pi->vector); }
+        else pci_write16(d->bus, d->slot, d->func, msi + 8, pi->vector);
+        pci_write16(d->bus, d->slot, d->func, msi + 2, (ctl & ~(7 << 4)) | 1);   /* one vector, enabled */
+        pci_write16(d->bus, d->slot, d->func, 4, pci_read16(d->bus, d->slot, d->func, 4) | (1 << 10));   /* INTx off */
+        snprintf(how, how_len, "MSI, vector 0x%x", pi->vector);
+        return true;
+    }
+    uint8_t pin = (pci_read32(d->bus, d->slot, d->func, 0x3C) >> 8) & 0xFF;
+    struct acpi_irq_route rt;
+    if (!pin) { snprintf(how, how_len, "no interrupt pin"); return false; }
+    if (!acpi_pci_route(d->bus, d->slot, d->func, pin, &rt)) { snprintf(how, how_len, "INT%c not routed by ACPI", 'A' + pin - 1); return false; }
+    struct pci_irq *pi = NULL;
+    for (int i = 0; i < npirqs; i++) if (!pirqs[i].msi && pirqs[i].gsi == rt.gsi && pirqs[i].n < 4) pi = &pirqs[i];
+    if (!pi) {
+        if (!(pi = pirq_new())) { snprintf(how, how_len, "no free vector"); return false; }
+        pi->gsi = rt.gsi;
+        if (!ioapic_route_gsi(rt.gsi, pi->vector, rt.level, rt.active_low)) { snprintf(how, how_len, "GSI %u outside the I/O APIC", rt.gsi); return false; }
+    }
+    uint64_t fl = irq_save();
+    pi->h[pi->n] = h; pi->ctx[pi->n] = ctx; pi->n++;
+    irq_restore(fl);
+    snprintf(how, how_len, "INT%c, GSI %u (%s, active %s)", 'A' + pin - 1, rt.gsi, rt.level ? "level" : "edge", rt.active_low ? "low" : "high");
+    return true;
 }
 
 const char *pci_class_name(uint8_t cls, uint8_t sub) {

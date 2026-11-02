@@ -1,7 +1,8 @@
 #include "string.h"
 #include "mm.h"
+#include "simd.h"
 
-void *memcpy(void *dst, const void *src, size_t n) {
+static void *memcpy_scalar(void *dst, const void *src, size_t n) {
     uint8_t *d = dst; const uint8_t *s = src;
     if (n >= 8 && !(((uintptr_t)d | (uintptr_t)s) & 7)) {
         uint64_t *d8 = (uint64_t *)d; const uint64_t *s8 = (const uint64_t *)s;
@@ -11,15 +12,21 @@ void *memcpy(void *dst, const void *src, size_t n) {
     while (n--) *d++ = *s++;
     return dst;
 }
+void *memcpy(void *dst, const void *src, size_t n) {
+    if (n >= SIMD_MIN_BYTES && simd_ok()) { simd_memcpy(dst, src, n); return dst; }
+    return memcpy_scalar(dst, src, n);
+}
 void *memmove(void *dst, const void *src, size_t n) {
     uint8_t *d = dst; const uint8_t *s = src;
     if (d == s || n == 0) return dst;
-    if (d < s || d >= s + n) return memcpy(dst, src, n);
+    if (d >= s + n || s >= d + n) return memcpy(dst, src, n);
+    if (d < s) return memcpy_scalar(dst, src, n);   /* forward copy is safe; the SIMD one is not */
     d += n; s += n;
     while (n--) *--d = *--s;
     return dst;
 }
 void *memset(void *dst, int c, size_t n) {
+    if (n >= SIMD_MIN_BYTES && simd_ok()) { simd_memset(dst, c, n); return dst; }
     uint8_t *d = dst; uint8_t v = (uint8_t)c;
     if (n >= 8 && !((uintptr_t)d & 7)) {
         uint64_t v8 = 0x0101010101010101ULL * v;
@@ -30,7 +37,10 @@ void *memset(void *dst, int c, size_t n) {
     while (n--) *d++ = v;
     return dst;
 }
-void memset32(uint32_t *dst, uint32_t v, size_t count) { while (count--) *dst++ = v; }
+void memset32(uint32_t *dst, uint32_t v, size_t count) {
+    if (count >= 16 && !((uintptr_t)dst & 3) && simd_ok()) { simd_memset32(dst, v, count); return; }
+    while (count--) *dst++ = v;
+}
 int memcmp(const void *a, const void *b, size_t n) {
     const uint8_t *x = a, *y = b;
     for (size_t i = 0; i < n; i++) if (x[i] != y[i]) return x[i] - y[i];

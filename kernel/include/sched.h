@@ -30,7 +30,9 @@ struct thread {
     struct list_head sched_link;  /* run queue / sleep list / wait queue */
     struct list_head proc_link;   /* process thread list */
     struct list_head all_link;
-    uint8_t fxsave[512] ALIGNED(16);
+    uint8_t *fpu;                 /* x87/SSE/AVX state (XSAVE or FXSAVE image) */
+    void *fpu_mem;                /* allocation backing 'fpu' */
+    int irq_depth;                /* nested interrupt handlers running on this thread */
     uint64_t user_rip, user_rsp;  /* initial user-mode entry */
     int exit_code;
     struct waitq *waiting_on;

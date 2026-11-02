@@ -10,6 +10,18 @@ typedef uint32_t color_t;   /* 0xAARRGGBB, straight alpha */
 #define BLUE(c)  ((c) & 0xFF)
 #define WITH_ALPHA(c, a) (((c) & 0x00FFFFFF) | ((uint32_t)(a) << 24))
 
+/* src over dst with alpha a (0..255); the SIMD spans in simd.c match this bit for bit */
+static inline color_t blend_px(color_t dst, color_t src, uint32_t a) {
+    if (a == 0) return dst;
+    if (a >= 255) return src | 0xFF000000u;
+    uint32_t ia = 255 - a;
+    uint32_t rb = ((src & 0x00FF00FF) * a + (dst & 0x00FF00FF) * ia) >> 8;
+    uint32_t g  = ((src & 0x0000FF00) * a + (dst & 0x0000FF00) * ia) >> 8;
+    uint32_t da = ALPHA(dst);
+    uint32_t oa = a + ((da * ia) >> 8);
+    return (oa << 24) | (rb & 0x00FF00FF) | (g & 0x0000FF00);
+}
+
 struct rect { int x, y, w, h; };
 static inline struct rect rect_make(int x, int y, int w, int h) { struct rect r = { x, y, w, h }; return r; }
 static inline bool rect_contains(struct rect r, int x, int y) { return x >= r.x && y >= r.y && x < r.x + r.w && y < r.y + r.h; }
@@ -60,9 +72,11 @@ void gfx_blit_tinted(struct canvas *dst, int x, int y, const struct canvas *src,
 void gfx_blit_scaled_tinted(struct canvas *dst, int x, int y, int w, int h, const struct canvas *src, color_t tint);
 void gfx_blit_rounded(struct canvas *dst, int x, int y, const struct canvas *src, int radius, int corner_mask);
 void gfx_shadow(struct canvas *c, int x, int y, int w, int h, int radius, int spread, int max_alpha);
+void gfx_shadow_outside(struct canvas *c, struct rect r, int radius, int spread, int max_alpha, int dy);
 void gfx_shadow_ex(struct canvas *c, int x, int y, int w, int h, int radius, int spread, int max_alpha, struct rect skip);
 void gfx_copy_rect(struct canvas *dst, int dx, int dy, const struct canvas *src, int sx, int sy, int w, int h);
 void gfx_blur_rect(struct canvas *c, struct rect r, int radius);
+void gfx_blur_rect_rounded(struct canvas *c, struct rect r, int radius, int corner_radius);
 
 /* fonts */
 struct font;
@@ -76,6 +90,7 @@ int font_text_width(const struct font *f, const char *s);
 int font_text_width_n(const struct font *f, const char *s, size_t n);
 int font_draw(struct canvas *c, const struct font *f, int x, int y, color_t col, const char *s);   /* y = top of line box; returns width */
 int font_draw_n(struct canvas *c, const struct font *f, int x, int y, color_t col, const char *s, size_t n);
+int font_draw_oblique_n(struct canvas *c, const struct font *f, int x, int y, color_t col, const char *s, size_t n);   /* synthesized italic */
 int font_draw_ellipsized(struct canvas *c, const struct font *f, int x, int y, int maxw, color_t col, const char *s);
 void font_draw_centered(struct canvas *c, const struct font *f, struct rect r, color_t col, const char *s);
 void font_draw_aligned(struct canvas *c, const struct font *f, struct rect r, color_t col, const char *s, int align); /* 0 left,1 center,2 right; vertically centered */
@@ -92,6 +107,7 @@ void fonts_init(void);
 /* images */
 struct canvas *image_load(const char *path);
 struct canvas *image_from_memory(const void *data, size_t size);
+struct canvas *image_decode(const void *data, size_t size);   /* PNG, JPEG, GIF, BMP */
 
 /* framebuffer */
 extern struct canvas *screen;    /* back buffer */
@@ -104,5 +120,6 @@ int fb_width(void);
 int fb_height(void);
 void fb_boot_splash(void);
 void fb_boot_progress(const char *msg);
+void fb_boot_error(const char *msg);
 
 int isqrt64(uint64_t v);

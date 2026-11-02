@@ -121,9 +121,13 @@ static struct rect win_outer(struct window *w) {   /* title bar + content */
     int top = (w->flags & WIN_FULL_TITLE) ? 0 : TITLEBAR_H;
     return rect_make(w->frame.x, w->frame.y - top, w->frame.w, w->frame.h + top);
 }
+#define SHADOW_SPREAD_FOCUSED 30
+#define SHADOW_SPREAD_UNFOCUSED 16
+/* Damage area of a window including its drop shadow. It always covers the larger
+ * (focused) shadow so a focus change never leaves stale shadow pixels behind. */
 static struct rect win_shadow_rect(struct window *w) {
     struct rect o = win_outer(w);
-    int s = (w == focused) ? 30 : 16;
+    int s = SHADOW_SPREAD_FOCUSED;
     return rect_make(o.x - s, o.y - s + 6, o.w + 2 * s, o.h + 2 * s);
 }
 static struct rect win_titlebar(struct window *w) { struct rect o = win_outer(w); return rect_make(o.x, o.y, o.w, TITLEBAR_H); }
@@ -327,12 +331,16 @@ bool window_wait_event(struct window *w, struct event *ev, int timeout_ms) {
     for (;;) {
         if (thread_should_exit()) { memset(ev, 0, sizeof *ev); ev->type = EV_QUIT; return true; }
         int wait = timeout_ms;
+        bool got = false;
         if (w->timer_ms > 0) {
             int64_t until = (int64_t)w->next_timer - (int64_t)system_ticks;
-            if (until <= 0) { w->next_timer = system_ticks + w->timer_ms; memset(ev, 0, sizeof *ev); ev->type = EV_TIMER; return true; }
-            if (wait < 0 || until < wait) wait = (int)until;
+            if (until <= 0) {
+                /* drain queued input first so a slow timer handler can't starve close/quit events */
+                got = sem_trywait(&w->evq_sem);
+                if (!got) { w->next_timer = system_ticks + w->timer_ms; memset(ev, 0, sizeof *ev); ev->type = EV_TIMER; return true; }
+            } else if (wait < 0 || until < wait) wait = (int)until;
         }
-        bool got = wait < 0 ? (sem_wait(&w->evq_sem), true) : sem_wait_timeout(&w->evq_sem, wait);
+        if (!got) got = wait < 0 ? (sem_wait(&w->evq_sem), true) : sem_wait_timeout(&w->evq_sem, wait);
         if (!got) {
             if (w->timer_ms > 0 && (int64_t)system_ticks >= (int64_t)w->next_timer) continue;
             return false;
@@ -420,7 +428,7 @@ static void draw_window(struct canvas *c, struct window *w) {
     struct rect o = win_outer(w);
     bool active = (w == focused);
     if (!rect_overlaps(win_shadow_rect(w), c->clip)) return;
-    gfx_shadow_ex(c, o.x, o.y + 6, o.w, o.h, WIN_RADIUS, active ? 30 : 16, active ? 120 : 70, o);
+    gfx_shadow_ex(c, o.x, o.y + 6, o.w, o.h, WIN_RADIUS, active ? SHADOW_SPREAD_FOCUSED : SHADOW_SPREAD_UNFOCUSED, active ? 120 : 70, o);
     gfx_shadow_ex(c, o.x, o.y, o.w, o.h, WIN_RADIUS, 2, 90, o);
     mutex_lock(&w->lock);
     if (w->flags & WIN_FULL_TITLE) {
@@ -572,7 +580,7 @@ static int menu_item_at(int mx, int my) {
 /* ---- dock ---- */
 struct dock_item { int app; const char *icon; const char *label; bool separator; };
 static const struct dock_item dock_items_all[] = {
-    { APP_FILES, "files", "Files", false }, { APP_TERMINAL, "terminal", "Terminal", false },
+    { APP_FILES, "files", "Files", false }, { APP_BROWSER, "browser", "Browser", false }, { APP_TERMINAL, "terminal", "Terminal", false },
     { APP_EDITOR, "editor", "Text Editor", false }, { APP_CALC, "calculator", "Calculator", false },
     { APP_TASKMAN, "taskman", "Task Manager", false }, { APP_SETTINGS, "settings", "System Settings", false }, { APP_GLDEMO, "gldemo", "OpenGL Demo", false },
     { APP_INSTALLER, "drive", "Install inFlux", false },
@@ -601,10 +609,9 @@ void wm_notify_app_state(void) {
 static void draw_dock(struct canvas *c) {
     if (!rect_overlaps(dock_damage(), c->clip)) return;
     struct rect d = dock_rect;
-    gfx_shadow_ex(c, d.x, d.y + 6, d.w, d.h, 18, 20, 80, d);
+    gfx_shadow_outside(c, d, 18, 20, 80, 6);
     /* frosted panel: blur whatever sits behind the dock, then tint it */
-    struct rect blur = rect_intersect(rect_make(d.x, d.y, d.w, d.h), c->clip);
-    if (!rect_empty(blur)) gfx_blur_rect(c, rect_make(d.x, d.y, d.w, d.h), 6);
+    gfx_blur_rect_rounded(c, d, 6, 18);
     /* translucent frosted glass: the blurred backdrop shows through the tint */
     gfx_fill_rounded_rect(c, d.x, d.y, d.w, d.h, 18, theme.dark ? RGBA(0x1C, 0x1C, 0x20, 0x66) : RGBA(0xF4, 0xF4, 0xF8, 0x6E));
     gfx_draw_rounded_rect(c, d.x + 1, d.y + 1, d.w - 2, d.h - 2, 17, theme.dark ? RGBA(255, 255, 255, 0x18) : RGBA(255, 255, 255, 0x80));
@@ -664,6 +671,9 @@ static void flush_damage(void) {
     spin_unlock(&damage_lock);
     if (!n) return;
     mutex_lock(&wm_lock);
+    for (int i = 0; i < n; i++) if (rect_overlaps(local[i], dock_rect)) local[i] = rect_union(local[i], dock_rect);
+    /* merge rects that now overlap so the dock is composed once */
+    for (int i = 0; i < n; i++) for (int j = i + 1; j < n; j++) if (rect_overlaps(local[i], local[j])) { local[i] = rect_union(local[i], local[j]); local[j--] = local[--n]; }
     for (int i = 0; i < n; i++) compose(local[i]);
     fb_present();
     mutex_unlock(&wm_lock);

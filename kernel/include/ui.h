@@ -141,7 +141,7 @@ void wm_broadcast(int type);         /* post an event to every window */
 extern bool clock_24h;
 
 /* apps */
-enum { APP_FILES, APP_TERMINAL, APP_EDITOR, APP_CALC, APP_TASKMAN, APP_SETTINGS, APP_GLDEMO, APP_INSTALLER, APP_COUNT };
+enum { APP_FILES, APP_TERMINAL, APP_EDITOR, APP_CALC, APP_TASKMAN, APP_SETTINGS, APP_GLDEMO, APP_INSTALLER, APP_BROWSER, APP_PLAYER, APP_COUNT };
 struct app_info { const char *name; const char *icon; void (*main)(void *arg); bool single_instance; };
 extern const struct app_info app_table[APP_COUNT];
 int app_launch(int id, const char *arg);
@@ -166,6 +166,10 @@ void ui_checkbox(struct canvas *c, int x, int y, bool checked, const char *label
 void ui_switch(struct canvas *c, int x, int y, bool on);
 void ui_scrollbar_v(struct canvas *c, struct rect track, int content, int view, int pos);
 void ui_panel(struct canvas *c, struct rect r, color_t bg);
+/* dropdown (popup button): the closed control, and its open list */
+#define DROPDOWN_ITEM_H 24
+void ui_dropdown(struct canvas *c, struct rect r, const char *label, bool open, bool enabled);
+void ui_dropdown_list(struct canvas *c, struct rect r, const char *const *items, int n, int first, int hover, int checked);
 void ui_separator_h(struct canvas *c, int x, int y, int w);
 void ui_icon_label(struct canvas *c, int x, int y, struct canvas *icon, int iconsz, const char *label, color_t col, struct font *f);
 

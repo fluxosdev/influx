@@ -14,6 +14,7 @@ struct tty {
     void *priv;
     int fg_pid;
     void (*on_interrupt)(void *priv);
+    volatile bool *intr_flag;  /* raw mode: Ctrl+C also raises this (the shell's cancel for builtins) */
     int cols, rows;
     struct vnode *vn;
     bool closed;

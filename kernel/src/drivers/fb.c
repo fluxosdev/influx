@@ -100,6 +100,13 @@ void fb_boot_splash(void) {
     fb_flush_all();
 }
 
+/* replaces the progress bar with an error, for failures that stop the boot */
+void fb_boot_error(const char *msg) {
+    gfx_fill_rect(screen, 0, splash_y - 2, fbw, 40, RGB(0x12, 0x12, 0x14));
+    if (splash_font) font_draw_centered(screen, splash_font, rect_make(0, splash_y, fbw, 20), RGB(0xFF, 0x6B, 0x60), msg);
+    fb_flush(rect_make(0, splash_y - 2, fbw, 40));
+}
+
 static int splash_step;
 void fb_boot_progress(const char *msg) {
     if (!splash_font) return;

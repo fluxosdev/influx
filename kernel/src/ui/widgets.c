@@ -40,6 +40,38 @@ void ui_panel(struct canvas *c, struct rect r, color_t bg) {
     gfx_fill_rounded_rect(c, r.x, r.y, r.w, r.h, 8, bg);
     gfx_draw_rounded_rect(c, r.x, r.y, r.w, r.h, 8, theme.separator);
 }
+void ui_dropdown(struct canvas *c, struct rect r, const char *label, bool open, bool enabled) {
+    gfx_shadow(c, r.x, r.y + 1, r.w, r.h, 6, 2, 40);
+    gfx_fill_rounded_rect(c, r.x, r.y, r.w, r.h, 6, open ? theme.control_hover : theme.control_bg);
+    gfx_draw_rounded_rect(c, r.x, r.y, r.w, r.h, 6, open ? theme.accent : theme.control_border);
+    font_draw_ellipsized(c, font_ui, r.x + 10, r.y + (r.h - font_height(font_ui)) / 2, r.w - 40, enabled ? theme.text : theme.text_disabled, label);
+    /* accent chevron capsule, like a macOS popup button */
+    int bw = 18, bx = r.x + r.w - bw - 4, by = r.y + 4, bh = r.h - 8;
+    gfx_fill_rounded_rect(c, bx, by, bw, bh, 5, enabled ? theme.accent : theme.text_disabled);
+    int mx = bx + bw / 2, my = by + bh / 2;
+    color_t ac = theme.accent_text;
+    gfx_line(c, mx - 3, my - 2, mx, my - 5, ac); gfx_line(c, mx, my - 5, mx + 3, my - 2, ac);
+    gfx_line(c, mx - 3, my + 2, mx, my + 5, ac); gfx_line(c, mx, my + 5, mx + 3, my + 2, ac);
+}
+
+void ui_dropdown_list(struct canvas *c, struct rect r, const char *const *items, int n, int first, int hover, int checked) {
+    gfx_shadow(c, r.x, r.y + 4, r.w, r.h, 8, 18, 90);
+    gfx_fill_rounded_rect(c, r.x, r.y, r.w, r.h, 8, theme.dark ? RGB(0x2C, 0x2C, 0x2E) : RGB(0xF8, 0xF8, 0xFA));
+    gfx_draw_rounded_rect(c, r.x, r.y, r.w, r.h, 8, theme.dark ? RGBA(255, 255, 255, 0x28) : RGBA(0, 0, 0, 0x28));
+    int visible = (r.h - 8) / DROPDOWN_ITEM_H;
+    for (int k = 0; k < visible && first + k < n; k++) {
+        int i = first + k, y = r.y + 4 + k * DROPDOWN_ITEM_H;
+        bool hl = i == hover;
+        if (hl) gfx_fill_rounded_rect(c, r.x + 4, y, r.w - 8, DROPDOWN_ITEM_H, 5, theme.accent);
+        color_t tc = hl ? theme.accent_text : theme.text;
+        if (i == checked) font_draw(c, font_ui, r.x + 10, y + (DROPDOWN_ITEM_H - font_height(font_ui)) / 2, tc, "\u2713");
+        font_draw_ellipsized(c, font_ui, r.x + 28, y + (DROPDOWN_ITEM_H - font_height(font_ui)) / 2, r.w - 38, tc, items[i]);
+    }
+    /* scroll hints */
+    if (first > 0) font_draw_centered(c, font_ui_small, rect_make(r.x, r.y, r.w, 10), theme.text_tertiary, "\u25B2");
+    if (first + visible < n) font_draw_centered(c, font_ui_small, rect_make(r.x, r.y + r.h - 11, r.w, 10), theme.text_tertiary, "\u25BC");
+}
+
 void ui_separator_h(struct canvas *c, int x, int y, int w) { gfx_hline(c, x, y, w, theme.separator); }
 void ui_icon_label(struct canvas *c, int x, int y, struct canvas *icon, int iconsz, const char *label, color_t col, struct font *f) {
     if (icon) gfx_blit_scaled(c, x, y, iconsz, iconsz, icon);

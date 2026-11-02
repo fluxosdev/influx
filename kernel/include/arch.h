@@ -29,6 +29,7 @@ void tss_set_kernel_stack(uint64_t rsp);
 void idt_init(void);
 void idt_set_gate(uint8_t vec, void *handler, uint8_t ist, uint8_t dpl);
 void irq_register(uint8_t vec, irq_handler_t h, void *ctx);
+int irq_alloc_vector(void);        /* a free vector for a device interrupt, 0 if none left */
 void cpu_init(void);
 void cpu_get_brand(char *out, size_t n);
 uint64_t cpu_tsc_hz(void);
@@ -53,6 +54,7 @@ void lapic_timer_start(uint32_t hz);
 uint32_t lapic_id(void);
 void ioapic_init(void);
 void ioapic_route_irq(uint8_t irq, uint8_t vector);
+bool ioapic_route_gsi(uint32_t gsi, uint8_t vector, bool level, bool active_low);
 void ioapic_mask_irq(uint8_t irq, bool mask);
 
 /* Legacy timers / clocks */
@@ -74,6 +76,7 @@ struct pci_device {
     uint8_t bus, slot, func;
     uint16_t vendor, device;
     uint8_t class_code, subclass, prog_if, irq_line;
+    uint8_t header_type, secondary_bus;   /* secondary bus: PCI-PCI bridges (header type 1) */
     uint32_t bar[6];
     uint64_t bar_addr[6];
     bool bar_is_mmio[6];
@@ -86,4 +89,9 @@ void pci_write32(uint8_t bus, uint8_t slot, uint8_t func, uint8_t off, uint32_t 
 uint16_t pci_read16(uint8_t bus, uint8_t slot, uint8_t func, uint8_t off);
 void pci_write16(uint8_t bus, uint8_t slot, uint8_t func, uint8_t off, uint16_t v);
 void pci_enable_bus_master(struct pci_device *d);
+uint8_t pci_find_cap(struct pci_device *d, uint8_t id);   /* capability offset, 0 if absent */
+/* Device interrupt: MSI when available and allowed, else INTx routed through
+ * ACPI _PRT. The handler runs in interrupt context and must not send the EOI.
+ * Returns false if neither works; `how` describes the result. */
+bool pci_irq_install(struct pci_device *d, irq_handler_t h, void *ctx, bool allow_msi, char *how, size_t how_len);
 const char *pci_class_name(uint8_t cls, uint8_t sub);

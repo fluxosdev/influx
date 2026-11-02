@@ -120,3 +120,8 @@ struct vnode *devfs_add(const char *name, int type, const struct vnode_ops *ops,
 #define ENOTTY_  25
 #define ECHILD   10
 #define ESRCH    3
+#ifndef EBUSY
+#define EBUSY    16
+#endif
+#define ENODEV   19
+#define ENOTSUP  95

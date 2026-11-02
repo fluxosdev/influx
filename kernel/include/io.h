@@ -8,6 +8,9 @@ static inline uint8_t inb(uint16_t port) { uint8_t v; __asm__ volatile("inb %1, 
 static inline uint16_t inw(uint16_t port) { uint16_t v; __asm__ volatile("inw %1, %0" : "=a"(v) : "Nd"(port)); return v; }
 static inline uint32_t inl(uint16_t port) { uint32_t v; __asm__ volatile("inl %1, %0" : "=a"(v) : "Nd"(port)); return v; }
 static inline void io_wait(void) { outb(0x80, 0); }
+/* string I/O: one instruction for a whole buffer (a hypervisor handles it in a single exit) */
+static inline void insw(uint16_t port, void *buf, uint64_t count) { __asm__ volatile("rep insw" : "+D"(buf), "+c"(count) : "d"(port) : "memory"); }
+static inline void outsw(uint16_t port, const void *buf, uint64_t count) { __asm__ volatile("rep outsw" : "+S"(buf), "+c"(count) : "d"(port) : "memory"); }
 
 static inline uint64_t rdmsr(uint32_t msr) { uint32_t lo, hi; __asm__ volatile("rdmsr" : "=a"(lo), "=d"(hi) : "c"(msr)); return ((uint64_t)hi << 32) | lo; }
 static inline void wrmsr(uint32_t msr, uint64_t v) { __asm__ volatile("wrmsr" :: "c"(msr), "a"((uint32_t)v), "d"((uint32_t)(v >> 32))); }

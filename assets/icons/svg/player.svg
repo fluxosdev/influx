@@ -1,0 +1,23 @@
+<svg viewBox="0 0 48 48" xmlns="http://www.w3.org/2000/svg">
+ <!-- inFlux Audio Player icon (original artwork, MIT like the rest of inFlux's own code) -->
+ <defs>
+  <linearGradient id="disc" x1="0" y1="0" x2="0" y2="1">
+   <stop offset="0" stop-color="#FF8A65"/>
+   <stop offset="1" stop-color="#E0245E"/>
+  </linearGradient>
+  <linearGradient id="rim" x1="0" y1="0" x2="0" y2="1">
+   <stop offset="0" stop-color="#E64A5F"/>
+   <stop offset="1" stop-color="#8E1538"/>
+  </linearGradient>
+ </defs>
+ <circle cx="24" cy="24" r="21.5" fill="url(#rim)"/>
+ <circle cx="24" cy="24" r="19.5" fill="url(#disc)"/>
+ <g fill="#FFFFFF" transform="translate(-0.4 0.6) scale(0.75)">
+  <path d="M26.1 23.4 41 19.6v3.6l-14.9 3.8z"/>
+  <rect x="26.1" y="23.4" width="2" height="14"/>
+  <rect x="39" y="19.6" width="2" height="14"/>
+  <ellipse cx="24.3" cy="37.3" rx="3.9" ry="2.9" transform="rotate(-22 24.3 37.3)"/>
+  <ellipse cx="37.2" cy="33.6" rx="3.9" ry="2.9" transform="rotate(-22 37.2 33.6)"/>
+ </g>
+ <path d="M8.5 18a17 17 0 0 1 31-1" fill="none" stroke="#FFFFFF" stroke-opacity="0.25" stroke-width="2" stroke-linecap="round"/>
+</svg>

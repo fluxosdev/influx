@@ -65,6 +65,7 @@ void tty_input(struct tty *t, const char *s, size_t n) {
             if (t->on_interrupt) t->on_interrupt(t->priv);
             continue;
         }
+        if (c == 3 && t->intr_flag) *t->intr_flag = true;
         spin_lock(&t->lock);
         if (t->raw) { push_in(t, c); wake = true; }
         else {

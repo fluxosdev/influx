@@ -4,6 +4,7 @@
 
 static volatile uint32_t *lapic;
 static volatile uint32_t *ioapic;
+static int ioapic_entries;
 
 #define LAPIC_ID        0x020
 #define LAPIC_EOI       0x0B0
@@ -63,6 +64,7 @@ void ioapic_init(void) {
     ioapic = vmm_map_mmio(madt.ioapic_addr, 0x1000);
     uint32_t ver = ioapic_read(1);
     int entries = ((ver >> 16) & 0xFF) + 1;
+    ioapic_entries = entries;
     for (int i = 0; i < entries; i++) { ioapic_write(0x10 + i * 2, 0x10000); ioapic_write(0x11 + i * 2, 0); }
     kprintf("ioapic: %d redirection entries\n", entries);
 }
@@ -76,6 +78,14 @@ void ioapic_route_irq(uint8_t irq, uint8_t vector) {
     if (((flags >> 2) & 3) == 3) lo |= (1 << 15); /* level triggered */
     ioapic_write(0x11 + idx * 2, lapic_id() << 24);
     ioapic_write(0x10 + idx * 2, lo);
+}
+
+bool ioapic_route_gsi(uint32_t gsi, uint8_t vector, bool level, bool active_low) {
+    if (gsi < madt.ioapic_gsi_base || gsi - madt.ioapic_gsi_base >= (uint32_t)ioapic_entries) return false;
+    uint32_t idx = gsi - madt.ioapic_gsi_base;
+    ioapic_write(0x11 + idx * 2, lapic_id() << 24);
+    ioapic_write(0x10 + idx * 2, vector | (active_low ? 1 << 13 : 0) | (level ? 1 << 15 : 0));
+    return true;
 }
 
 void ioapic_mask_irq(uint8_t irq, bool mask) {

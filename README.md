@@ -2,8 +2,9 @@
 
 inFlux is a small x86-64, Unix-like operating system with a preemptive,
 multithreaded kernel and a macOS-style desktop. It boots with the Limine
-bootloader, drives SATA (AHCI) and NVMe disks, and reads and writes btrfs
-volumes with its own filesystem driver.
+bootloader, drives SATA (AHCI) and NVMe disks, reads and writes btrfs
+volumes with its own filesystem driver, and browses the web over its own
+TCP/IP stack.
 
 **This entire operating system was written by Claude**, Anthropic's AI model,
 in a single session: kernel, drivers, filesystems, window server, applications,
@@ -20,11 +21,42 @@ shell, user-space C library and build system.
   spaces, bucket heap allocator
 - Preemptive round-robin scheduler with kernel threads and ring-3 user
   threads, sleep queues, wait queues, mutexes, semaphores, FPU state switching
+- **AVX required**: boot stops at the splash screen with an error on CPUs
+  without AVX (Intel Sandy Bridge / AMD Bulldozer or newer). XSAVE/XSAVEOPT
+  context switching of the full x87/SSE/AVX (and AVX-512) register state; AVX
+  paths (AVX2 chosen at boot when present) for `memcpy`/`memset`, alpha
+  compositing, glyph rendering and the blur; the OpenGL renderer, image decoder
+  and all user programs are compiled with `-mavx`. The CPU's extensions are
+  listed in Settings → About
 - Processes with file descriptor tables, working directories, exit status and
   `wait`; kernel-side killing of faulting user programs
 - `syscall`/`sysret` fast system calls (31 calls: files, directories, process
   spawning, pipes, sleep, uname, sysinfo, process listing, block devices)
 - Static ELF64 loader for user programs
+
+### ACPI
+- **AML interpreter** of its own: loads the DSDT and every SSDT into a
+  namespace and runs module-level code; methods with arguments, locals and
+  method-local objects; integers (32- or 64-bit by DSDT revision), strings,
+  buffers, packages, references, `Index`/`RefOf`/`DerefOf`/`CondRefOf`,
+  buffer fields, the arithmetic, logical, conversion and resource-template
+  operators, `If`/`While` (with a runaway-loop timeout), `Load`/`LoadTable`,
+  `_OSI` (answers like Windows), `\_OS`, `\_REV`
+- Operation regions in SystemMemory, SystemIO, PCI_Config (bus found through
+  `_BBN` and the bridges on the way), EmbeddedControl and CMOS; normal, index
+  and bank fields with all access widths and update rules
+- Brings the platform up the way firmware expects: enters ACPI mode, runs
+  `_REG`, `_STA`/`_INI` over the device tree and `\_PIC(1)`
+- **SCI**: the fixed power button and runtime GPEs (`_Lxx`/`_Exx`) handled by a
+  worker thread; embedded controller (ECDT or PNP0C09) with `_Qxx` queries.
+  Pressing the power button opens the Shut Down dialog
+- **Power off through `\_S5`** (`\_PTS` first) and **reboot through the FADT
+  reset register**, so both work on real hardware, not only in emulators
+- **PCI interrupt routing** from `_PRT`, including link devices (`_CRS`,
+  `_PRS`/`_SRS`) and bridge swizzling; drivers ask for MSI first and fall back
+  to the routed INTx line
+- `acpi` in the Terminal: tables and mode, `acpi tree [path]` dumps the
+  namespace, `acpi eval _S5` evaluates any object, `acpi irq` lists routing
 
 ### Storage and filesystems
 - PCI enumeration
@@ -70,12 +102,72 @@ shell, user-space C library and build system.
   `mkfs.btrfs` and Limine's BIOS stage-2 install are all implemented in the
   kernel. The installed system boots on BIOS and UEFI firmware; its root
   volume holds the persistent home directory, mounted at `/home`.
-- **Display resolution**: System Settings → Displays lists the available
-  modes. On QEMU, VirtualBox and Bochs the mode changes immediately (DISPI
-  mode setting; the compositor re-lays out the desktop). The choice is also
-  written as `resolution:` into the installed system's `limine.conf`, so on
-  real hardware it takes effect at the next boot through Limine (VBE on BIOS,
-  GOP on UEFI). The `display` shell command does the same.
+- **Display resolution**: System Settings → Displays has a resolution
+  dropdown with the common modes the display supports. On QEMU, VirtualBox and
+  Bochs the mode changes immediately (DISPI mode setting; the compositor
+  re-lays out the desktop) and a "Keep this resolution?" banner reverts it
+  after 15 seconds unless confirmed. A kept resolution is also written as
+  `resolution:` into the installed system's `limine.conf`, so on real
+  hardware it takes effect at the next boot through Limine (VBE on BIOS, GOP
+  on UEFI). The `display` shell command does the same.
+
+### Networking
+- **NE2000 driver** for the PCI clones (Realtek RTL8029, which QEMU emulates
+  as `ne2k_pci`, plus Winbond, VIA, Compex, Holtek and others) with a
+  fallback probe of the classic ISA I/O bases. Frames move through the card's
+  16 KiB buffer with remote DMA (`rep insw`/`rep outsw`). The adapter is
+  polled by the network thread.
+- **TCP/IP stack**: Ethernet, ARP (cache, request retries, packets parked
+  until the next hop resolves), IPv4 with routing through a default gateway,
+  ICMP echo (answers pings, and `ping`), UDP sockets, a DHCP client that
+  configures the adapter at boot, and a DNS resolver with CNAME following and
+  a TTL cache.
+- **TCP**: active open with MSS negotiation, in-order delivery with an
+  out-of-order queue and duplicate ACKs for fast retransmit, RFC 6298
+  retransmission timers with Karn's rule, slow start and congestion avoidance,
+  zero-window probing, orderly close and TIME_WAIT. The advertised window is
+  capped at what the adapter can buffer.
+- **HTTP/1.1 client**: redirects, `Content-Length`, chunked and
+  read-to-close bodies, GET and POST.
+- Shell commands: `ifconfig` (show, or set a static address), `dhcp`,
+  `ping`, `nslookup`/`host`, `curl` (`-I`, `-i`, `-o file`), `arp`, `netstat`.
+
+### Sound
+- **Intel High Definition Audio** driver: controller reset, CORB/RIRB command
+  rings (immediate commands as a fallback), codec discovery and widget graph
+  parsing. Every analog output pin (speakers, headphones, line out) gets a
+  path back to a DAC through mixers and selectors, which is powered up and
+  unmuted, so sound comes out of all of them. HDMI/DisplayPort audio pins are
+  not used yet.
+- Playback from a 64 KiB cyclic DMA buffer at the source's sample rate when
+  the codec supports it (8 to 192 kHz), otherwise resampled to 48 kHz; played
+  regions are zeroed at once, so running dry gives silence, not a stutter loop
+- Plays 8/16/24/32-bit integer and 32-bit float PCM, mono to 8 channels
+  (front left/right are used), with a master volume
+- **Audio Player**: double-click a `.wav` file in Files; play/pause (Space),
+  stop, seek (click the bar, or ← →), volume. In the Terminal: `play
+  file.wav` (Ctrl+C stops) and `volume [0-100]`. `/dev/audio` takes raw
+  48 kHz signed 16-bit stereo, e.g. `cat sound.raw > /dev/audio`
+- No system sounds yet
+
+### Web browser
+- **Browser** (Dock): address bar that also searches (via wiby.me), back and
+  forward, reload/stop, a progress bar, status bar with link targets and load
+  times, View Source, Save Page As, and a start page.
+- HTML parser that copes with real pages: implied end tags (`p`, `li`, `td`,
+  `tr`, `option`, ...), character references, windows-1252 and UTF-8 text.
+- Layout of headings, paragraphs, lists (bulleted, numbered, lettered, roman),
+  definition lists, block quotes, preformatted text, rules, `<font>`, `<center>`,
+  `align` and `bgcolor` attributes, and the inline `style` properties that
+  matter most (colour, background, alignment, weight, `display: none`).
+  Tables are sized from each cell's minimum and preferred widths, with
+  `colspan`, `cellspacing`/`cellpadding`, borders, percentage and fixed widths
+  and vertical alignment.
+- Images (PNG, JPEG, GIF, BMP via stb_image) load after the page and reflow it
+  as they arrive. Forms work: text, password, checkbox, radio, select,
+  textarea and buttons, submitted with GET or POST.
+- Opens `file://` paths (`.html` files from Files or `open page.html` in the
+  Terminal), plain text and images. Other downloads go to `~/Downloads`.
 
 ### Desktop
 - Software-composited window server with damage tracking, drop shadows,
@@ -85,10 +177,10 @@ shell, user-space C library and build system.
 - Dock with pinned apps, running indicators, hover tooltips and Trash
 - Light and dark appearance, eight accent colors, wallpaper presets
   (default: steel blue)
-- Applications: **Files** (sidebar, icon/list views, history, new folder,
+- Applications: **Browser**, **Files** (sidebar, icon/list views, history, new folder,
   rename, duplicate, move to Trash, Get Info), **Terminal**, **Text Editor**
   (selection, clipboard, undo, open/save), **Calculator**, **Task Manager**
-  (live CPU/memory/threads, force quit), **System Settings**
+  (live CPU/memory/threads, force quit), **System Settings**, **Audio Player**
 - zsh-like shell: line editing, history (persisted to `~/.zsh_history`), Tab
   completion, aliases, environment variables, globbing, pipes, redirection,
   `&&`/`||`, background jobs, 60+ built-ins, and external programs from `/bin`
@@ -111,7 +203,7 @@ Requirements (Debian/Ubuntu package names):
 ```sh
 make            # builds build/influx.iso
 make disk       # creates build/sata.img and build/nvme.img (btrfs test volumes)
-make run        # boots in QEMU with a SATA and an NVMe disk attached
+make run        # boots in QEMU with a SATA and an NVMe disk and an HD Audio card
 make run-kvm    # same, with KVM acceleration
 make run-installed       # boot the disk the installer wrote (build/install.img) on BIOS
 make run-installed-uefi  # the same under OVMF UEFI
@@ -120,6 +212,14 @@ make run-installed-uefi  # the same under OVMF UEFI
 The build compiles the kernel with the host GCC in freestanding mode, rasterises
 the fonts and icons with the small host tools in `tools/`, packs `build/sysroot`
 into a ustar initrd and produces a hybrid BIOS/UEFI ISO with Limine.
+
+The emulated sound card plays through the host's PulseAudio or PipeWire
+(`-audiodev pa`); use `make run QEMU_AUDIODEV=pipewire` for another QEMU audio
+backend, or `make run QEMU_AUDIO=` to leave the card out.
+
+inFlux needs an AVX-capable CPU. The `run` targets pass `-cpu max` (QEMU's
+default emulated CPU has no AVX) and `run-kvm` passes `-cpu host`; when starting
+QEMU by hand, pick a CPU model with AVX.
 
 Changing the SVG icon sources requires `python3` with `cairosvg`; run
 `tools/render_icons.py` to regenerate the committed PNGs.
@@ -137,6 +237,13 @@ Changing the SVG icon sources requires `python3` with `cairosvg`; run
 - Type `help` in the Terminal for the list of shell built-ins; programs in
   `/bin` run in user mode. `lsgpu` shows the graphics adapter, `glcube &`
   starts the user-mode OpenGL program.
+- `make run` attaches an NE2000 to QEMU's user-mode network; the adapter gets
+  10.0.2.15 from QEMU's DHCP server at boot (`ifconfig` shows it). Open the
+  Browser from the Dock: ⌘L focuses the address bar, ⌘R reloads, ⌘[ and ⌘]
+  go back and forward, ⌘U shows the source. In the Terminal, try
+  `ping 10.0.2.2`, `nslookup example.com` or `curl -I example.com`. On real
+  hardware a DHCP server must answer within a few seconds, or set the address
+  with `ifconfig ne0 192.168.1.50 netmask 255.255.255.0 gw 192.168.1.1`.
 
 ## Layout
 
@@ -144,13 +251,15 @@ Changing the SVG icon sources requires `python3` with `cairosvg`; run
 kernel/src/arch     GDT, IDT, APIC, ACPI, PCI, timers, serial
 kernel/src/mm       physical/virtual memory, heap
 kernel/src/sched    scheduler, synchronisation, ELF loader, system calls
-kernel/src/drivers  framebuffer, PS/2, AHCI, NVMe, block devices, GPU abstraction, Radeon R700
+kernel/src/drivers  framebuffer, PS/2, AHCI, NVMe, block devices, GPU abstraction, Radeon R700, NE2000
+kernel/src/net      Ethernet/ARP, IPv4/ICMP, UDP, TCP, DHCP, DNS, HTTP client
 kernel/src/gl       kernel build of the OpenGL renderer and the OpenGL Demo app
 gl                  shared software OpenGL implementation (gl.c / gl.h)
 kernel/src/fs       VFS, tmpfs, initrd, tty, pipes, btrfs
 kernel/src/gfx      canvas primitives, fonts, images
 kernel/src/ui       window server, theme, widgets, dialogs, app registry
-kernel/src/apps     Files, Terminal, shell, Editor, Calculator, Task Manager, Settings, Installer
+kernel/src/apps     Files, Terminal, shell, Editor, Calculator, Task Manager, Settings, Installer,
+                    Browser (browser.c), HTML parser (html.c) and layout (layout.c)
 user/libc           minimal C library for user programs
 user/bin            user-mode programs
 tools               fontgen, imgconv, icon renderer, test-disk builder
@@ -160,7 +269,16 @@ third_party         Limine, stb headers
 
 ## Limitations
 
-- Single CPU (other cores are left parked), no networking, no audio, no USB.
+- Single CPU (other cores are left parked), no audio, no USB.
+- Networking: IPv4 only, one NE2000 adapter type, TCP as a client only (no
+  listening sockets), no IP fragment reassembly, DHCP leases are not renewed.
+  The stack is used by the kernel and the desktop; user programs in `/bin`
+  have no socket system calls yet.
+- The browser speaks plain HTTP: no HTTPS (most of today's web), JavaScript
+  or style sheets, so modern sites either redirect to HTTPS (an error page
+  offers the FrogFind text proxy) or render as unstyled documents. Sites
+  built for old computers, such as 68k.news, info.cern.ch, textfiles.com and
+  wiby.me, work well.
 - btrfs: single-device volumes with CRC32C checksums only; no compression,
   snapshots, RAID or zoned support. Metadata is updated in place rather than
   copy-on-write, so an interrupted write can leave the volume inconsistent;

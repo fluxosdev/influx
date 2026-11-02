@@ -3,6 +3,7 @@
 #include "string.h"
 #include "io.h"
 #include "fs.h"
+#include "simd.h"
 
 extern void context_switch(uint64_t *old_rsp, uint64_t new_rsp);
 extern void enter_user_mode(uint64_t rip, uint64_t rsp);
@@ -25,10 +26,16 @@ static spinlock_t sched_lock = SPINLOCK_INIT;   /* protects the lists */
 
 static void idle_loop(void *arg) { for (;;) { sti(); hlt(); } }
 
+static void thread_free(struct thread *t) {
+    if (t->kstack_base) kfree((void *)t->kstack_base);
+    kfree(t->fpu_mem);
+    kfree(t);
+}
+
 static void thread_trampoline(void) {
     /* Runs on the new thread's stack after the first context switch. */
     struct thread *t = current_thread;
-    if (reap_thread) { struct thread *r = reap_thread; reap_thread = NULL; kfree((void *)r->kstack_base); kfree(r); }
+    if (reap_thread) { struct thread *r = reap_thread; reap_thread = NULL; thread_free(r); }
     sti();
     if (t->is_user) enter_user_mode(t->user_rip, t->user_rsp);
     t->entry(t->arg);
@@ -51,10 +58,7 @@ static struct thread *alloc_thread(struct process *p, const char *name) {
     *--sp = (uint64_t)thread_trampoline;
     for (int i = 0; i < 6; i++) *--sp = 0;
     t->rsp = (uint64_t)sp;
-    /* sane initial FPU state */
-    memset(t->fxsave, 0, 512);
-    *(uint16_t *)(t->fxsave) = 0x37F;          /* FCW */
-    *(uint32_t *)(t->fxsave + 24) = 0x1F80;    /* MXCSR */
+    t->fpu = fpu_state_alloc(&t->fpu_mem);     /* sane initial FPU/SSE/AVX state */
     list_init(&t->sched_link);
     spin_lock(&sched_lock);
     list_add_tail(&t->all_link, &all_threads);
@@ -109,7 +113,7 @@ void sched_init(void) {
     boot->state = THREAD_RUNNING;
     boot->slice = TIME_SLICE;
     boot->kstack_base = 0;
-    *(uint16_t *)(boot->fxsave) = 0x37F; *(uint32_t *)(boot->fxsave + 24) = 0x1F80;
+    boot->fpu = fpu_state_alloc(&boot->fpu_mem);
     list_init(&boot->sched_link);
     list_add_tail(&boot->all_link, &all_threads);
     list_add_tail(&boot->proc_link, &kernel_process->threads);
@@ -141,20 +145,21 @@ void schedule(void) {
     next->slice = TIME_SLICE;
     spin_unlock(&sched_lock);
     if (next == prev) return;
+    /* save the vector registers before current_thread changes, so nothing in
+     * between can mistake them for the next thread's (see simd_ok) */
+    fpu_save(prev->fpu);
     sched_context_switches++;
     current_thread = next;
     tss_set_kernel_stack(next->kstack_top);
     kernel_rsp_for_syscall = next->kstack_top;
     vmm_switch(next->proc->pml4 ? next->proc->pml4 : vmm_kernel_pml4());
-    __asm__ volatile("fxsave (%0)" :: "r"(prev->fxsave) : "memory");
-    __asm__ volatile("fxrstor (%0)" :: "r"(next->fxsave) : "memory");
+    fpu_restore(next->fpu);
     if (prev->state == THREAD_ZOMBIE) reap_thread = prev;
     context_switch(&prev->rsp, next->rsp);
     /* back on 'prev' stack */
     if (reap_thread && reap_thread != current_thread) {
         struct thread *r = reap_thread; reap_thread = NULL;
-        if (r->kstack_base) kfree((void *)r->kstack_base);
-        kfree(r);
+        thread_free(r);
     }
 }
 

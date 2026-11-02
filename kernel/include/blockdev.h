@@ -14,6 +14,7 @@ struct blockdev {
     const char *fs_type;
     const char *bus;                 /* "SATA" / "NVMe" */
     struct vnode *vn;
+    bool esp;                        /* EFI System Partition: mounted hidden */
 };
 void blockdev_register(struct blockdev *d);   /* registers the disk, scans partitions */
 void blockdev_rescan(struct blockdev *d);     /* drop and re-read the partition table */

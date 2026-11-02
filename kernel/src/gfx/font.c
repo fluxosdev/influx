@@ -2,6 +2,7 @@
 #include "fs.h"
 #include "mm.h"
 #include "string.h"
+#include "simd.h"
 
 #pragma pack(push, 1)
 struct fnt_header { char magic[4]; uint16_t size; int16_t ascent, descent; uint16_t line_height; uint32_t glyph_count, data_size; };
@@ -87,6 +88,7 @@ int font_draw_n(struct canvas *c, const struct font *f, int x, int y, color_t co
     int pen = x << 8;   /* 24.8 */
     int base = y + f->hdr.ascent;
     uint32_t ca = ALPHA(col);
+    bool simd = simd_ok();
     while (s < end && *s) {
         uint32_t cp = utf8_decode(&s);
         const struct fnt_glyph *g = glyph(f, cp); if (!g) g = glyph(f, '?');
@@ -97,6 +99,7 @@ int font_draw_n(struct canvas *c, const struct font *f, int x, int y, color_t co
             for (int yy = dr.y; yy < dr.y + dr.h; yy++) {
                 const uint8_t *src = f->data + g->off + (yy - gy) * g->w + (dr.x - gx);
                 uint32_t *d = c->px + yy * c->stride + dr.x;
+                if (simd) { simd_blend_mask8(d, src, col, ca, dr.w); continue; }
                 for (int i = 0; i < dr.w; i++) {
                     uint32_t a = src[i];
                     if (!a) continue;
@@ -110,6 +113,40 @@ int font_draw_n(struct canvas *c, const struct font *f, int x, int y, color_t co
     return ((pen + 128) >> 8) - x;
 }
 int font_draw(struct canvas *c, const struct font *f, int x, int y, color_t col, const char *s) { return font_draw_n(c, f, x, y, col, s, strlen(s)); }
+
+/* oblique text: each glyph row is shifted right by a quarter of its height above the baseline */
+int font_draw_oblique_n(struct canvas *c, const struct font *f, int x, int y, color_t col, const char *s, size_t n) {
+    if (!f) return 0;
+    const char *end = s + n;
+    int pen = x << 8;
+    int base = y + f->hdr.ascent;
+    uint32_t ca = ALPHA(col);
+    bool simd = simd_ok();
+    while (s < end && *s) {
+        uint32_t cp = utf8_decode(&s);
+        const struct fnt_glyph *g = glyph(f, cp); if (!g) g = glyph(f, '?');
+        if (!g) continue;
+        if (g->w && g->h) {
+            int gx = ((pen + 128) >> 8) + g->x0, gy = base + g->y0;
+            for (int row = 0; row < g->h; row++) {
+                int yy = gy + row;
+                if (yy < c->clip.y || yy >= c->clip.y + c->clip.h) continue;
+                int dx = gx + (base - yy) / 4;
+                int x0 = MAX(dx, c->clip.x), x1 = MIN(dx + g->w, c->clip.x + c->clip.w);
+                const uint8_t *src = f->data + g->off + row * g->w;
+                uint32_t *d = c->px + yy * c->stride;
+                if (simd) { if (x1 > x0) simd_blend_mask8(d + x0, src + (x0 - dx), col, ca, x1 - x0); continue; }
+                for (int xx = x0; xx < x1; xx++) {
+                    uint32_t a = src[xx - dx];
+                    if (!a) continue;
+                    d[xx] = color_blend(d[xx], WITH_ALPHA(col, (a * ca) / 255));
+                }
+            }
+        }
+        pen += g->advance_q8;
+    }
+    return ((pen + 128) >> 8) - x;
+}
 
 int font_fit_chars(const struct font *f, const char *s, int maxw) {
     const char *p = s; int pen = 0;

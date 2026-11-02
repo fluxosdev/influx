@@ -69,6 +69,7 @@ static const char *kind_of(const struct entry *e) {
     if (!strcmp(icon, "file-markdown")) return "Markdown";
     if (!strcmp(icon, "file-c") || !strcmp(icon, "file-h")) return "C source";
     if (!strcmp(icon, "file-image")) return "Image";
+    if (!strcmp(icon, "file-audio")) return "Audio";
     if (!strcmp(icon, "file-exec")) return "Executable";
     if (!strcmp(icon, "file-script")) return "Shell script";
     return "Document";
@@ -122,6 +123,7 @@ static void build_sidebar(struct files *f) {
     for (int i = 0; i < vfs_mount_count() && f->nside < 22; i++) {
         char mp[PATH_MAX]; struct vnode *root = vfs_mount_at(i, mp, sizeof mp);
         if (!root || strncmp(mp, "/mnt", 4) != 0) continue;
+        if (!f->show_hidden && vfs_basename(mp)[0] == '.') continue;
         SIDE(root->name[0] ? root->name : vfs_basename(mp), "drive", mp, false);
     }
     SIDE("Trash", "trash", "/home/flux/.Trash", false);
@@ -459,7 +461,7 @@ static void handle_command(struct files *f, int cmd, bool *quit, bool *close) {
     case CMD_SELECT_ALL: memset(f->sel, 1, f->nentries); break;
     case FCMD_ICONS: f->list_view = false; clamp_scroll(f); break;
     case FCMD_LIST: f->list_view = true; clamp_scroll(f); break;
-    case FCMD_HIDDEN: f->show_hidden = !f->show_hidden; load_dir(f); break;
+    case FCMD_HIDDEN: f->show_hidden = !f->show_hidden; load_dir(f); build_sidebar(f); break;
     case FCMD_REFRESH: load_dir(f); build_sidebar(f); break;
     case FCMD_BACK: if (f->hist_pos > 0) { f->hist_pos--; navigate(f, f->history[f->hist_pos], false); } break;
     case FCMD_FORWARD: if (f->hist_pos < f->hist_len - 1) { f->hist_pos++; navigate(f, f->history[f->hist_pos], false); } break;

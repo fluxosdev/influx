@@ -4,6 +4,7 @@
 #include <unistd.h>
 #include <ctype.h>
 #include <influx.h>
+#include <immintrin.h>
 
 extern int errno;
 int main(int argc, char **argv);
@@ -11,9 +12,33 @@ int __libc_start(int argc, char **argv) { return main(argc, argv); }
 void exit(int code) { _exit(code); }
 
 /* ---- string ---- */
-void *memcpy(void *d, const void *s, size_t n) { char *dd = d; const char *ss = s; while (n--) *dd++ = *ss++; return d; }
-void *memmove(void *d, const void *s, size_t n) { char *dd = d; const char *ss = s; if (dd < ss) while (n--) *dd++ = *ss++; else { dd += n; ss += n; while (n--) *--dd = *--ss; } return d; }
-void *memset(void *d, int c, size_t n) { char *dd = d; while (n--) *dd++ = (char)c; return d; }
+/* Bulk copies and fills use AVX, which inFlux requires (libc is built with -mavx) */
+static void copy_avx(char *d, const char *s, size_t n) {
+    __m256i tail = _mm256_loadu_si256((const __m256i *)(s + n - 32));
+    for (size_t i = 0; i + 32 <= n; i += 32) _mm256_storeu_si256((__m256i *)(d + i), _mm256_loadu_si256((const __m256i *)(s + i)));
+    _mm256_storeu_si256((__m256i *)(d + n - 32), tail);
+}
+static void fill_avx(char *d, int c, size_t n) {
+    __m256i v = _mm256_set1_epi8((char)c);
+    for (size_t i = 0; i + 32 <= n; i += 32) _mm256_storeu_si256((__m256i *)(d + i), v);
+    _mm256_storeu_si256((__m256i *)(d + n - 32), v);
+}
+void *memcpy(void *d, const void *s, size_t n) {
+    if (n >= 32) copy_avx(d, s, n);
+    else { char *dd = d; const char *ss = s; while (n--) *dd++ = *ss++; }
+    return d;
+}
+void *memmove(void *d, const void *s, size_t n) {
+    char *dd = d; const char *ss = s;
+    if (dd + n <= ss || ss + n <= dd) return memcpy(d, s, n);
+    if (dd < ss) while (n--) *dd++ = *ss++; else { dd += n; ss += n; while (n--) *--dd = *--ss; }
+    return d;
+}
+void *memset(void *d, int c, size_t n) {
+    if (n >= 32) fill_avx(d, c, n);
+    else { char *dd = d; while (n--) *dd++ = (char)c; }
+    return d;
+}
 int memcmp(const void *a, const void *b, size_t n) { const unsigned char *x = a, *y = b; for (size_t i = 0; i < n; i++) if (x[i] != y[i]) return x[i] - y[i]; return 0; }
 size_t strlen(const char *s) { size_t n = 0; while (s[n]) n++; return n; }
 int strcmp(const char *a, const char *b) { while (*a && *a == *b) { a++; b++; } return (unsigned char)*a - (unsigned char)*b; }

@@ -17,8 +17,10 @@ KCFLAGS := -std=gnu11 -ffreestanding -fno-stack-protector -fno-stack-check \
            -mcmodel=kernel -mgeneral-regs-only -O2 -g \
            -Wall -Wextra -Wno-unused-parameter -Wno-unused-function -Wno-misleading-indentation -Wno-type-limits -Wno-missing-field-initializers -Wno-sign-compare -Wno-address-of-packed-member \
            -Ikernel/include -Ithird_party/limine -MMD -MP
-# the OpenGL software renderer and its demo use SSE floating point (FPU state is saved per thread)
-KCFLAGS_SSE := $(filter-out -mno-sse -mno-sse2 -mgeneral-regs-only -mno-mmx,$(KCFLAGS)) -msse -msse2 -mno-mmx -Igl
+# Code that may use vector registers: the OpenGL software renderer and its demo,
+# the image decoder and the SIMD kernels. inFlux requires AVX (kmain halts at the
+# boot splash without it), so these assume it; vector state is saved per thread.
+KCFLAGS_SIMD := $(filter-out -mno-sse -mno-sse2 -mgeneral-regs-only -mno-mmx,$(KCFLAGS)) -mavx -mno-mmx -Igl
 KLDFLAGS := -nostdlib -static -z max-page-size=0x1000 -Wl,--gc-sections \
             -T kernel/linker.ld -Wl,--build-id=none
 KASFLAGS := -ffreestanding -m64
@@ -30,7 +32,7 @@ KOBJ   := $(patsubst kernel/src/%.c,$(BUILD)/kernel/%.o,$(KSRC_C)) \
 
 # ---- userland ----
 UCFLAGS := -std=gnu11 -ffreestanding -fno-stack-protector -fno-pic -fno-pie \
-           -m64 -mno-red-zone -O2 -g -Wall -Wextra -Wno-unused-parameter \
+           -m64 -mavx -mno-red-zone -O2 -g -Wall -Wextra -Wno-unused-parameter \
            -Iuser/libc/include -Igl -Wno-misleading-indentation
 ULDFLAGS := -nostdlib -static -z max-page-size=0x1000 -Wl,--build-id=none \
             -T user/libc/user.ld
@@ -51,7 +53,10 @@ FONT_SPECS := inter-regular:Inter-Regular:11 inter-regular:Inter-Regular:13 \
               inter-semibold:Inter-SemiBold:13 inter-semibold:Inter-SemiBold:15 \
               inter-semibold:Inter-SemiBold:20 \
               inter-bold:Inter-Bold:13 inter-bold:Inter-Bold:22 \
-              scp-regular:SourceCodePro-Regular:14 scp-bold:SourceCodePro-Bold:14
+              scp-regular:SourceCodePro-Regular:14 scp-bold:SourceCodePro-Bold:14 \
+              inter-regular:Inter-Regular:18 inter-regular:Inter-Regular:22 \
+              inter-regular:Inter-Regular:28 inter-bold:Inter-Bold:11 \
+              inter-bold:Inter-Bold:15 inter-bold:Inter-Bold:18 inter-bold:Inter-Bold:28
 FONT_FILES := $(foreach s,$(FONT_SPECS),$(SYSROOT)/sys/fonts/$(word 1,$(subst :, ,$(s)))-$(word 3,$(subst :, ,$(s))).fnt)
 ICON_PNGS  := $(wildcard assets/icons/png/*.png)
 ICON_FILES := $(patsubst assets/icons/png/%.png,$(SYSROOT)/sys/icons/%.img,$(ICON_PNGS))
@@ -75,7 +80,18 @@ kernel: $(KERNEL)
 
 $(BUILD)/kernel/gl/%.o: kernel/src/gl/%.c
 	@mkdir -p $(dir $@)
-	$(CC) $(KCFLAGS_SSE) -c $< -o $@
+	$(CC) $(KCFLAGS_SIMD) -c $< -o $@
+
+# the browser's image decoder (stb_image) also gets AVX
+$(BUILD)/kernel/gfx/imgdecode.o: kernel/src/gfx/imgdecode.c
+	@mkdir -p $(dir $@)
+	$(CC) $(KCFLAGS_SIMD) -Wno-unused-but-set-variable -Wno-implicit-fallthrough -c $< -o $@
+
+# SIMD kernels (memcpy/memset, compositing, blur): AVX, with AVX2 picked at run
+# time; callers only enter them where simd_ok() says vector registers are safe
+$(BUILD)/kernel/lib/simd.o: kernel/src/lib/simd.c
+	@mkdir -p $(dir $@)
+	$(CC) $(KCFLAGS_SIMD) -fno-tree-loop-distribute-patterns -c $< -o $@
 
 $(BUILD)/kernel/%.o: kernel/src/%.c
 	@mkdir -p $(dir $@)
@@ -164,29 +180,40 @@ $(DISK_NVME): tools/mkdisk.sh
 	tools/mkdisk.sh $@ "inFlux NVMe" 256
 
 QEMU      := qemu-system-x86_64
-QEMU_ARGS := -M q35 -m 2G -cdrom $(ISO) -boot d -serial stdio \
+# inFlux requires AVX, which TCG's default CPU model lacks; 'max' has AVX and AVX2
+QEMU_CPU  := -cpu max
+# NE2000 (RTL8029) on QEMU's user-mode network: DHCP gives 10.0.2.15, the host is reachable as 10.0.2.2
+QEMU_NET  := -netdev user,id=net0 -device ne2k_pci,netdev=net0
+# Intel HD Audio with a line-out codec, played through the host's PulseAudio/PipeWire;
+# override with e.g. QEMU_AUDIODEV=pipewire, or QEMU_AUDIO= for no sound card
+QEMU_AUDIODEV ?= pa
+QEMU_AUDIO ?= -audiodev $(QEMU_AUDIODEV),id=snd0 -device intel-hda -device hda-duplex,audiodev=snd0
+# the live CD gets bootindex=0 so it boots ahead of an installed system on install.img
+QEMU_ARGS := -M q35 -m 2G -serial stdio \
+             -drive id=cd0,file=$(ISO),format=raw,media=cdrom,readonly=on,if=none \
+             -device ide-cd,drive=cd0,bus=ide.2,bootindex=0 \
              -drive id=sata0,file=$(DISK_SATA),format=raw,if=none \
              -device ahci,id=ahci -device ide-hd,drive=sata0,bus=ahci.0 \
              -drive id=nvme0,file=$(DISK_NVME),format=raw,if=none \
              -device nvme,serial=INFLUX01,drive=nvme0 \
-             -drive id=inst,file=$(DISK_INSTALL),format=raw,if=none -device ide-hd,drive=inst,bus=ahci.1 \
-             -vga std -display gtk,zoom-to-fit=on
+             -drive id=inst,file=$(DISK_INSTALL),format=raw,if=none -device ide-hd,drive=inst,bus=ahci.1,bootindex=1 \
+             $(QEMU_NET) $(QEMU_AUDIO) -vga std -display gtk,zoom-to-fit=on
 
 run: $(ISO) disk
-	$(QEMU) $(QEMU_ARGS)
+	$(QEMU) $(QEMU_CPU) $(QEMU_ARGS)
 
 run-kvm: $(ISO) disk
 	$(QEMU) -enable-kvm -cpu host $(QEMU_ARGS)
 
 # boot an installed system (after using the installer on build/install.img)
 run-installed: $(DISK_INSTALL)
-	$(QEMU) -M q35 -m 2G -serial stdio -vga std -display gtk,zoom-to-fit=on -drive file=$(DISK_INSTALL),format=raw,if=none,id=d -device ahci,id=ahci -device ide-hd,drive=d,bus=ahci.0
+	$(QEMU) $(QEMU_CPU) -M q35 -m 2G -serial stdio $(QEMU_NET) $(QEMU_AUDIO) -vga std -display gtk,zoom-to-fit=on -drive file=$(DISK_INSTALL),format=raw,if=none,id=d -device ahci,id=ahci -device ide-hd,drive=d,bus=ahci.0
 
 OVMF_CODE ?= /usr/share/OVMF/OVMF_CODE_4M.fd
 OVMF_VARS ?= /usr/share/OVMF/OVMF_VARS_4M.fd
 run-installed-uefi: $(DISK_INSTALL)
 	cp -n $(OVMF_VARS) $(BUILD)/ovmf_vars.fd || true
-	$(QEMU) -M q35 -m 2G -serial stdio -vga std -display gtk,zoom-to-fit=on \
+	$(QEMU) $(QEMU_CPU) -M q35 -m 2G -serial stdio $(QEMU_NET) $(QEMU_AUDIO) -vga std -display gtk,zoom-to-fit=on \
 	    -drive if=pflash,format=raw,readonly=on,file=$(OVMF_CODE) -drive if=pflash,format=raw,file=$(BUILD)/ovmf_vars.fd \
 	    -drive file=$(DISK_INSTALL),format=raw,if=none,id=d -device ahci,id=ahci -device ide-hd,drive=d,bus=ahci.0
 

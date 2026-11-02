@@ -1,6 +1,7 @@
 #include "gfx.h"
 #include "mm.h"
 #include "string.h"
+#include "simd.h"
 
 struct rect rect_intersect(struct rect a, struct rect b) {
     int x0 = MAX(a.x, b.x), y0 = MAX(a.y, b.y);
@@ -49,16 +50,6 @@ struct canvas canvas_sub(struct canvas *c, struct rect r) {
     return s;
 }
 
-static inline color_t blend_px(color_t dst, color_t src, uint32_t a) {
-    if (a == 0) return dst;
-    if (a >= 255) return src | 0xFF000000u;
-    uint32_t ia = 255 - a;
-    uint32_t rb = ((src & 0x00FF00FF) * a + (dst & 0x00FF00FF) * ia) >> 8;
-    uint32_t g  = ((src & 0x0000FF00) * a + (dst & 0x0000FF00) * ia) >> 8;
-    uint32_t da = ALPHA(dst);
-    uint32_t oa = a + ((da * ia) >> 8);
-    return (oa << 24) | (rb & 0x00FF00FF) | (g & 0x0000FF00);
-}
 color_t color_blend(color_t dst, color_t src) { return blend_px(dst, src, ALPHA(src)); }
 color_t color_mix(color_t a, color_t b, int t) {
     if (t <= 0) return a; if (t >= 256) return b;
@@ -88,9 +79,11 @@ void gfx_fill_rect(struct canvas *c, int x, int y, int w, int h, color_t col) {
     if (rect_empty(r)) return;
     uint32_t a = ALPHA(col);
     if (a == 0) return;
+    bool simd = a != 255 && simd_ok();
     for (int yy = r.y; yy < r.y + r.h; yy++) {
         uint32_t *p = c->px + yy * c->stride + r.x;
         if (a == 255) memset32(p, col, r.w);
+        else if (simd) simd_blend_solid(p, col, a, r.w);
         else for (int i = 0; i < r.w; i++) p[i] = blend_px(p[i], col, a);
     }
 }
@@ -191,10 +184,12 @@ void gfx_blit_rect(struct canvas *dst, int x, int y, const struct canvas *src, s
     struct rect dr = rect_intersect(rect_make(x, y, sr.w, sr.h), dst->clip);
     if (rect_empty(dr)) return;
     int ox = dr.x - x, oy = dr.y - y;
+    bool simd = blend && simd_ok();
     for (int yy = 0; yy < dr.h; yy++) {
         const uint32_t *s = src->px + (sr.y + oy + yy) * src->stride + sr.x + ox;
         uint32_t *d = dst->px + (dr.y + yy) * dst->stride + dr.x;
         if (!blend) memcpy(d, s, dr.w * 4);
+        else if (simd) simd_blend_span(d, s, dr.w);
         else for (int i = 0; i < dr.w; i++) d[i] = blend_px(d[i], s[i], ALPHA(s[i]));
     }
 }
@@ -249,10 +244,12 @@ void gfx_blit_tinted(struct canvas *dst, int x, int y, const struct canvas *src,
     struct rect dr = rect_intersect(rect_make(x, y, src->w, src->h), dst->clip);
     if (rect_empty(dr)) return;
     uint32_t ta = ALPHA(tint);
+    bool simd = simd_ok();
     for (int yy = 0; yy < dr.h; yy++) {
         const uint32_t *s = src->px + (dr.y - y + yy) * src->stride + (dr.x - x);
         uint32_t *d = dst->px + (dr.y + yy) * dst->stride + dr.x;
-        for (int i = 0; i < dr.w; i++) d[i] = blend_px(d[i], tint, ALPHA(s[i]) * ta / 255);
+        if (simd) simd_blend_tint(d, s, tint, ta, dr.w);
+        else for (int i = 0; i < dr.w; i++) d[i] = blend_px(d[i], tint, ALPHA(s[i]) * ta / 255);
     }
 }
 void gfx_blit_scaled_tinted(struct canvas *dst, int x, int y, int w, int h, const struct canvas *src, color_t tint) {
@@ -308,8 +305,73 @@ void gfx_shadow_ex(struct canvas *c, int x, int y, int w, int h, int radius, int
         }
     }
 }
+/* coverage (0..256) of pixel (px,py) by a rounded rectangle, anti-aliased */
+static int rrect_cov(int px, int py, struct rect r, int rad) {
+    int hx = r.w * 8, hy = r.h * 8;                        /* half extents, 1/16 px */
+    int dx = (px * 16 + 8) - (r.x * 16 + hx), dy = (py * 16 + 8) - (r.y * 16 + hy);
+    if (dx < 0) dx = -dx; if (dy < 0) dy = -dy;
+    int qx = dx - (hx - rad * 16), qy = dy - (hy - rad * 16);
+    int ox = qx > 0 ? qx : 0, oy = qy > 0 ? qy : 0;
+    int outside = isqrt64((uint64_t)((int64_t)ox * ox + (int64_t)oy * oy)) + MIN(MAX(qx, qy), 0) - rad * 16;   /* signed distance */
+    int cov = 8 - outside;                                  /* half-pixel ramp */
+    return cov <= 0 ? 0 : cov >= 16 ? 256 : cov * 16;
+}
+
+/* Drop shadow of a rounded rect (offset by dy) that is only visible outside the shape itself,
+ * for translucent surfaces whose body must not be darkened. */
+void gfx_shadow_outside(struct canvas *c, struct rect r, int radius, int spread, int max_alpha, int dy) {
+    struct rect band = rect_intersect(rect_make(r.x - spread, r.y + dy - spread, r.w + 2 * spread, r.h + 2 * spread), c->clip);
+    struct rect sh = rect_make(r.x, r.y + dy, r.w, r.h);
+    for (int yy = band.y; yy < band.y + band.h; yy++) {
+        uint32_t *row = c->px + yy * c->stride;
+        for (int xx = band.x; xx < band.x + band.w; xx++) {
+            int inside = rrect_cov(xx, yy, r, radius);
+            if (inside >= 256) continue;
+            /* distance outside the shifted shape */
+            int hx = sh.w * 8, hy = sh.h * 8;
+            int ddx = (xx * 16 + 8) - (sh.x * 16 + hx), ddy = (yy * 16 + 8) - (sh.y * 16 + hy);
+            if (ddx < 0) ddx = -ddx; if (ddy < 0) ddy = -ddy;
+            int qx = ddx - (hx - radius * 16), qy = ddy - (hy - radius * 16);
+            int ox = qx > 0 ? qx : 0, oy = qy > 0 ? qy : 0;
+            int d = isqrt64((uint64_t)((int64_t)ox * ox + (int64_t)oy * oy)) + MIN(MAX(qx, qy), 0) - radius * 16;
+            if (d < 0) d = 0;
+            int t = spread * 16 - d;
+            if (t <= 0) continue;
+            int a = max_alpha * t / (spread * 16);
+            a = a * t / (spread * 16);
+            a = a * (256 - inside) / 256;
+            row[xx] = blend_px(row[xx], 0xFF000000, a);
+        }
+    }
+}
+
 void gfx_shadow(struct canvas *c, int x, int y, int w, int h, int radius, int spread, int max_alpha) {
     gfx_shadow_ex(c, x, y, w, h, radius, spread, max_alpha, rect_make(0, 0, 0, 0));
+}
+
+/* Blur r but keep the pixels outside a rounded rectangle (corner radius cr) untouched,
+ * blending with anti-aliased coverage along the corner arcs. */
+void gfx_blur_rect_rounded(struct canvas *c, struct rect r, int radius, int cr) {
+    r = rect_intersect(r, rect_make(0, 0, c->w, c->h));
+    if (rect_empty(r)) return;
+    if (cr * 2 > r.w) cr = r.w / 2; if (cr * 2 > r.h) cr = r.h / 2;
+    /* save the four corner squares */
+    uint32_t *save = kmalloc((size_t)4 * cr * cr * 4 + 4);
+    int cx0[4] = { r.x, r.x + r.w - cr, r.x, r.x + r.w - cr }, cy0[4] = { r.y, r.y, r.y + r.h - cr, r.y + r.h - cr };
+    for (int k = 0; k < 4; k++) for (int y = 0; y < cr; y++) memcpy(save + (k * cr + y) * cr, c->px + (cy0[k] + y) * c->stride + cx0[k], cr * 4);
+    gfx_blur_rect(c, r, radius);
+    /* restore outside the arcs */
+    for (int k = 0; k < 4; k++) for (int y = 0; y < cr; y++) for (int x = 0; x < cr; x++) {
+        int px = cx0[k] + x, py = cy0[k] + y;
+        int ccx = (k & 1) ? r.x + r.w - cr : r.x + cr, ccy = (k & 2) ? r.y + r.h - cr : r.y + cr;
+        int cov = corner_cov(px, py, ccx, ccy, cr);
+        /* corner_cov measures distance from the arc centre; pixels on the inner side of the centre are fully inside */
+        if (((k & 1) && px < ccx) || (!(k & 1) && px >= ccx) || ((k & 2) && py < ccy) || (!(k & 2) && py >= ccy)) cov = 256;
+        uint32_t orig = save[(k * cr + y) * cr + x];
+        uint32_t *d = c->px + py * c->stride + px;
+        *d = cov >= 256 ? *d : cov <= 0 ? orig : color_mix(orig, *d, cov);
+    }
+    kfree(save);
 }
 
 /* Cheap box blur (2 passes) within r, used for translucent surfaces */
@@ -317,6 +379,16 @@ void gfx_blur_rect(struct canvas *c, struct rect r, int radius) {
     r = rect_intersect(r, rect_make(0, 0, c->w, c->h));
     if (rect_empty(r) || radius <= 0) return;
     uint32_t *tmp = kmalloc((size_t)r.w * r.h * 4);
+    if (radius <= SIMD_BLUR_MAX_RADIUS && simd_ok()) {
+        void *sums = kmalloc((size_t)r.w * 16);
+        uint32_t *px = c->px + r.y * c->stride + r.x;
+        for (int pass = 0; pass < 2; pass++) {
+            simd_blur_h(px, c->stride, tmp, r.w, r.w, r.h, radius);
+            simd_blur_v(tmp, r.w, px, c->stride, r.w, r.h, radius, sums);
+        }
+        kfree(sums); kfree(tmp);
+        return;
+    }
     for (int pass = 0; pass < 2; pass++) {
         /* horizontal */
         for (int yy = 0; yy < r.h; yy++) {

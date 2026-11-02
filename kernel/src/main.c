@@ -5,6 +5,8 @@
 #include "fs.h"
 #include "string.h"
 #include "io.h"
+#include "simd.h"
+#include "acpi.h"
 #include <limine.h>
 
 __attribute__((used, section(".limine_requests_start"))) static volatile LIMINE_REQUESTS_START_MARKER;
@@ -25,13 +27,19 @@ void desktop_main(void *arg);
 void drivers_init(void);
 void fb_init(void);
 void fb_boot_splash(void);
+void fb_boot_error(const char *msg);
 void storage_init(void);
+void net_init(void);
+void fb_boot_progress(const char *msg);
 
 static void init_thread(void *arg) {
     kprintf("init: running as thread %d\n", current_thread->tid);
     pci_init();
+    fb_boot_progress("Loading ACPI");
+    acpi_namespace_init();   /* before the drivers: they route PCI interrupts through _PRT */
     drivers_init();
     storage_init();
+    net_init();
     syscall_init();
     desktop_main(NULL);
 }
@@ -60,6 +68,10 @@ void kmain(void) {
     heap_init();
     fb_init();
     fb_boot_splash();
+    if (!cpu_feat.avx) {   /* checked before anything built with -mavx can run */
+        fb_boot_error("inFlux needs a processor with AVX (Intel Sandy Bridge / AMD Bulldozer or newer).");
+        panic("CPU does not support AVX (or XSAVE)");
+    }
     acpi_init(boot_info.rsdp);
     lapic_init();
     ioapic_init();
@@ -73,6 +85,9 @@ void kmain(void) {
 
     char brand[64]; cpu_get_brand(brand, sizeof brand);
     kprintf("cpu: %s\n", brand);
+    char simd[64]; cpu_simd_describe(simd, sizeof simd);
+    kprintf("cpu: %s; %s state, %u bytes per thread\n", simd,
+            cpu_feat.xsaveopt ? "XSAVEOPT" : cpu_feat.xsave ? "XSAVE" : "FXSAVE", fpu_state_size);
     kprintf("mem: %lu MiB total, %lu MiB free\n", pmm_total_bytes() >> 20, pmm_free_bytes() >> 20);
 
     thread_create(kernel_process, "init", init_thread, NULL);

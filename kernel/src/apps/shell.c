@@ -8,6 +8,9 @@
 #include "blockdev.h"
 #include "gpu.h"
 #include "installer.h"
+#include "net.h"
+#include "acpi.h"
+#include "audio.h"
 
 #define MAX_ARGS 128
 #define MAX_HIST 500
@@ -607,6 +610,208 @@ static int b_lspci(struct ctx *c, int argc, char **argv) {
     for (int i = 0; i < pci_device_count(); i++) { struct pci_device *d = pci_device_at(i); cprintf(c, "%02x:%02x.%d %s [%02x%02x]: %04x:%04x\n", d->bus, d->slot, d->func, pci_class_name(d->class_code, d->subclass), d->class_code, d->subclass, d->vendor, d->device); }
     return 0;
 }
+/* ---- ACPI ---- */
+static void acpi_line(void *ctx, const char *s) { cprintf(ctx, "%s\n", s); }
+static int b_acpi(struct ctx *c, int argc, char **argv) {
+    if (argc < 2 || !strcmp(argv[1], "info")) { acpi_print_info(acpi_line, c); return 0; }
+    if (!strcmp(argv[1], "irq")) { acpi_print_irqs(acpi_line, c); return 0; }
+    if (!strcmp(argv[1], "tree")) {
+        if (acpi_print_tree(argc > 2 ? argv[2] : NULL, acpi_line, c) == 0) return 0;
+        eprintf(c, "acpi: %s: no such object\n", argc > 2 ? argv[2] : "\\"); return 1;
+    }
+    if (!strcmp(argv[1], "eval") && argc > 2) {
+        uint64_t args[7]; int n = 0;
+        for (int i = 3; i < argc && n < 7; i++) args[n++] = strtoul(argv[i], NULL, 0);
+        int r = acpi_print_eval(argv[2], n, args, acpi_line, c);
+        if (r == -ENOENT) eprintf(c, "acpi: %s: no such object\n", argv[2]);
+        else if (r < 0) eprintf(c, "acpi: evaluating %s failed (see the kernel log)\n", argv[2]);
+        return r < 0;
+    }
+    cputs(c, "usage: acpi [info]          ACPI tables, mode, SCI, sleep states\n"
+             "       acpi tree [path]     dump the AML namespace (e.g. acpi tree _SB.PCI0)\n"
+             "       acpi eval path [n..] evaluate an object or run a method (e.g. acpi eval _S5)\n"
+             "       acpi irq             PCI interrupt routing from _PRT\n");
+    return 1;
+}
+/* ---- sound ---- */
+static int b_play(struct ctx *c, int argc, char **argv) {
+    if (argc < 2) { cputs(c, "usage: play file.wav ...\n"); return 1; }
+    int status = 0;
+    for (int i = 1; i < argc && !c->sh->cancel; i++) {
+        char p[PATH_MAX]; resolve(c->sh, argv[i], p, sizeof p);
+        struct vnode *v = vfs_lookup(p);
+        if (!v) { eprintf(c, "play: %s: no such file or directory\n", argv[i]); status = 1; continue; }
+        struct wav_info w;
+        int r = wav_parse(v, &w);
+        if (r < 0) { eprintf(c, "play: %s: %s\n", argv[i], r == -ENOTSUP ? "unsupported WAV encoding (PCM or float only)" : "not a WAV file"); vnode_unref(v); status = 1; continue; }
+        int err;
+        struct audio_stream *s = audio_open(w.rate, w.channels, w.bits, w.is_float, &err);
+        if (!s) { eprintf(c, "play: %s\n", err == -ENODEV ? "no sound hardware" : err == -EBUSY ? "the audio device is in use" : "unsupported format"); vnode_unref(v); return 1; }
+        char desc[64]; wav_describe(&w, desc, sizeof desc);
+        uint64_t total = w.frames / w.rate;
+        cprintf(c, "%s: %s, %lu:%02lu\n", vfs_basename(p), desc, total / 60, total % 60);
+        size_t fb = w.channels * w.bits / 8, cap = 65536 / fb * fb;
+        uint8_t *buf = kmalloc(cap);
+        uint64_t shown = ~0ULL;
+        for (uint64_t off = 0; off < w.data_len && !c->sh->cancel; ) {
+            int64_t got = vfs_pread(v, w.data_off + off, buf, MIN((uint64_t)cap, w.data_len - off));
+            if (got <= 0) break;
+            got -= got % fb;
+            if (!got) break;
+            audio_stream_write(s, buf, got / fb, &c->sh->cancel);
+            off += got;
+            uint64_t sec = audio_stream_position(s) / w.rate;
+            if (sec != shown) { cprintf(c, "\r  %lu:%02lu / %lu:%02lu", sec / 60, sec % 60, total / 60, total % 60); shown = sec; }
+        }
+        audio_stream_drain(s, &c->sh->cancel);
+        if (c->sh->cancel) audio_stream_stop(s);
+        else cprintf(c, "\r  %lu:%02lu / %lu:%02lu", total / 60, total % 60, total / 60, total % 60);
+        cputs(c, "\n");
+        audio_stream_close(s);
+        kfree(buf);
+        vnode_unref(v);
+    }
+    return status;
+}
+static int b_volume(struct ctx *c, int argc, char **argv) {
+    struct audio_device *d = audio_device();
+    if (!d) { eprintf(c, "volume: no sound hardware\n"); return 1; }
+    if (argc > 1) {
+        if (!isdigit(argv[1][0])) { cputs(c, "usage: volume [0-100]\n"); return 1; }
+        audio_set_volume(atoi(argv[1]));
+    }
+    cprintf(c, "%s\n%s\nvolume %d%%\n", d->name, d->detail, audio_volume());
+    return 0;
+}
+/* ---- networking ---- */
+static int b_ifconfig(struct ctx *c, int argc, char **argv) {
+    if (argc >= 3) {
+        /* ifconfig <if> <ip> [netmask <m>] [gw <g>] [dns <d>] | ifconfig <if> up|down */
+        struct netif *n = netif_find(argv[1]);
+        if (!n) { eprintf(c, "ifconfig: %s: no such interface\n", argv[1]); return 1; }
+        if (!strcmp(argv[2], "up") || !strcmp(argv[2], "down")) { n->up = !strcmp(argv[2], "up"); return 0; }
+        uint32_t ip, mask = 0xFFFFFF00, gw = 0, dns = 0;
+        if (!str_to_ip(argv[2], &ip)) { eprintf(c, "ifconfig: %s: bad address\n", argv[2]); return 1; }
+        for (int i = 3; i + 1 < argc; i += 2) {
+            uint32_t v;
+            if (!str_to_ip(argv[i + 1], &v)) { eprintf(c, "ifconfig: %s: bad address\n", argv[i + 1]); return 1; }
+            if (!strcmp(argv[i], "netmask")) mask = v; else if (!strcmp(argv[i], "gw")) gw = v; else if (!strcmp(argv[i], "dns")) dns = v;
+            else { eprintf(c, "ifconfig: unknown option %s\n", argv[i]); return 1; }
+        }
+        mutex_lock(&net_lock);
+        n->ip = ip; n->netmask = mask; n->gateway = gw; n->dns = dns ? dns : gw; n->configured = true; n->dhcp = false; n->up = true;
+        mutex_unlock(&net_lock);
+        dns_flush();
+        return 0;
+    }
+    if (!netif_count()) { cputs(c, "no network adapters (QEMU: -device ne2k_pci,netdev=n0 -netdev user,id=n0)\n"); return 1; }
+    for (int i = 0; i < netif_count(); i++) {
+        struct netif *n = netif_at(i);
+        if (argc == 2 && strcmp(argv[1], n->name)) continue;
+        char mac[18], ip[16], mask[16], gw[16], dns[16];
+        mac_to_str(n->mac, mac); ip_to_str(n->ip, ip); ip_to_str(n->netmask, mask); ip_to_str(n->gateway, gw); ip_to_str(n->dns, dns);
+        cprintf(c, "%s: <%s%s> %s\n", n->name, n->up ? "UP" : "DOWN", n->configured ? (n->dhcp ? ",DHCP" : ",STATIC") : ",UNCONFIGURED", n->driver);
+        cprintf(c, "    ether %s\n", mac);
+        if (n->configured) cprintf(c, "    inet %s  netmask %s  gateway %s  dns %s\n", ip, mask, gw, dns);
+        cprintf(c, "    RX packets %lu  bytes %lu  errors %lu  dropped %lu\n", n->rx_packets, n->rx_bytes, n->rx_errors, n->rx_dropped);
+        cprintf(c, "    TX packets %lu  bytes %lu  errors %lu\n", n->tx_packets, n->tx_bytes, n->tx_errors);
+    }
+    return 0;
+}
+static int b_dhcp(struct ctx *c, int argc, char **argv) {
+    struct netif *n = argc > 1 ? netif_find(argv[1]) : netif_at(0);
+    if (!n) { eprintf(c, "dhcp: no such interface\n"); return 1; }
+    cprintf(c, "%s: requesting an address...\n", n->name);
+    mutex_lock(&net_lock); n->configured = false; n->ip = 0; mutex_unlock(&net_lock);
+    int r = dhcp_configure(n, 10000);
+    if (r < 0) { eprintf(c, "dhcp: no lease (%s)\n", r == -ETIMEDOUT ? "no answer" : r == -ECONNREFUSED ? "refused" : "error"); return 1; }
+    char ip[16], gw[16]; ip_to_str(n->ip, ip); ip_to_str(n->gateway, gw);
+    cprintf(c, "%s: %s, gateway %s\n", n->name, ip, gw);
+    return 0;
+}
+static int b_ping(struct ctx *c, int argc, char **argv) {
+    int count = 4; const char *host = NULL;
+    for (int i = 1; i < argc; i++) { if (!strcmp(argv[i], "-c") && i + 1 < argc) count = atoi(argv[++i]); else host = argv[i]; }
+    if (!host) { cputs(c, "usage: ping [-c count] host\n"); return 1; }
+    uint32_t ip;
+    int r = dns_resolve(host, &ip, 5000, &c->sh->cancel);
+    if (r < 0) { eprintf(c, "ping: %s: %s\n", host, r == -ENOENT ? "unknown host" : r == -ENETUNREACH ? "network unreachable" : "lookup failed"); return 1; }
+    char ips[16]; ip_to_str(ip, ips);
+    cprintf(c, "PING %s (%s): 56 data bytes\n", host, ips);
+    int sent = 0, received = 0; int64_t min = -1, max = 0, total = 0;
+    for (int seq = 0; count <= 0 || seq < count; seq++) {
+        if (c->sh->cancel) break;
+        uint64_t start = time_ms();
+        int ttl = 0;
+        int64_t us = icmp_ping(ip, seq, 56, 2000, &ttl);
+        sent++;
+        if (us >= 0) {
+            received++; total += us; if (min < 0 || us < min) min = us; if (us > max) max = us;
+            cprintf(c, "64 bytes from %s: icmp_seq=%d ttl=%d time=%ld.%03ld ms\n", ips, seq, ttl, us / 1000, us % 1000);
+        } else if (us == -ETIMEDOUT) cprintf(c, "Request timeout for icmp_seq %d\n", seq);
+        else { eprintf(c, "ping: sendto: %s\n", us == -ENETUNREACH ? "network unreachable" : "error"); break; }
+        while (time_ms() - start < 1000 && !c->sh->cancel && (count <= 0 || seq + 1 < count)) thread_sleep_ms(20);
+    }
+    cprintf(c, "--- %s ping statistics ---\n%d packets transmitted, %d packets received, %d%% packet loss\n", host, sent, received, sent ? (sent - received) * 100 / sent : 0);
+    if (received) cprintf(c, "round-trip min/avg/max = %ld.%03ld/%ld.%03ld/%ld.%03ld ms\n", min / 1000, min % 1000, total / received / 1000, total / received % 1000, max / 1000, max % 1000);
+    return received ? 0 : 1;
+}
+static int b_nslookup(struct ctx *c, int argc, char **argv) {
+    if (argc < 2) { cprintf(c, "usage: %s name\n", argv[0]); return 1; }
+    struct netif *n = netif_default();
+    if (n && n->configured) { char d[16]; ip_to_str(n->dns, d); cprintf(c, "Server:  %s\n\n", d); }
+    uint32_t ip;
+    int r = dns_resolve(argv[1], &ip, 8000, &c->sh->cancel);
+    if (r < 0) { eprintf(c, "%s: %s: %s\n", argv[0], argv[1], r == -ENOENT ? "NXDOMAIN" : r == -ETIMEDOUT ? "timed out" : r == -ENETUNREACH ? "network unreachable" : "lookup failed"); return 1; }
+    char ips[16]; ip_to_str(ip, ips);
+    cprintf(c, "Name:    %s\nAddress: %s\n", argv[1], ips);
+    return 0;
+}
+static void curl_progress(void *ctx, const char *stage, size_t done, size_t total) { UNUSED(ctx); UNUSED(stage); UNUSED(done); UNUSED(total); }
+static int b_curl(struct ctx *c, int argc, char **argv) {
+    const char *url = NULL, *out = NULL; bool head = false, include = false, location = true;
+    for (int i = 1; i < argc; i++) {
+        if (!strcmp(argv[i], "-o") && i + 1 < argc) out = argv[++i];
+        else if (!strcmp(argv[i], "-I")) head = true;
+        else if (!strcmp(argv[i], "-i")) include = true;
+        else if (!strcmp(argv[i], "-L")) location = true;
+        else if (!strcmp(argv[i], "-s")) ;
+        else url = argv[i];
+    }
+    if (!url) { cputs(c, "usage: curl [-I] [-i] [-o file] http://host/path\n"); return 1; }
+    char full[1024];
+    if (!strstr(url, "://")) snprintf(full, sizeof full, "http://%s", url); else strlcpy(full, url, sizeof full);
+    struct http_request req = { .url = full, .method = head ? "HEAD" : "GET", .cancel = &c->sh->cancel, .max_redirects = location ? -1 : 0, .progress = curl_progress };
+    struct http_response resp;
+    int r = http_request(&req, &resp);
+    if (r < 0) { eprintf(c, "curl: %s\n", resp.error); http_response_free(&resp); return 1; }
+    if (head || include) { cprintf(c, "HTTP/1.1 %d %s\n", resp.status, resp.status_text); for (char *p = resp.headers; p && *p; p++) if (*p != '\r') cwrite(c, p, 1); }
+    if (!head) {
+        if (out) {
+            char p[PATH_MAX]; resolve(c->sh, out, p, sizeof p);
+            if (vfs_write_file(p, resp.body, resp.body_len) < 0) { eprintf(c, "curl: cannot write %s\n", out); http_response_free(&resp); return 1; }
+            cprintf(c, "%zu bytes saved to %s\n", resp.body_len, p);
+        } else cwrite(c, (const char *)resp.body, resp.body_len);
+    }
+    http_response_free(&resp);
+    return 0;
+}
+static int b_arp(struct ctx *c, int argc, char **argv) {
+    struct arp_entry_info e[64]; int n = arp_list(e, 64);
+    for (int i = 0; i < n; i++) { char ip[16], mac[18]; ip_to_str(e[i].ip, ip); mac_to_str(e[i].mac, mac); cprintf(c, "%-15s  %s  %lus\n", ip, e[i].resolved ? mac : "(incomplete)    ", e[i].age_ms / 1000); }
+    return 0;
+}
+static int b_netstat(struct ctx *c, int argc, char **argv) {
+    struct tcp_conn_info t[64]; int n = tcp_list(t, 64);
+    cputs(c, "Proto Recv-Q Send-Q Local Address          Foreign Address        State\n");
+    for (int i = 0; i < n; i++) {
+        char l[32], r[32], a[16];
+        ip_to_str(t[i].lip, a); snprintf(l, sizeof l, "%s:%u", a, t[i].lport);
+        ip_to_str(t[i].rip, a); snprintf(r, sizeof r, "%s:%u", a, t[i].rport);
+        cprintf(c, "tcp   %6u %6u %-22s %-22s %s\n", t[i].rx_queued, t[i].tx_queued, l, r, t[i].state);
+    }
+    return 0;
+}
 static int b_date(struct ctx *c, int argc, char **argv) {
     static const char *wd[] = { "Sun", "Mon", "Tue", "Wed", "Thu", "Fri", "Sat" }; static const char *mon[] = { "Jan", "Feb", "Mar", "Apr", "May", "Jun", "Jul", "Aug", "Sep", "Oct", "Nov", "Dec" };
     uint64_t t = time_unix(); struct rtc_time d; unix_to_datetime(t + tz_offset_minutes * 60, &d);
@@ -800,10 +1005,10 @@ static int b_help(struct ctx *c, int argc, char **argv) {
 static int b_type(struct ctx *c, int argc, char **argv) { return b_which(c, argc, argv); }
 
 static const struct builtin builtins[] = {
-    { "alias", b_alias, "define or list aliases: alias ll='ls -l'" }, { "basename", b_basename, "strip directory from a path" },
+    { "acpi", b_acpi, "ACPI information, namespace dump and evaluation" }, { "alias", b_alias, "define or list aliases: alias ll='ls -l'" }, { "arp", b_arp, "show the ARP cache" }, { "basename", b_basename, "strip directory from a path" },
     { "cat", b_cat, "concatenate files (-n numbers lines)" }, { "cd", b_cd, "change directory (cd -, cd ~)" },
-    { "clear", b_clear, "clear the screen" }, { "cp", b_cp, "copy files (-r for directories)" },
-    { "date", b_date, "show the current date and time" }, { "df", b_df, "show filesystem usage (-h)" },
+    { "clear", b_clear, "clear the screen" }, { "cp", b_cp, "copy files (-r for directories)" }, { "curl", b_curl, "fetch a URL over HTTP (-I headers, -i, -o file)" },
+    { "date", b_date, "show the current date and time" }, { "df", b_df, "show filesystem usage (-h)" }, { "dhcp", b_dhcp, "request an address for an adapter" },
     { "dirname", b_dirname, "strip the last component from a path" }, { "display", b_display, "show or set the display resolution" }, { "du", b_du, "disk usage (-h)" },
     { "echo", b_echo, "print arguments (-n, -e)" }, { "env", b_env, "list environment variables" },
     { "exit", b_exit, "exit the shell" }, { "export", b_export, "set environment variables" },
@@ -811,13 +1016,13 @@ static const struct builtin builtins[] = {
     { "find", b_find, "list files recursively (-name pattern)" }, { "free", b_free, "show memory usage (-h)" },
     { "grep", b_grep, "search for a pattern (-i -v -c -n)" }, { "head", b_head, "first lines of input (-n N)" },
     { "help", b_help, "this list" }, { "hexdump", b_hexdump, "hex dump of a file (-n bytes)" },
-    { "history", b_history, "show command history (-c clears)" }, { "hostname", b_hostname, "print the host name" },
-    { "id", b_id, "print user identity" }, { "install", b_install, "install inFlux to a disk" }, { "kill", b_kill, "terminate a process: kill [-9] pid" },
+    { "history", b_history, "show command history (-c clears)" }, { "host", b_nslookup, "look up a host name" }, { "hostname", b_hostname, "print the host name" },
+    { "id", b_id, "print user identity" }, { "ifconfig", b_ifconfig, "show or configure network adapters" }, { "install", b_install, "install inFlux to a disk" }, { "kill", b_kill, "terminate a process: kill [-9] pid" },
     { "ls", b_ls, "list directory contents (-l -a -h)" }, { "lsblk", b_lsblk, "list block devices" }, { "lsgpu", b_lsgpu, "show graphics adapters" },
     { "lspci", b_lspci, "list PCI devices" }, { "mkdir", b_mkdir, "create directories (-p)" },
-    { "mount", b_mount, "list mounted filesystems" }, { "mv", b_mv, "move or rename files" },
-    { "nproc", b_nproc, "number of processors" }, { "open", b_open, "open a file or folder in the desktop (-a App)" },
-    { "printf", b_printf, "formatted output" }, { "ps", b_ps, "list processes (-T shows threads)" },
+    { "mount", b_mount, "list mounted filesystems" }, { "mv", b_mv, "move or rename files" }, { "netstat", b_netstat, "list TCP connections" },
+    { "nproc", b_nproc, "number of processors" }, { "nslookup", b_nslookup, "query DNS for a host name" }, { "open", b_open, "open a file or folder in the desktop (-a App)" },
+    { "ping", b_ping, "send ICMP echo requests (-c count)" }, { "play", b_play, "play WAV files (Ctrl+C stops)" }, { "printf", b_printf, "formatted output" }, { "ps", b_ps, "list processes (-T shows threads)" },
     { "pwd", b_pwd, "print the working directory" }, { "reboot", b_reboot, "restart the computer" },
     { "rev", b_rev, "reverse each line" }, { "rm", b_rm, "remove files (-r -f)" },
     { "rmdir", b_rmdir, "remove empty directories" }, { "seq", b_seq, "print a sequence of numbers" },
@@ -827,7 +1032,7 @@ static const struct builtin builtins[] = {
     { "tail", b_tail, "last lines of input (-n N)" }, { "tee", b_tee, "copy input to a file and stdout" },
     { "touch", b_touch, "create files or update timestamps" }, { "tree", b_tree, "show a directory tree" },
     { "true", b_true, "return success" }, { "type", b_type, "describe a command" },
-    { "unalias", b_unalias, "remove an alias" }, { "uname", b_uname, "system information (-a)" },
+    { "unalias", b_unalias, "remove an alias" }, { "volume", b_volume, "show the sound output, set the volume (0-100)" }, { "uname", b_uname, "system information (-a)" },
     { "uniq", b_uniq, "filter adjacent duplicate lines (-c)" }, { "unset", b_unset, "remove environment variables" },
     { "uptime", b_uptime, "show uptime and load" }, { "wc", b_wc, "count lines, words and bytes" },
     { "which", b_which, "locate a command" }, { "whoami", b_whoami, "print the current user" },
@@ -1076,6 +1281,7 @@ void shell_main(void *arg) {
     struct shell *sh = kzalloc(sizeof *sh);
     sh->tty = ss->tty; sh->proc = current_thread->proc;
     sh->tty_f = tty_file(sh->tty);
+    sh->tty->intr_flag = &sh->cancel;   /* Ctrl+C stops ping, play, sleep, ... */
     env_set(sh, "HOME", "/home/flux"); env_set(sh, "USER", "flux"); env_set(sh, "SHELL", "/bin/zsh"); env_set(sh, "PATH", "/bin");
     env_set(sh, "TERM", "xterm-256color"); env_set(sh, "PWD", sh->proc->cwd); env_set(sh, "HOSTNAME", "influx"); env_set(sh, "EDITOR", "editor");
     alias_set(sh, "ll", "ls -l"); alias_set(sh, "la", "ls -la"); alias_set(sh, "l", "ls -lah"); alias_set(sh, "..", "cd .."); alias_set(sh, "cls", "clear");
@@ -1102,6 +1308,7 @@ void shell_main(void *arg) {
         char line_copy[LINE_MAX]; strcpy(line_copy, sh->line);
         run_line(sh, &c, line_copy);
     }
+    sh->tty->intr_flag = NULL;
     vfs_close(sh->tty_f);
     for (int i = 0; i < sh->nhist; i++) kfree(sh->history[i]);
     kfree(ss->cwd); kfree(ss->cmd); kfree(ss);

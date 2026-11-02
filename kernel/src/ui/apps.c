@@ -3,6 +3,7 @@
 #include "string.h"
 #include "io.h"
 #include "fs.h"
+#include "acpi.h"
 
 void files_main(void *arg);
 void terminal_main(void *arg);
@@ -12,6 +13,8 @@ void taskman_main(void *arg);
 void settings_main(void *arg);
 void gldemo_main(void *arg);
 void installer_main(void *arg);
+void browser_main(void *arg);
+void player_main(void *arg);
 
 const struct app_info app_table[APP_COUNT] = {
     [APP_FILES]   = { "Files", "files", files_main, false },
@@ -22,6 +25,8 @@ const struct app_info app_table[APP_COUNT] = {
     [APP_SETTINGS] = { "System Settings", "settings", settings_main, true },
     [APP_GLDEMO]   = { "OpenGL Demo", "gldemo", gldemo_main, false },
     [APP_INSTALLER] = { "Install inFlux", "drive", installer_main, true },
+    [APP_BROWSER]  = { "Browser", "browser", browser_main, false },
+    [APP_PLAYER]   = { "Audio Player", "player", player_main, true },
 };
 
 struct app_start { int id; char *arg; };
@@ -94,6 +99,7 @@ const char *icon_for_file(const char *name, int type) {
     if (!strcasecmp(ext, "sh") || !strcasecmp(ext, "zsh")) return "file-script";
     if (!strcasecmp(ext, "json")) return "file-json";
     if (!strcasecmp(ext, "png") || !strcasecmp(ext, "jpg") || !strcasecmp(ext, "img") || !strcasecmp(ext, "svg")) return "file-image";
+    if (!strcasecmp(ext, "wav") || !strcasecmp(ext, "mp3") || !strcasecmp(ext, "ogg") || !strcasecmp(ext, "flac")) return "file-audio";
     if (!strcasecmp(ext, "elf") || !strcasecmp(ext, "bin")) return "file-exec";
     if (!strcasecmp(ext, "fnt")) return "file-binary";
     return "file-generic";
@@ -105,8 +111,11 @@ void app_open_path(const char *path) {
     if (st.type == VN_DIR) { app_launch(APP_FILES, path); return; }
     const char *base = vfs_basename(path);
     if (!strncmp(path, "/bin/", 5) && st.type == VN_FILE) { app_launch(APP_TERMINAL, path); return; }
+    const char *dot = strrchr(base, '.');
+    if (dot && (!strcasecmp(dot, ".html") || !strcasecmp(dot, ".htm"))) { app_launch(APP_BROWSER, path); return; }
+    if (dot && !strcasecmp(dot, ".wav")) { app_launch(APP_PLAYER, path); return; }
     const char *icon = icon_for_file(base, st.type);
-    if (!strcmp(icon, "file-image") || !strcmp(icon, "file-binary")) { app_launch(APP_FILES, NULL); return; }
+    if (!strcmp(icon, "file-image") || !strcmp(icon, "file-binary") || !strcmp(icon, "file-audio")) { app_launch(APP_FILES, NULL); return; }
     app_launch(APP_EDITOR, path);
 }
 
@@ -187,6 +196,7 @@ void wm_system_command(int cmd) {
 void power_restart(void) {
     vfs_sync();
     kprintf("power: restarting\n");
+    acpi_reboot();
     cli();
     uint8_t good = 0x02;
     while (good & 0x02) good = inb(0x64);
@@ -199,6 +209,8 @@ void power_restart(void) {
 void power_shutdown(void) {
     vfs_sync();
     kprintf("power: shutting down\n");
+    acpi_shutdown();
+    /* firmware without a usable \_S5: the emulators' fixed power-off ports */
     outw(0x604, 0x2000);    /* QEMU */
     outw(0xB004, 0x2000);   /* Bochs */
     outw(0x4004, 0x3400);   /* VirtualBox */
@@ -209,4 +221,12 @@ void power_shutdown(void) {
     for (;;) hlt();
 }
 void power_restart_thread(void *a) { if (dialog_confirm("Restart", "Are you sure you want to restart your computer now?", "Restart", false)) power_restart(); }
-void power_shutdown_thread(void *a) { if (dialog_confirm("Shut Down", "Are you sure you want to shut down your computer now?", "Shut Down", false)) power_shutdown(); }
+static volatile bool shutdown_asking;
+void power_shutdown_thread(void *a) {
+    shutdown_asking = true;
+    bool yes = dialog_confirm("Shut Down", "Are you sure you want to shut down your computer now?", "Shut Down", false);
+    shutdown_asking = false;
+    if (yes) power_shutdown();
+}
+/* the ACPI power button asks the same question as the menu, once at a time */
+void power_button_pressed(void) { if (!shutdown_asking) wm_system_command(CMD_SHUTDOWN); }
