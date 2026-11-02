@@ -6,7 +6,7 @@ takes its cues from macOS.
 
 Things to try:
   - Open the Terminal from the Dock and type `help`.
-  - Browse the mounted btrfs volumes under /mnt in Finder.
+  - Browse the mounted btrfs volumes under /mnt in Files.
   - Edit this file and press Cmd+S to save it.
   - Open the Task Manager to watch threads being scheduled.
 

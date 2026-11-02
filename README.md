@@ -47,7 +47,7 @@ shell, user-space C library and build system.
 - Dock with pinned apps, running indicators, hover tooltips and Trash
 - Light and dark appearance, eight accent colors, wallpaper presets
   (default: steel blue)
-- Applications: **Finder** (sidebar, icon/list views, history, new folder,
+- Applications: **Files** (sidebar, icon/list views, history, new folder,
   rename, duplicate, move to Trash, Get Info), **Terminal**, **Text Editor**
   (selection, clipboard, undo, open/save), **Calculator**, **Task Manager**
   (live CPU/memory/threads, force quit), **System Settings**
@@ -87,11 +87,11 @@ Changing the SVG icon sources requires `python3` with `cairosvg`; run
 ## Using it
 
 - Click an icon in the Dock to start an application; double-click files in
-  Finder to open them.
+  Files to open them.
 - Keyboard shortcuts: `⌘Q` quit, `⌘W` close window, `⌘M` minimize, `⌘Tab` cycle
   windows, `⌘,` System Settings, `Ctrl+Alt+Delete` Task Manager. On a PC keyboard
   the Windows key is `⌘`; `Ctrl` works as an alias outside the Terminal.
-- The btrfs volumes appear in the Finder sidebar and under `/mnt`. Try
+- The btrfs volumes appear in the Files sidebar and under `/mnt`. Try
   `echo hi > /mnt/sda1/hello.txt` in the Terminal, then inspect `build/sata.img`
   on Linux (the filesystem starts 1 MiB into the image).
 - Type `help` in the Terminal for the list of shell built-ins; programs in
@@ -107,7 +107,7 @@ kernel/src/drivers  framebuffer, PS/2, AHCI, NVMe, block devices
 kernel/src/fs       VFS, tmpfs, initrd, tty, pipes, btrfs
 kernel/src/gfx      canvas primitives, fonts, images
 kernel/src/ui       window server, theme, widgets, dialogs, app registry
-kernel/src/apps     Finder, Terminal, shell, Editor, Calculator, Task Manager, Settings
+kernel/src/apps     Files, Terminal, shell, Editor, Calculator, Task Manager, Settings
 user/libc           minimal C library for user programs
 user/bin            user-mode programs
 tools               fontgen, imgconv, icon renderer, test-disk builder

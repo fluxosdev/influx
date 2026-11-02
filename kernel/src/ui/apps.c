@@ -4,7 +4,7 @@
 #include "io.h"
 #include "fs.h"
 
-void finder_main(void *arg);
+void files_main(void *arg);
 void terminal_main(void *arg);
 void editor_main(void *arg);
 void calc_main(void *arg);
@@ -12,7 +12,7 @@ void taskman_main(void *arg);
 void settings_main(void *arg);
 
 const struct app_info app_table[APP_COUNT] = {
-    [APP_FINDER]   = { "Finder", "finder", finder_main, false },
+    [APP_FILES]   = { "Files", "files", files_main, false },
     [APP_TERMINAL] = { "Terminal", "terminal", terminal_main, false },
     [APP_EDITOR]   = { "Text Editor", "editor", editor_main, false },
     [APP_CALC]     = { "Calculator", "calculator", calc_main, true },
@@ -98,11 +98,11 @@ const char *icon_for_file(const char *name, int type) {
 void app_open_path(const char *path) {
     struct stat st;
     if (vfs_stat(path, &st) < 0) return;
-    if (st.type == VN_DIR) { app_launch(APP_FINDER, path); return; }
+    if (st.type == VN_DIR) { app_launch(APP_FILES, path); return; }
     const char *base = vfs_basename(path);
     if (!strncmp(path, "/bin/", 5) && st.type == VN_FILE) { app_launch(APP_TERMINAL, path); return; }
     const char *icon = icon_for_file(base, st.type);
-    if (!strcmp(icon, "file-image") || !strcmp(icon, "file-binary")) { app_launch(APP_FINDER, NULL); return; }
+    if (!strcmp(icon, "file-image") || !strcmp(icon, "file-binary")) { app_launch(APP_FILES, NULL); return; }
     app_launch(APP_EDITOR, path);
 }
 

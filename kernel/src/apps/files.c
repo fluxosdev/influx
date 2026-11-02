@@ -1,4 +1,4 @@
-/* Finder: a sidebar + icon/list view file manager. */
+/* Files: a sidebar + icon/list view file manager. */
 #include "ui.h"
 #include "fs.h"
 #include "mm.h"
@@ -15,7 +15,7 @@
 struct entry { char name[NAME_MAX + 1]; int type; uint64_t size, mtime; };
 struct side_item { const char *label; const char *icon; char path[PATH_MAX]; bool header; };
 
-struct finder {
+struct files {
     struct window *w;
     char path[PATH_MAX];
     char history[32][PATH_MAX]; int hist_len, hist_pos;
@@ -36,17 +36,17 @@ enum { FCMD_NEW_WINDOW = CMD_APP + 1, FCMD_RENAME, FCMD_TRASH, FCMD_INFO, FCMD_I
        FCMD_BACK, FCMD_FORWARD, FCMD_UP, FCMD_HOME, FCMD_COMPUTER, FCMD_GOTO, FCMD_OPEN_TERMINAL, FCMD_EMPTY_TRASH, FCMD_DUPLICATE };
 
 static const struct menu_item file_items[] = {
-    MENU("New Finder Window", FCMD_NEW_WINDOW, 'n', MOD_CMD), MENU("New Folder", CMD_NEW_FOLDER, 'n', MOD_CMD | MOD_SHIFT), MENU("New Document", CMD_NEW, 'n', MOD_CMD | MOD_ALT), MENU_SEP,
+    MENU("New Files Window", FCMD_NEW_WINDOW, 'n', MOD_CMD), MENU("New Folder", CMD_NEW_FOLDER, 'n', MOD_CMD | MOD_SHIFT), MENU("New Document", CMD_NEW, 'n', MOD_CMD | MOD_ALT), MENU_SEP,
     MENU("Open", CMD_OPEN, 'o', MOD_CMD), MENU("Open in Terminal", FCMD_OPEN_TERMINAL, 't', MOD_CMD | MOD_SHIFT), MENU("Get Info", FCMD_INFO, 'i', MOD_CMD), MENU("Rename…", FCMD_RENAME, KEY_ENTER, 0), MENU("Duplicate", FCMD_DUPLICATE, 'd', MOD_CMD), MENU_SEP,
     MENU("Move to Trash", FCMD_TRASH, KEY_BACKSPACE, MOD_CMD), MENU("Empty Trash…", FCMD_EMPTY_TRASH, KEY_BACKSPACE, MOD_CMD | MOD_SHIFT), MENU_SEP,
-    MENU("Close Window", CMD_CLOSE, 'w', MOD_CMD), MENU("Quit Finder", CMD_QUIT, 'q', MOD_CMD),
+    MENU("Close Window", CMD_CLOSE, 'w', MOD_CMD), MENU("Quit Files", CMD_QUIT, 'q', MOD_CMD),
 };
 static const struct menu_item edit_items[] = { MENU("Copy", CMD_COPY, 'c', MOD_CMD), MENU("Paste", CMD_PASTE, 'v', MOD_CMD), MENU_SEP, MENU("Select All", CMD_SELECT_ALL, 'a', MOD_CMD) };
 static const struct menu_item view_items[] = { MENU("as Icons", FCMD_ICONS, '1', MOD_CMD), MENU("as List", FCMD_LIST, '2', MOD_CMD), MENU_SEP, MENU("Show Hidden Files", FCMD_HIDDEN, '.', MOD_CMD | MOD_SHIFT), MENU("Refresh", FCMD_REFRESH, 'r', MOD_CMD) };
 static const struct menu_item go_items[] = { MENU("Back", FCMD_BACK, '[', MOD_CMD), MENU("Forward", FCMD_FORWARD, ']', MOD_CMD), MENU("Enclosing Folder", FCMD_UP, KEY_UP, MOD_CMD), MENU_SEP, MENU("Home", FCMD_HOME, 'h', MOD_CMD | MOD_SHIFT), MENU("Computer", FCMD_COMPUTER, 'c', MOD_CMD | MOD_SHIFT), MENU_SEP, MENU("Go to Folder…", FCMD_GOTO, 'g', MOD_CMD | MOD_SHIFT) };
 static const struct menu_item help_items[] = { MENU("inFlux Help", CMD_HELP, '?', MOD_CMD) };
 static const struct menu menus[] = { { "File", file_items, ARRAY_LEN(file_items) }, { "Edit", edit_items, ARRAY_LEN(edit_items) }, { "View", view_items, ARRAY_LEN(view_items) }, { "Go", go_items, ARRAY_LEN(go_items) }, { "Help", help_items, ARRAY_LEN(help_items) } };
-static struct app_menus finder_menus = { menus, ARRAY_LEN(menus) };
+static struct app_menus files_menus = { menus, ARRAY_LEN(menus) };
 
 static void format_size(uint64_t sz, char *out, size_t n) {
     if (sz < 1000) snprintf(out, n, "%lu bytes", sz);
@@ -84,7 +84,7 @@ static int cmp_entries(const struct entry *a, const struct entry *b, int col) {
     return strcasecmp(a->name, b->name);
 }
 
-static void load_dir(struct finder *f) {
+static void load_dir(struct files *f) {
     kfree(f->entries); kfree(f->sel);
     f->entries = NULL; f->nentries = 0; f->sel = NULL;
     struct vnode *d = vfs_lookup(f->path);
@@ -108,7 +108,7 @@ static void load_dir(struct finder *f) {
     f->selected = -1; f->scroll = 0;
 }
 
-static void build_sidebar(struct finder *f) {
+static void build_sidebar(struct files *f) {
     f->nside = 0;
     #define SIDE(l, ic, p, h) do { struct side_item *s = &f->side[f->nside++]; s->label = l; s->icon = ic; strlcpy(s->path, p, PATH_MAX); s->header = h; } while (0)
     SIDE("Favorites", NULL, "", true);
@@ -127,10 +127,10 @@ static void build_sidebar(struct finder *f) {
     SIDE("Trash", "trash", "/home/flux/.Trash", false);
 }
 
-static void navigate(struct finder *f, const char *path, bool push) {
+static void navigate(struct files *f, const char *path, bool push) {
     char norm[PATH_MAX]; vfs_normalize("/", path, norm, sizeof norm);
     struct stat st;
-    if (vfs_stat(norm, &st) < 0 || st.type != VN_DIR) { dialog_message("Finder", "The folder can’t be found."); return; }
+    if (vfs_stat(norm, &st) < 0 || st.type != VN_DIR) { dialog_message("Files", "The folder can’t be found."); return; }
     strlcpy(f->path, norm, sizeof f->path);
     if (push) {
         if (f->hist_pos < f->hist_len - 1) f->hist_len = f->hist_pos + 1;
@@ -144,19 +144,19 @@ static void navigate(struct finder *f, const char *path, bool push) {
 }
 
 /* ---- geometry ---- */
-static struct rect content_rect(struct finder *f) { return rect_make(SIDEBAR_W, TITLEBAR_H + TOOLBAR_H, f->w->frame.w - SIDEBAR_W, f->w->frame.h - TITLEBAR_H - TOOLBAR_H - STATUS_H); }
-static int cols_per_row(struct finder *f) { int c = (content_rect(f).w - 16) / CELL_W; return c < 1 ? 1 : c; }
-static int content_height(struct finder *f) {
+static struct rect content_rect(struct files *f) { return rect_make(SIDEBAR_W, TITLEBAR_H + TOOLBAR_H, f->w->frame.w - SIDEBAR_W, f->w->frame.h - TITLEBAR_H - TOOLBAR_H - STATUS_H); }
+static int cols_per_row(struct files *f) { int c = (content_rect(f).w - 16) / CELL_W; return c < 1 ? 1 : c; }
+static int content_height(struct files *f) {
     if (f->list_view) return LIST_HEADER_H + f->nentries * LIST_ROW_H + 8;
     int c = cols_per_row(f); return ((f->nentries + c - 1) / c) * CELL_H + 16;
 }
-static struct rect item_rect(struct finder *f, int i) {
+static struct rect item_rect(struct files *f, int i) {
     struct rect cr = content_rect(f);
     if (f->list_view) return rect_make(cr.x, cr.y + LIST_HEADER_H + i * LIST_ROW_H - f->scroll, cr.w, LIST_ROW_H);
     int c = cols_per_row(f);
     return rect_make(cr.x + 8 + (i % c) * CELL_W, cr.y + 8 + (i / c) * CELL_H - f->scroll, CELL_W, CELL_H);
 }
-static int item_at(struct finder *f, int x, int y) {
+static int item_at(struct files *f, int x, int y) {
     struct rect cr = content_rect(f);
     if (!rect_contains(cr, x, y)) return -1;
     for (int i = 0; i < f->nentries; i++) {
@@ -166,15 +166,15 @@ static int item_at(struct finder *f, int x, int y) {
     }
     return -1;
 }
-static int clamp_scroll(struct finder *f) { int max = content_height(f) - content_rect(f).h; if (max < 0) max = 0; f->scroll = CLAMP(f->scroll, 0, max); return max; }
+static int clamp_scroll(struct files *f) { int max = content_height(f) - content_rect(f).h; if (max < 0) max = 0; f->scroll = CLAMP(f->scroll, 0, max); return max; }
 
 /* ---- drawing ---- */
-static struct rect btn_back(struct finder *f) { return rect_make(SIDEBAR_W + 12, TITLEBAR_H + 8, 30, 28); }
-static struct rect btn_fwd(struct finder *f) { return rect_make(SIDEBAR_W + 44, TITLEBAR_H + 8, 30, 28); }
-static struct rect btn_view(struct finder *f, int which) { return rect_make(f->w->frame.w - 12 - 72 + which * 36, TITLEBAR_H + 8, 36, 28); }
-static struct rect btn_newfolder(struct finder *f) { return rect_make(f->w->frame.w - 12 - 72 - 10 - 40, TITLEBAR_H + 8, 40, 28); }
+static struct rect btn_back(struct files *f) { return rect_make(SIDEBAR_W + 12, TITLEBAR_H + 8, 30, 28); }
+static struct rect btn_fwd(struct files *f) { return rect_make(SIDEBAR_W + 44, TITLEBAR_H + 8, 30, 28); }
+static struct rect btn_view(struct files *f, int which) { return rect_make(f->w->frame.w - 12 - 72 + which * 36, TITLEBAR_H + 8, 36, 28); }
+static struct rect btn_newfolder(struct files *f) { return rect_make(f->w->frame.w - 12 - 72 - 10 - 40, TITLEBAR_H + 8, 40, 28); }
 
-static void draw(struct finder *f) {
+static void draw(struct files *f) {
     struct canvas *c = window_begin_draw(f->w);
     int W = c->w, H = c->h;
     gfx_fill(c, theme.bg);
@@ -290,9 +290,9 @@ static void draw(struct finder *f) {
 }
 
 /* ---- actions ---- */
-static void select_only(struct finder *f, int i) { memset(f->sel, 0, f->nentries); if (i >= 0) f->sel[i] = true; f->selected = i; f->anchor = i; }
-static int first_selected(struct finder *f) { for (int i = 0; i < f->nentries; i++) if (f->sel[i]) return i; return -1; }
-static void ensure_visible(struct finder *f, int i) {
+static void select_only(struct files *f, int i) { memset(f->sel, 0, f->nentries); if (i >= 0) f->sel[i] = true; f->selected = i; f->anchor = i; }
+static int first_selected(struct files *f) { for (int i = 0; i < f->nentries; i++) if (f->sel[i]) return i; return -1; }
+static void ensure_visible(struct files *f, int i) {
     if (i < 0) return;
     struct rect cr = content_rect(f), r = item_rect(f, i);
     int top = cr.y + (f->list_view ? LIST_HEADER_H : 0);
@@ -300,9 +300,9 @@ static void ensure_visible(struct finder *f, int i) {
     else if (r.y + r.h > cr.y + cr.h) f->scroll += r.y + r.h - (cr.y + cr.h);
     clamp_scroll(f);
 }
-static void full_path(struct finder *f, const char *name, char *out, size_t n) { snprintf(out, n, "%s/%s", !strcmp(f->path, "/") ? "" : f->path, name); }
+static void full_path(struct files *f, const char *name, char *out, size_t n) { snprintf(out, n, "%s/%s", !strcmp(f->path, "/") ? "" : f->path, name); }
 
-static void open_entry(struct finder *f, int i) {
+static void open_entry(struct files *f, int i) {
     if (i < 0 || i >= f->nentries) return;
     char p[PATH_MAX]; full_path(f, f->entries[i].name, p, sizeof p);
     if (f->entries[i].type == VN_DIR) navigate(f, p, true);
@@ -345,7 +345,7 @@ static void unique_dest(const char *dir, const char *name, char *out, size_t n) 
     while (vfs_stat(out, &st) == 0 && k < 100) { snprintf(out, n, "%s/%s copy%s%d", dir, name, k == 2 ? "" : " ", k); if (k == 2) snprintf(out, n, "%s/%s copy", dir, name); k++; }
 }
 
-static void trash_selected(struct finder *f) {
+static void trash_selected(struct files *f) {
     int n = 0; for (int i = 0; i < f->nentries; i++) if (f->sel[i]) n++;
     if (!n) return;
     bool in_trash = !strcmp(f->path, "/home/flux/.Trash");
@@ -364,35 +364,35 @@ static void trash_selected(struct finder *f) {
     load_dir(f);
 }
 
-static void new_folder(struct finder *f) {
+static void new_folder(struct files *f) {
     char name[NAME_MAX + 1];
     if (!dialog_prompt("New Folder", "Name of the new folder:", "untitled folder", name, sizeof name) || !name[0]) return;
     char p[PATH_MAX]; full_path(f, name, p, sizeof p);
     int r = vfs_mkdir(p);
-    if (r < 0) dialog_message("Finder", r == -EEXIST ? "An item with that name already exists." : "The folder could not be created.");
+    if (r < 0) dialog_message("Files", r == -EEXIST ? "An item with that name already exists." : "The folder could not be created.");
     load_dir(f);
     for (int i = 0; i < f->nentries; i++) if (!strcmp(f->entries[i].name, name)) { select_only(f, i); ensure_visible(f, i); }
 }
-static void new_document(struct finder *f) {
+static void new_document(struct files *f) {
     char name[NAME_MAX + 1];
     if (!dialog_prompt("New Document", "Name of the new text file:", "untitled.txt", name, sizeof name) || !name[0]) return;
     char p[PATH_MAX]; full_path(f, name, p, sizeof p);
-    if (vfs_write_file(p, "", 0) < 0) dialog_message("Finder", "The file could not be created.");
+    if (vfs_write_file(p, "", 0) < 0) dialog_message("Files", "The file could not be created.");
     load_dir(f);
 }
-static void rename_selected(struct finder *f) {
+static void rename_selected(struct files *f) {
     int i = first_selected(f); if (i < 0) return;
     char name[NAME_MAX + 1];
     if (!dialog_prompt("Rename", "Enter a new name:", f->entries[i].name, name, sizeof name) || !name[0] || !strcmp(name, f->entries[i].name)) return;
     char a[PATH_MAX], b[PATH_MAX]; full_path(f, f->entries[i].name, a, sizeof a); full_path(f, name, b, sizeof b);
     struct stat st;
-    if (vfs_stat(b, &st) == 0) { dialog_message("Finder", "An item with that name already exists."); return; }
+    if (vfs_stat(b, &st) == 0) { dialog_message("Files", "An item with that name already exists."); return; }
     if (f->entries[i].type == VN_DIR) { if (copy_tree(a, b) == 0) remove_tree(a); }
     else vfs_rename(a, b);
     load_dir(f);
     for (int k = 0; k < f->nentries; k++) if (!strcmp(f->entries[k].name, name)) select_only(f, k);
 }
-static void get_info(struct finder *f) {
+static void get_info(struct files *f) {
     int i = first_selected(f);
     char msg[512];
     if (i < 0) {
@@ -407,21 +407,21 @@ static void get_info(struct finder *f) {
     }
     dialog_message("Info", msg);
 }
-static void duplicate_selected(struct finder *f) {
+static void duplicate_selected(struct files *f) {
     int i = first_selected(f); if (i < 0) return;
     char a[PATH_MAX], b[PATH_MAX]; full_path(f, f->entries[i].name, a, sizeof a);
     unique_dest(f->path, f->entries[i].name, b, sizeof b);
     copy_tree(a, b);
     load_dir(f);
 }
-static void paste(struct finder *f) {
+static void paste(struct files *f) {
     if (!f->clip_path[0]) { char *s = clipboard_get(); if (s) { struct stat st; if (s[0] == '/' && vfs_stat(s, &st) == 0) strlcpy(f->clip_path, s, PATH_MAX); kfree(s); } }
     if (!f->clip_path[0]) return;
     char dst[PATH_MAX]; unique_dest(f->path, vfs_basename(f->clip_path), dst, sizeof dst);
     copy_tree(f->clip_path, dst);
     load_dir(f);
 }
-static void empty_trash(struct finder *f) {
+static void empty_trash(struct files *f) {
     if (!dialog_confirm("Empty Trash", "Are you sure you want to permanently erase the items in the Trash?", "Empty Trash", true)) return;
     struct vnode *d = vfs_lookup("/home/flux/.Trash"); if (!d) return;
     struct dirent de;
@@ -430,7 +430,7 @@ static void empty_trash(struct finder *f) {
     load_dir(f);
 }
 
-static void move_selection(struct finder *f, int delta, bool extend) {
+static void move_selection(struct files *f, int delta, bool extend) {
     if (!f->nentries) return;
     int cur = f->selected < 0 ? -1 : f->selected;
     int nxt = CLAMP(cur + delta, 0, f->nentries - 1);
@@ -440,11 +440,11 @@ static void move_selection(struct finder *f, int delta, bool extend) {
     ensure_visible(f, nxt);
 }
 
-static void handle_command(struct finder *f, int cmd, bool *quit, bool *close) {
+static void handle_command(struct files *f, int cmd, bool *quit, bool *close) {
     switch (cmd) {
     case CMD_QUIT: *quit = true; break;
     case CMD_CLOSE: *close = true; break;
-    case FCMD_NEW_WINDOW: app_launch(APP_FINDER, f->path); break;
+    case FCMD_NEW_WINDOW: app_launch(APP_FILES, f->path); break;
     case CMD_NEW_FOLDER: new_folder(f); break;
     case CMD_NEW: new_document(f); break;
     case CMD_OPEN: { int i = first_selected(f); if (i >= 0) open_entry(f, i); break; }
@@ -471,12 +471,12 @@ static void handle_command(struct finder *f, int cmd, bool *quit, bool *close) {
     }
 }
 
-void finder_main(void *arg) {
-    struct finder *f = kzalloc(sizeof *f);
+void files_main(void *arg) {
+    struct files *f = kzalloc(sizeof *f);
     f->selected = -1; f->anchor = -1; f->pressed_btn = 0; f->last_click_idx = -1;
-    f->w = window_create("Finder", 860, 520, WIN_STANDARD | WIN_FULL_TITLE);
+    f->w = window_create("Files", 860, 520, WIN_STANDARD | WIN_FULL_TITLE);
     window_set_min_size(f->w, 520, 300);
-    window_set_menus(f->w, &finder_menus);
+    window_set_menus(f->w, &files_menus);
     build_sidebar(f);
     navigate(f, arg && ((const char *)arg)[0] ? (const char *)arg : "/home/flux", true);
     draw(f);

@@ -13,8 +13,8 @@ void desktop_main(void *arg) {
     input_init();
     ps2_init();
     wm_init();
-    fb_boot_progress("Starting Finder");
-    app_launch(APP_FINDER, NULL);
+    fb_boot_progress("Starting Files");
+    app_launch(APP_FILES, NULL);
     thread_sleep_ms(50);
     current_thread->proc->name[0] = 0; strcpy(current_thread->proc->name, "kernel");
     strcpy(current_thread->name, "WindowServer");

@@ -650,7 +650,7 @@ static int b_stat(struct ctx *c, int argc, char **argv) {
     return status;
 }
 static int b_open(struct ctx *c, int argc, char **argv) {
-    if (argc < 2) { app_launch(APP_FINDER, c->sh->proc->cwd); return 0; }
+    if (argc < 2) { app_launch(APP_FILES, c->sh->proc->cwd); return 0; }
     for (int i = 1; i < argc; i++) {
         if (!strcmp(argv[i], "-a") && i + 2 < argc) { const char *app = argv[i + 1]; char p[PATH_MAX]; resolve(c->sh, argv[i + 2], p, sizeof p); for (int k = 0; k < APP_COUNT; k++) if (!strcasecmp(app_table[k].name, app)) app_launch(k, p); i += 2; continue; }
         if (!strcmp(argv[i], "-a") && i + 1 < argc) { for (int k = 0; k < APP_COUNT; k++) if (!strcasecmp(app_table[k].name, argv[i + 1])) app_launch(k, NULL); i++; continue; }

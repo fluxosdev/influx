@@ -451,7 +451,7 @@ static void clock_string(char *out, size_t n) {
 static const char *current_app_name(void) {
     if (focused && focused->app_id >= 0 && focused->app_id < APP_COUNT && !(focused->flags & WIN_UTILITY)) return app_table[focused->app_id].name;
     if (focused && focused->owner) return focused->owner->name;
-    return "Finder";
+    return "Files";
 }
 static const struct app_menus *current_menus(void) { return focused && !(focused->flags & WIN_UTILITY) ? focused->menus : NULL; }
 
@@ -564,7 +564,7 @@ static int menu_item_at(int mx, int my) {
 /* ---- dock ---- */
 struct dock_item { int app; const char *icon; const char *label; bool separator; };
 static const struct dock_item dock_items[] = {
-    { APP_FINDER, "finder", "Finder", false }, { APP_TERMINAL, "terminal", "Terminal", false },
+    { APP_FILES, "files", "Files", false }, { APP_TERMINAL, "terminal", "Terminal", false },
     { APP_EDITOR, "editor", "Text Editor", false }, { APP_CALC, "calculator", "Calculator", false },
     { APP_TASKMAN, "taskman", "Task Manager", false }, { APP_SETTINGS, "settings", "System Settings", false },
     { -1, NULL, NULL, true }, { -2, "trash", "Trash", false },
@@ -588,9 +588,14 @@ void wm_notify_app_state(void) {
 static void draw_dock(struct canvas *c) {
     if (!rect_overlaps(dock_damage(), c->clip)) return;
     struct rect d = dock_rect;
-    gfx_shadow_ex(c, d.x, d.y + 4, d.w, d.h, 18, 16, 60, d);
-    gfx_fill_rounded_rect(c, d.x, d.y, d.w, d.h, 18, theme.dock_bg);
-    gfx_draw_rounded_rect(c, d.x, d.y, d.w, d.h, 18, theme.dock_border);
+    gfx_shadow_ex(c, d.x, d.y + 6, d.w, d.h, 18, 20, 80, d);
+    /* frosted panel: blur whatever sits behind the dock, then tint it */
+    struct rect blur = rect_intersect(rect_make(d.x, d.y, d.w, d.h), c->clip);
+    if (!rect_empty(blur)) gfx_blur_rect(c, rect_make(d.x, d.y, d.w, d.h), 6);
+    gfx_fill_rounded_rect(c, d.x, d.y, d.w, d.h, 18, theme.dark ? RGBA(0x1C, 0x1C, 0x20, 0xB4) : RGBA(0xF2, 0xF2, 0xF6, 0xB8));
+    gfx_fill_rounded_rect_corners(c, d.x, d.y, d.w, d.h / 2, 18, theme.dark ? RGBA(255, 255, 255, 0x10) : RGBA(255, 255, 255, 0x50), 3);
+    gfx_draw_rounded_rect(c, d.x + 1, d.y + 1, d.w - 2, d.h - 2, 17, theme.dark ? RGBA(255, 255, 255, 0x18) : RGBA(255, 255, 255, 0x90));
+    gfx_draw_rounded_rect(c, d.x, d.y, d.w, d.h, 18, theme.dark ? RGBA(0, 0, 0, 0x80) : RGBA(0, 0, 0, 0x30));
     for (int i = 0; i < NDOCK; i++) {
         const struct dock_item *it = &dock_items[i];
         int x = d.x + dock_item_x[i];
@@ -770,7 +775,7 @@ static void on_mouse_button(const struct input_event *in) {
                 const struct dock_item *it = &dock_items[di];
                 mutex_unlock(&wm_lock);
                 if (it->app >= 0) { if (app_is_running(it->app)) app_activate(it->app); else app_launch(it->app, NULL); }
-                else if (it->app == -2) app_launch(APP_FINDER, "/home/flux/.Trash");
+                else if (it->app == -2) app_launch(APP_FILES, "/home/flux/.Trash");
                 mutex_lock(&wm_lock);
             }
             return;
