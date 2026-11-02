@@ -6,6 +6,7 @@
 #include "io.h"
 #include "tty.h"
 #include "blockdev.h"
+#include "ui.h"
 
 struct elf64_ehdr { uint8_t ident[16]; uint16_t type, machine; uint32_t version; uint64_t entry, phoff, shoff; uint32_t flags; uint16_t ehsize, phentsize, phnum, shentsize, shnum, shstrndx; } PACKED;
 struct elf64_phdr { uint32_t type, flags; uint64_t offset, vaddr, paddr, filesz, memsz, align; } PACKED;
@@ -95,7 +96,9 @@ enum {
     SYS_EXIT = 0, SYS_WRITE, SYS_READ, SYS_OPEN, SYS_CLOSE, SYS_LSEEK, SYS_GETPID, SYS_SBRK, SYS_SLEEP, SYS_YIELD,
     SYS_GETCWD, SYS_CHDIR, SYS_READDIR, SYS_STAT, SYS_MKDIR, SYS_UNLINK, SYS_SPAWN, SYS_WAITPID, SYS_UNAME, SYS_TIME,
     SYS_UPTIME, SYS_IOCTL, SYS_DUP2, SYS_PIPE, SYS_KILL, SYS_SYSINFO, SYS_PS, SYS_FSTAT, SYS_RENAME, SYS_SYNC, SYS_LSBLK,
+    SYS_WIN_CREATE, SYS_WIN_PRESENT, SYS_WIN_EVENT, SYS_WIN_DESTROY, SYS_WIN_TITLE,
 };
+struct user_event { int32_t type, x, y, button, buttons, scroll, key; uint32_t ch; int32_t mods, cmd, w, h; };
 struct user_dirent { char name[256]; uint32_t type; uint64_t size, mtime; };
 struct user_stat { uint32_t type, mode; uint64_t size, mtime, ino; };
 struct user_utsname { char sysname[32], nodename[64], release[32], version[64], machine[32]; };
@@ -103,6 +106,8 @@ struct user_sysinfo { uint64_t uptime_ms, total_mem, free_mem, used_mem; uint32_
 struct user_procinfo { int32_t pid; char name[32]; int32_t cpu; uint64_t mem; int32_t threads; int32_t user; };
 struct user_blkinfo { char name[16], model[48], fs[16]; uint64_t bytes; int32_t partition; };
 
+void process_close_windows(struct process *p) { for (int i = 0; i < 8; i++) if (p->uwin[i]) { window_destroy(p->uwin[i]); p->uwin[i] = NULL; } }
+static struct window *uwin_get(struct process *p, uint64_t id) { return id < 8 ? p->uwin[id] : NULL; }
 static int fd_alloc(struct process *p, struct file *f) { for (int i = 0; i < MAX_FDS; i++) if (!p->fds[i]) { p->fds[i] = f; return i; } vfs_close(f); return -ENOMEM; }
 static struct file *fd_get(struct process *p, int fd) { return fd >= 0 && fd < MAX_FDS ? p->fds[fd] : NULL; }
 
@@ -148,6 +153,34 @@ static int64_t do_syscall(struct syscall_frame *f) {
     case SYS_SYSINFO: { if (!user_range_ok(p, a1, sizeof(struct user_sysinfo))) return -EINVAL; struct user_sysinfo *si = (void *)a1; si->uptime_ms = system_ticks; si->total_mem = pmm_total_bytes(); si->free_mem = pmm_free_bytes(); si->used_mem = pmm_used_bytes(); struct process *l[64]; si->procs = process_list(l, 64); struct thread *t[128]; si->threads = thread_list(t, 128); return 0; }
     case SYS_PS: { int max = (int)a2; if (max > 64) max = 64; if (!user_range_ok(p, a1, max * sizeof(struct user_procinfo))) return -EINVAL; sched_sample_cpu(); struct process *l[64]; int n = process_list(l, 64); struct user_procinfo *out = (void *)a1; int k = 0; for (int i = 0; i < n && k < max; i++) { out[k].pid = l[i]->pid; strlcpy(out[k].name, l[i]->name, 32); out[k].user = l[i]->is_user; out[k].mem = l[i]->heap_bytes + (l[i]->pml4 ? vmm_user_pages(l[i]->pml4) * PAGE_SIZE : 0); int cpu = 0, nt = 0; struct thread *t; list_for_each_entry(t, &l[i]->threads, proc_link) { cpu += t->cpu_percent; nt++; } out[k].cpu = l[i]->pid == 1 ? 0 : cpu; out[k].threads = nt; k++; } return k; }
     case SYS_SYNC: vfs_sync(); return 0;
+    case SYS_WIN_CREATE: {
+        char title[128]; if (copy_user_string(p, a3, title, sizeof title) < 0) strcpy(title, p->name);
+        int w = (int)a1, h = (int)a2; if (w < 64 || h < 48 || w > 4096 || h > 4096) return -EINVAL;
+        int slot = -1; for (int i = 0; i < 8; i++) if (!p->uwin[i]) { slot = i; break; }
+        if (slot < 0) return -ENOMEM;
+        struct window *win = window_create(title, w, h, WIN_STANDARD);
+        win->flags |= WIN_NO_CTRL_ALIAS;
+        p->uwin[slot] = win;
+        window_show(win);
+        return slot; }
+    case SYS_WIN_PRESENT: {
+        struct window *win = uwin_get(p, a1); if (!win) return -EBADF;
+        struct canvas *cv = window_begin_draw(win);
+        size_t bytes = (size_t)cv->w * cv->h * 4;
+        if (!user_range_ok(p, a2, bytes)) { window_end_draw(win, NULL); return -EINVAL; }
+        memcpy(cv->px, (void *)a2, bytes);
+        window_end_draw(win, NULL);
+        return 0; }
+    case SYS_WIN_EVENT: {
+        struct window *win = uwin_get(p, a1); if (!win) return -EBADF;
+        if (!user_range_ok(p, a2, sizeof(struct user_event))) return -EINVAL;
+        struct event ev; if (!window_wait_event(win, &ev, (int)(int64_t)a3)) return 0;
+        struct user_event *ue = (void *)a2;
+        ue->type = ev.type; ue->x = ev.x; ue->y = ev.y; ue->button = ev.button; ue->buttons = ev.buttons; ue->scroll = ev.scroll; ue->key = ev.key; ue->ch = ev.ch; ue->mods = ev.mods; ue->cmd = ev.cmd; ue->w = ev.w; ue->h = ev.h;
+        if (ev.type == EV_OPEN) kfree(ev.path);
+        return 1; }
+    case SYS_WIN_DESTROY: { struct window *win = uwin_get(p, a1); if (!win) return -EBADF; p->uwin[a1] = NULL; window_destroy(win); return 0; }
+    case SYS_WIN_TITLE: { struct window *win = uwin_get(p, a1); if (!win) return -EBADF; char t[128]; if (copy_user_string(p, a2, t, sizeof t) < 0) return -EINVAL; window_set_title(win, t); return 0; }
     case SYS_LSBLK: { int max = (int)a2; if (max > 32) max = 32; if (!user_range_ok(p, a1, max * sizeof(struct user_blkinfo))) return -EINVAL; struct user_blkinfo *out = (void *)a1; int n = 0; for (int i = 0; i < blockdev_count() && n < max; i++) { struct blockdev *b = blockdev_at(i); strlcpy(out[n].name, b->name, 16); strlcpy(out[n].model, b->parent ? b->parent->model : b->model, 48); strlcpy(out[n].fs, b->fs_type ? b->fs_type : "", 16); out[n].bytes = b->sectors * b->sector_size; out[n].partition = b->parent != NULL; n++; } return n; }
     }
     return -ENOSYS;

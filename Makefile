@@ -17,6 +17,8 @@ KCFLAGS := -std=gnu11 -ffreestanding -fno-stack-protector -fno-stack-check \
            -mcmodel=kernel -mgeneral-regs-only -O2 -g \
            -Wall -Wextra -Wno-unused-parameter -Wno-unused-function -Wno-misleading-indentation -Wno-type-limits -Wno-missing-field-initializers -Wno-sign-compare \
            -Ikernel/include -Ithird_party/limine -MMD -MP
+# the OpenGL software renderer and its demo use SSE floating point (FPU state is saved per thread)
+KCFLAGS_SSE := $(filter-out -mno-sse -mno-sse2 -mgeneral-regs-only -mno-mmx,$(KCFLAGS)) -msse -msse2 -mno-mmx -Igl
 KLDFLAGS := -nostdlib -static -z max-page-size=0x1000 -Wl,--gc-sections \
             -T kernel/linker.ld -Wl,--build-id=none
 KASFLAGS := -ffreestanding -m64
@@ -29,7 +31,7 @@ KOBJ   := $(patsubst kernel/src/%.c,$(BUILD)/kernel/%.o,$(KSRC_C)) \
 # ---- userland ----
 UCFLAGS := -std=gnu11 -ffreestanding -fno-stack-protector -fno-pic -fno-pie \
            -m64 -mno-red-zone -O2 -g -Wall -Wextra -Wno-unused-parameter \
-           -Iuser/libc/include
+           -Iuser/libc/include -Igl -Wno-misleading-indentation
 ULDFLAGS := -nostdlib -static -z max-page-size=0x1000 -Wl,--build-id=none \
             -T user/libc/user.ld
 ULIBC_SRC := $(wildcard user/libc/*.c) $(wildcard user/libc/*.S)
@@ -70,6 +72,10 @@ $(IMGCONV): tools/imgconv.c third_party/stb/stb_image.h
 
 # ---- kernel ----
 kernel: $(KERNEL)
+
+$(BUILD)/kernel/gl/%.o: kernel/src/gl/%.c
+	@mkdir -p $(dir $@)
+	$(CC) $(KCFLAGS_SSE) -c $< -o $@
 
 $(BUILD)/kernel/%.o: kernel/src/%.c
 	@mkdir -p $(dir $@)

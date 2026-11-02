@@ -2,10 +2,11 @@
 #include "fs.h"
 #include "string.h"
 #include "mm.h"
+#include "gpu.h"
 
 struct vnode *btrfs_mount(struct blockdev *d);
 
-void drivers_init(void) {}
+void drivers_init(void) { gpu_init(); }
 
 void storage_init(void) {
     extern void fb_boot_progress(const char *);

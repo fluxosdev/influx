@@ -39,6 +39,29 @@ shell, user-space C library and build system.
   CRC32C checksums for metadata and data, extent-tree and free-space-tree
   bookkeeping. Volumes modified by inFlux pass `btrfs check` on Linux.
 
+### Graphics
+- **ATI Radeon R700 driver** (HD 4800/4700/4600/4300/4500 and the RS880 IGP),
+  modelled on the Linux `radeon` driver: PCI probe, register and VRAM
+  aperture mapping, VRAM size and MC framebuffer location, inspection of the
+  scanout that the video BIOS (BIOS boot) or GOP (UEFI boot) configured,
+  AtomBIOS ROM parsing (bootup message, part number, default clocks), a 64x64
+  ARGB hardware cursor and vblank-synchronised double-buffered page flipping
+  of the primary surface. Every other adapter uses the **software fallback**
+  (CPU compositing into the bootloader's linear framebuffer).
+- **OpenGL**: a fixed-function OpenGL 1.x subset (immediate mode, matrix
+  stacks, depth test, Gouraud lighting, textures with bilinear filtering,
+  blending, culling, wireframe) with a software rasteriser. The same
+  implementation (`gl/gl.c`) is built into the kernel for desktop apps and
+  into the user C library; `glGetString(GL_RENDERER)` names the adapter the
+  frame ends up on. The desktop has an **OpenGL Demo** app and `/bin/glcube`
+  renders from user space into a desktop window (`win_create`,
+  `win_present`, `win_event` system calls).
+- BIOS and UEFI boot both work through Limine's hybrid ISO; under BIOS the
+  Radeon's VBIOS sets the mode through VBE and the driver takes over scanout
+  programming from there.
+
+![OpenGL demo](docs/opengl.png)
+
 ### Desktop
 - Software-composited window server with damage tracking, drop shadows,
   rounded windows, traffic-light controls, drag/resize/zoom/minimize
@@ -95,7 +118,8 @@ Changing the SVG icon sources requires `python3` with `cairosvg`; run
   `echo hi > /mnt/sda1/hello.txt` in the Terminal, then inspect `build/sata.img`
   on Linux (the filesystem starts 1 MiB into the image).
 - Type `help` in the Terminal for the list of shell built-ins; programs in
-  `/bin` run in user mode.
+  `/bin` run in user mode. `lsgpu` shows the graphics adapter, `glcube &`
+  starts the user-mode OpenGL program.
 
 ## Layout
 
@@ -103,7 +127,9 @@ Changing the SVG icon sources requires `python3` with `cairosvg`; run
 kernel/src/arch     GDT, IDT, APIC, ACPI, PCI, timers, serial
 kernel/src/mm       physical/virtual memory, heap
 kernel/src/sched    scheduler, synchronisation, ELF loader, system calls
-kernel/src/drivers  framebuffer, PS/2, AHCI, NVMe, block devices
+kernel/src/drivers  framebuffer, PS/2, AHCI, NVMe, block devices, GPU abstraction, Radeon R700
+kernel/src/gl       kernel build of the OpenGL renderer and the OpenGL Demo app
+gl                  shared software OpenGL implementation (gl.c / gl.h)
 kernel/src/fs       VFS, tmpfs, initrd, tty, pipes, btrfs
 kernel/src/gfx      canvas primitives, fonts, images
 kernel/src/ui       window server, theme, widgets, dialogs, app registry
@@ -125,6 +151,11 @@ third_party         Limine, stb headers
   group uses the bitmap format.
 - The desktop applications run as kernel threads; only `/bin` programs run in
   ring 3.
+- The Radeon driver was written from the Linux radeon register definitions
+  and has not been run on real HD 4000 hardware yet; it never touches the 3D
+  engine (that needs the R700 CP microcode and a command-stream backend), so
+  OpenGL is always software-rendered. QEMU does not emulate an R700, so the
+  software path is what you see under QEMU.
 - The hardware clock is assumed to be in UTC; adjust the offset in
   System Settings → Date & Time.
 

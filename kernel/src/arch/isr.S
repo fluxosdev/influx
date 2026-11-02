@@ -34,7 +34,9 @@ isr_common:
     pushq %r15
     cld
     movq %rsp, %rdi
+    subq $8, %rsp            /* keep the C stack 16-byte aligned */
     call isr_dispatch
+    addq $8, %rsp
     popq %r15
     popq %r14
     popq %r13

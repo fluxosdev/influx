@@ -151,7 +151,10 @@ uint64_t vmm_user_pages(uint64_t pml4) {
 
 void vmm_switch(uint64_t pml4) { if (read_cr3() != pml4) write_cr3(pml4); }
 
-void *vmm_map_mmio(uint64_t phys, size_t size) {
+static void *map_mmio(uint64_t phys, size_t size, uint64_t cache_bits);
+void *vmm_map_mmio(uint64_t phys, size_t size) { return map_mmio(phys, size, PTE_PCD); }
+void *vmm_map_wc(uint64_t phys, size_t size) { return map_mmio(phys, size, PTE_PWT); }
+static void *map_mmio(uint64_t phys, size_t size, uint64_t cache_bits) {
     uint64_t start = PAGE_ALIGN_DOWN(phys), end = PAGE_ALIGN_UP(phys + size);
     for (uint64_t p = start; p < end; p += PAGE_SIZE) {
         /* If the HHDM already covers this via a 2 MiB page, remap that 2 MiB
@@ -173,7 +176,7 @@ void *vmm_map_mmio(uint64_t phys, size_t size) {
             *pdee = pt | PTE_PRESENT | PTE_WRITE;
         }
         uint64_t *pte = &table_of(*pdee)[(v >> 12) & 0x1FF];
-        *pte = p | PTE_PRESENT | PTE_WRITE | PTE_GLOBAL | PTE_PCD | PTE_NX;
+        *pte = p | PTE_PRESENT | PTE_WRITE | PTE_GLOBAL | cache_bits | PTE_NX;
         spin_unlock(&lock);
         invlpg(v);
     }

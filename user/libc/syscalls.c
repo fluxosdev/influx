@@ -44,3 +44,8 @@ int pipe(int fds[2]) { return (int)ret(syscall1(SYS_PIPE, (long)fds)); }
 int dup2(int o, int n) { return (int)ret(syscall2(SYS_DUP2, o, n)); }
 int ioctl(int fd, int cmd, void *arg) { return (int)ret(syscall3(SYS_IOCTL, fd, cmd, (long)arg)); }
 int isatty(int fd) { int wh[2]; return syscall3(SYS_IOCTL, fd, 2, (long)wh) == 0; }
+int win_create(int w, int h, const char *title) { return (int)ret(syscall3(SYS_WIN_CREATE, w, h, (long)title)); }
+int win_present(int id, const uint32_t *px) { return (int)ret(syscall2(SYS_WIN_PRESENT, id, (long)px)); }
+int win_event(int id, struct win_event *ev, int timeout_ms) { return (int)syscall3(SYS_WIN_EVENT, id, (long)ev, timeout_ms); }
+int win_destroy(int id) { return (int)ret(syscall1(SYS_WIN_DESTROY, id)); }
+int win_set_title(int id, const char *t) { return (int)ret(syscall2(SYS_WIN_TITLE, id, (long)t)); }

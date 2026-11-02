@@ -6,6 +6,7 @@
 #include "string.h"
 #include "arch.h"
 #include "blockdev.h"
+#include "gpu.h"
 
 #define MAX_ARGS 128
 #define MAX_HIST 500
@@ -563,6 +564,17 @@ static int b_lsblk(struct ctx *c, int argc, char **argv) {
     }
     return 0;
 }
+static int b_lsgpu(struct ctx *c, int argc, char **argv) {
+    for (int i = 0; i < gpu_count(); i++) {
+        struct gpu_device *g = gpu_at(i);
+        cprintf(c, "%s%s\n  driver: %s   chip: %s   bus: %s\n", g->name, g == gpu_primary() ? "  (primary)" : "", g->driver, g->chip, g->bus[0] ? g->bus : "-");
+        if (g->vram_bytes) cprintf(c, "  VRAM: %lu MiB at %lx, registers at %lx\n", g->vram_bytes >> 20, g->vram_base, g->mmio_base);
+        if (g->bios_message[0]) cprintf(c, "  BIOS: %s %s\n", g->bios_message, g->bios_part);
+        if (g->engine_clock_khz) cprintf(c, "  clocks: %u MHz engine, %u MHz memory, %d stream processors\n", g->engine_clock_khz / 1000, g->memory_clock_khz / 1000, g->stream_processors);
+        cprintf(c, "  features: %s%s%s\n", g->scanout_verified ? "scanout " : "", g->page_flip ? "page-flip " : "", g->hw_cursor ? "hw-cursor" : "");
+    }
+    return 0;
+}
 static int b_lspci(struct ctx *c, int argc, char **argv) {
     for (int i = 0; i < pci_device_count(); i++) { struct pci_device *d = pci_device_at(i); cprintf(c, "%02x:%02x.%d %s [%02x%02x]: %04x:%04x\n", d->bus, d->slot, d->func, pci_class_name(d->class_code, d->subclass), d->class_code, d->subclass, d->vendor, d->device); }
     return 0;
@@ -773,7 +785,7 @@ static const struct builtin builtins[] = {
     { "help", b_help, "this list" }, { "hexdump", b_hexdump, "hex dump of a file (-n bytes)" },
     { "history", b_history, "show command history (-c clears)" }, { "hostname", b_hostname, "print the host name" },
     { "id", b_id, "print user identity" }, { "kill", b_kill, "terminate a process: kill [-9] pid" },
-    { "ls", b_ls, "list directory contents (-l -a -h)" }, { "lsblk", b_lsblk, "list block devices" },
+    { "ls", b_ls, "list directory contents (-l -a -h)" }, { "lsblk", b_lsblk, "list block devices" }, { "lsgpu", b_lsgpu, "show graphics adapters" },
     { "lspci", b_lspci, "list PCI devices" }, { "mkdir", b_mkdir, "create directories (-p)" },
     { "mount", b_mount, "list mounted filesystems" }, { "mv", b_mv, "move or rename files" },
     { "nproc", b_nproc, "number of processors" }, { "open", b_open, "open a file or folder in the desktop (-a App)" },

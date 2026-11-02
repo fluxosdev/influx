@@ -7,6 +7,7 @@
 #include "mm.h"
 #include "string.h"
 #include "io.h"
+#include "gpu.h"
 
 /* ---------------------------------------------------------------- state */
 static struct mutex wm_lock;
@@ -90,6 +91,12 @@ static void cursor_init(void) {
     }
 }
 static struct rect cursor_rect(void) { return rect_make(mouse_x - 1, mouse_y - 1, CUR_W + 2, CUR_H + 2); }
+static bool hw_cursor;
+static void hw_cursor_init(void) {
+    struct gpu_device *g = gpu_primary();
+    if (!g || !g->hw_cursor || !g->set_cursor) return;
+    if (g->set_cursor(g, cursor_img->px, cursor_img->w, cursor_img->h, 1, 1)) { hw_cursor = true; g->move_cursor(g, mouse_x - 1, mouse_y - 1, true); }
+}
 
 /* ---------------------------------------------------------------- damage */
 static void damage_add(struct rect r) {
@@ -566,7 +573,7 @@ struct dock_item { int app; const char *icon; const char *label; bool separator;
 static const struct dock_item dock_items[] = {
     { APP_FILES, "files", "Files", false }, { APP_TERMINAL, "terminal", "Terminal", false },
     { APP_EDITOR, "editor", "Text Editor", false }, { APP_CALC, "calculator", "Calculator", false },
-    { APP_TASKMAN, "taskman", "Task Manager", false }, { APP_SETTINGS, "settings", "System Settings", false },
+    { APP_TASKMAN, "taskman", "Task Manager", false }, { APP_SETTINGS, "settings", "System Settings", false }, { APP_GLDEMO, "gldemo", "OpenGL Demo", false },
     { -1, NULL, NULL, true }, { -2, "trash", "Trash", false },
 };
 #define NDOCK ((int)ARRAY_LEN(dock_items))
@@ -592,10 +599,10 @@ static void draw_dock(struct canvas *c) {
     /* frosted panel: blur whatever sits behind the dock, then tint it */
     struct rect blur = rect_intersect(rect_make(d.x, d.y, d.w, d.h), c->clip);
     if (!rect_empty(blur)) gfx_blur_rect(c, rect_make(d.x, d.y, d.w, d.h), 6);
-    gfx_fill_rounded_rect(c, d.x, d.y, d.w, d.h, 18, theme.dark ? RGBA(0x1C, 0x1C, 0x20, 0xB4) : RGBA(0xF2, 0xF2, 0xF6, 0xB8));
-    gfx_fill_rounded_rect_corners(c, d.x, d.y, d.w, d.h / 2, 18, theme.dark ? RGBA(255, 255, 255, 0x10) : RGBA(255, 255, 255, 0x50), 3);
-    gfx_draw_rounded_rect(c, d.x + 1, d.y + 1, d.w - 2, d.h - 2, 17, theme.dark ? RGBA(255, 255, 255, 0x18) : RGBA(255, 255, 255, 0x90));
-    gfx_draw_rounded_rect(c, d.x, d.y, d.w, d.h, 18, theme.dark ? RGBA(0, 0, 0, 0x80) : RGBA(0, 0, 0, 0x30));
+    /* translucent frosted glass: the blurred backdrop shows through the tint */
+    gfx_fill_rounded_rect(c, d.x, d.y, d.w, d.h, 18, theme.dark ? RGBA(0x1C, 0x1C, 0x20, 0x66) : RGBA(0xF4, 0xF4, 0xF8, 0x6E));
+    gfx_draw_rounded_rect(c, d.x + 1, d.y + 1, d.w - 2, d.h - 2, 17, theme.dark ? RGBA(255, 255, 255, 0x18) : RGBA(255, 255, 255, 0x80));
+    gfx_draw_rounded_rect(c, d.x, d.y, d.w, d.h, 18, theme.dark ? RGBA(0, 0, 0, 0x70) : RGBA(0, 0, 0, 0x2A));
     for (int i = 0; i < NDOCK; i++) {
         const struct dock_item *it = &dock_items[i];
         int x = d.x + dock_item_x[i];
@@ -639,7 +646,7 @@ static void compose(struct rect r) {
     draw_dock(screen);
     draw_menubar(screen);
     if (open_menu != -1) draw_menu_popup(screen);
-    gfx_blit(screen, mouse_x - 1, mouse_y - 1, cursor_img);
+    if (!hw_cursor) gfx_blit(screen, mouse_x - 1, mouse_y - 1, cursor_img);
     canvas_reset_clip(screen);
     fb_flush(r);
 }
@@ -652,6 +659,7 @@ static void flush_damage(void) {
     if (!n) return;
     mutex_lock(&wm_lock);
     for (int i = 0; i < n; i++) compose(local[i]);
+    fb_present();
     mutex_unlock(&wm_lock);
 }
 
@@ -801,7 +809,8 @@ static void on_mouse_move(const struct input_event *in) {
     struct rect old = cursor_rect();
     mouse_x = CLAMP(mouse_x + in->dx, 0, scr_w - 1);
     mouse_y = CLAMP(mouse_y + in->dy, 0, scr_h - 1);
-    damage_add(old); damage_add(cursor_rect());
+    if (hw_cursor) { struct gpu_device *g = gpu_primary(); g->move_cursor(g, mouse_x - 1, mouse_y - 1, true); }
+    else { damage_add(old); damage_add(cursor_rect()); }
     int x = mouse_x, y = mouse_y;
     if (drag_win) {
         damage_add(win_shadow_rect(drag_win));
@@ -923,6 +932,7 @@ void wm_init(void) {
     theme_apply(false, 0);
     wallpaper_build();
     cursor_init();
+    hw_cursor_init();
     logo_icon = icon_get("logo", 64);
     layout_dock();
     wm_notify_app_state();

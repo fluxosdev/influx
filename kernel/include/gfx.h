@@ -98,6 +98,7 @@ extern struct canvas *screen;    /* back buffer */
 void fb_init(void);
 void fb_flush(struct rect r);    /* copy back buffer to the physical framebuffer */
 void fb_flush_all(void);
+void fb_present(void);           /* page flip (no-op on the software path) */
 int fb_width(void);
 int fb_height(void);
 void fb_boot_splash(void);

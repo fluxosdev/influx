@@ -3,6 +3,7 @@
 #include "fs.h"
 #include "mm.h"
 #include "string.h"
+#include "gpu.h"
 
 #define SIDEBAR_W 200
 enum { PANE_GENERAL, PANE_APPEARANCE, PANE_WALLPAPER, PANE_DISPLAYS, PANE_DATETIME, PANE_STORAGE, PANE_ABOUT, NPANES };

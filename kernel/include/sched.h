@@ -57,7 +57,9 @@ struct process {
     int app_id;                   /* desktop app id (-1 = none) */
     void *app_data;
     int exit_signal;
+    struct window *uwin[8];       /* windows owned by a user process */
 };
+void process_close_windows(struct process *p);
 
 extern struct thread *current_thread;
 extern struct process *kernel_process;

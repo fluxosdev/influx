@@ -2,6 +2,7 @@
 #include "mm.h"
 #include "string.h"
 #include <limine.h>
+#include "gpu.h"
 
 extern volatile struct limine_framebuffer_request framebuffer_request;
 static struct limine_framebuffer *fb;
@@ -21,13 +22,43 @@ void fb_init(void) {
 int fb_width(void) { return fbw; }
 int fb_height(void) { return fbh; }
 
+/* With a page-flipping GPU, damage goes to the VRAM back buffer; the other
+ * buffer's stale regions are remembered and refreshed after the flip. */
+static struct rect stale[2][32]; static int nstale[2];
+static int flip_side;              /* which 'stale' list belongs to the current back buffer */
+static bool flip_pending;
+static void stale_add(int side, struct rect r) {
+    if (nstale[side] < 32) stale[side][nstale[side]++] = r;
+    else { struct rect u = stale[side][0]; for (int i = 1; i < nstale[side]; i++) u = rect_union(u, stale[side][i]); stale[side][0] = rect_union(u, r); nstale[side] = 1; }
+}
+static void copy_rect_to(uint8_t *dst, int pitch, struct rect r) {
+    for (int y = r.y; y < r.y + r.h; y++) memcpy(dst + y * pitch + r.x * 4, screen->px + y * screen->stride + r.x, r.w * 4);
+}
 void fb_flush(struct rect r) {
     r = rect_intersect(r, rect_make(0, 0, fbw, fbh));
     if (rect_empty(r)) return;
-    for (int y = r.y; y < r.y + r.h; y++)
-        memcpy(fb_mem + y * fbpitch + r.x * 4, screen->px + y * screen->stride + r.x, r.w * 4);
+    struct gpu_device *g = gpu_primary();
+    if (g && g->page_flip) {
+        int pitch; uint8_t *back = g->back_buffer(g, &pitch);
+        copy_rect_to(back, pitch, r);
+        stale_add(flip_side ^ 1, r);     /* the front buffer will miss this update */
+        flip_pending = true;
+        return;
+    }
+    copy_rect_to(fb_mem, fbpitch, r);
 }
-void fb_flush_all(void) { fb_flush(rect_make(0, 0, fbw, fbh)); }
+void fb_present(void) {
+    struct gpu_device *g = gpu_primary();
+    if (!g || !g->page_flip || !flip_pending) return;
+    g->flip(g);
+    flip_pending = false;
+    flip_side ^= 1;
+    /* bring the new back buffer up to date */
+    int pitch; uint8_t *back = g->back_buffer(g, &pitch);
+    for (int i = 0; i < nstale[flip_side]; i++) copy_rect_to(back, pitch, rect_intersect(stale[flip_side][i], rect_make(0, 0, fbw, fbh)));
+    nstale[flip_side] = 0;
+}
+void fb_flush_all(void) { fb_flush(rect_make(0, 0, fbw, fbh)); fb_present(); }
 
 /* Locate a file inside the raw initrd tar (fonts/images are needed before the VFS exists) */
 static const void *tar_find(const char *name, size_t *size) {

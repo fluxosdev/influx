@@ -31,6 +31,7 @@ void vmm_unmap(uint64_t pml4, uint64_t virt);
 uint64_t vmm_get_phys(uint64_t pml4, uint64_t virt);   /* 0 if unmapped */
 void vmm_switch(uint64_t pml4);
 void *vmm_map_mmio(uint64_t phys, size_t size);  /* returns HHDM pointer, uncached */
+void *vmm_map_wc(uint64_t phys, size_t size);    /* write-combining (VRAM apertures) */
 uint64_t vmm_user_pages(uint64_t pml4);          /* count mapped user pages */
 
 /* Kernel heap */

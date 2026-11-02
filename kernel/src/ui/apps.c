@@ -10,6 +10,7 @@ void editor_main(void *arg);
 void calc_main(void *arg);
 void taskman_main(void *arg);
 void settings_main(void *arg);
+void gldemo_main(void *arg);
 
 const struct app_info app_table[APP_COUNT] = {
     [APP_FILES]   = { "Files", "files", files_main, false },
@@ -18,6 +19,7 @@ const struct app_info app_table[APP_COUNT] = {
     [APP_CALC]     = { "Calculator", "calculator", calc_main, true },
     [APP_TASKMAN]  = { "Task Manager", "taskman", taskman_main, true },
     [APP_SETTINGS] = { "System Settings", "settings", settings_main, true },
+    [APP_GLDEMO]   = { "OpenGL Demo", "gldemo", gldemo_main, false },
 };
 
 struct app_start { int id; char *arg; };

@@ -44,8 +44,10 @@ static struct thread *alloc_thread(struct process *p, const char *name) {
     t->kstack_top = (t->kstack_base + KSTACK_SIZE) & ~0xFULL;
     t->state = THREAD_READY;
     t->slice = TIME_SLICE;
-    /* initial frame consumed by context_switch: 6 callee-saved regs + return address */
-    uint64_t *sp = (uint64_t *)t->kstack_top;
+    /* initial frame consumed by context_switch: 6 callee-saved regs + return address.
+     * Start 8 bytes below the top so the trampoline runs with the SysV stack
+     * alignment a 'call' would have produced (SSE code relies on it). */
+    uint64_t *sp = (uint64_t *)(t->kstack_top - 8);
     *--sp = (uint64_t)thread_trampoline;
     for (int i = 0; i < 6; i++) *--sp = 0;
     t->rsp = (uint64_t)sp;
@@ -107,6 +109,7 @@ void sched_init(void) {
     boot->state = THREAD_RUNNING;
     boot->slice = TIME_SLICE;
     boot->kstack_base = 0;
+    *(uint16_t *)(boot->fxsave) = 0x37F; *(uint32_t *)(boot->fxsave + 24) = 0x1F80;
     list_init(&boot->sched_link);
     list_add_tail(&boot->all_link, &all_threads);
     list_add_tail(&boot->proc_link, &kernel_process->threads);
@@ -208,6 +211,7 @@ void thread_exit(int code) {
         p->exited = true;
         if (!p->exit_code) p->exit_code = code;
         for (int i = 0; i < MAX_FDS; i++) if (p->fds[i]) { vfs_close(p->fds[i]); p->fds[i] = NULL; }
+        process_close_windows(p);
         waitq_wake_all(&p->exit_wq);
     }
     t->state = THREAD_ZOMBIE;

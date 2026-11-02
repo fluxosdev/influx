@@ -139,7 +139,7 @@ void wm_broadcast(int type);         /* post an event to every window */
 extern bool clock_24h;
 
 /* apps */
-enum { APP_FILES, APP_TERMINAL, APP_EDITOR, APP_CALC, APP_TASKMAN, APP_SETTINGS, APP_COUNT };
+enum { APP_FILES, APP_TERMINAL, APP_EDITOR, APP_CALC, APP_TASKMAN, APP_SETTINGS, APP_GLDEMO, APP_COUNT };
 struct app_info { const char *name; const char *icon; void (*main)(void *arg); bool single_instance; };
 extern const struct app_info app_table[APP_COUNT];
 int app_launch(int id, const char *arg);
