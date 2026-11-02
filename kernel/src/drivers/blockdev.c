@@ -131,6 +131,17 @@ void blockdev_register(struct blockdev *d) {
     add_dev(d);
     scan_partitions(d);
 }
+void blockdev_rescan(struct blockdev *d) {
+    for (int i = 0; i < ndevs; ) {
+        if (devs[i]->parent == d) {
+            char p[32]; snprintf(p, sizeof p, "/dev/%s", devs[i]->name); vfs_unlink(p);
+            kfree(devs[i]);
+            for (int j = i; j < ndevs - 1; j++) devs[j] = devs[j + 1];
+            ndevs--;
+        } else i++;
+    }
+    scan_partitions(d);
+}
 int blockdev_count(void) { return ndevs; }
 struct blockdev *blockdev_at(int i) { return i >= 0 && i < ndevs ? devs[i] : NULL; }
 struct blockdev *blockdev_find(const char *name) { for (int i = 0; i < ndevs; i++) if (!strcmp(devs[i]->name, name)) return devs[i]; return NULL; }

@@ -62,6 +62,21 @@ shell, user-space C library and build system.
 
 ![OpenGL demo](docs/opengl.png)
 
+### Installer and display modes
+- **Install inFlux** (Dock icon on the live system, or `install /dev/sdX` in the
+  Terminal) writes a GPT with a 1 MB BIOS boot partition, a 64 MB FAT32 EFI
+  System Partition (Limine for BIOS and UEFI, kernel, system image,
+  `limine.conf`) and a btrfs root volume. The partitioning, FAT32 formatter,
+  `mkfs.btrfs` and Limine's BIOS stage-2 install are all implemented in the
+  kernel. The installed system boots on BIOS and UEFI firmware; its root
+  volume holds the persistent home directory, mounted at `/home`.
+- **Display resolution**: System Settings → Displays lists the available
+  modes. On QEMU, VirtualBox and Bochs the mode changes immediately (DISPI
+  mode setting; the compositor re-lays out the desktop). The choice is also
+  written as `resolution:` into the installed system's `limine.conf`, so on
+  real hardware it takes effect at the next boot through Limine (VBE on BIOS,
+  GOP on UEFI). The `display` shell command does the same.
+
 ### Desktop
 - Software-composited window server with damage tracking, drop shadows,
   rounded windows, traffic-light controls, drag/resize/zoom/minimize
@@ -98,6 +113,8 @@ make            # builds build/influx.iso
 make disk       # creates build/sata.img and build/nvme.img (btrfs test volumes)
 make run        # boots in QEMU with a SATA and an NVMe disk attached
 make run-kvm    # same, with KVM acceleration
+make run-installed       # boot the disk the installer wrote (build/install.img) on BIOS
+make run-installed-uefi  # the same under OVMF UEFI
 ```
 
 The build compiles the kernel with the host GCC in freestanding mode, rasterises
@@ -133,7 +150,7 @@ gl                  shared software OpenGL implementation (gl.c / gl.h)
 kernel/src/fs       VFS, tmpfs, initrd, tty, pipes, btrfs
 kernel/src/gfx      canvas primitives, fonts, images
 kernel/src/ui       window server, theme, widgets, dialogs, app registry
-kernel/src/apps     Files, Terminal, shell, Editor, Calculator, Task Manager, Settings
+kernel/src/apps     Files, Terminal, shell, Editor, Calculator, Task Manager, Settings, Installer
 user/libc           minimal C library for user programs
 user/bin            user-mode programs
 tools               fontgen, imgconv, icon renderer, test-disk builder

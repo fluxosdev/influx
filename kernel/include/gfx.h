@@ -99,6 +99,7 @@ void fb_init(void);
 void fb_flush(struct rect r);    /* copy back buffer to the physical framebuffer */
 void fb_flush_all(void);
 void fb_present(void);           /* page flip (no-op on the software path) */
+void fb_set_mode(uint64_t phys, int w, int h, int pitch);
 int fb_width(void);
 int fb_height(void);
 void fb_boot_splash(void);

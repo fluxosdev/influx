@@ -8,6 +8,7 @@
 #include "string.h"
 #include "io.h"
 #include "gpu.h"
+#include "installer.h"
 
 /* ---------------------------------------------------------------- state */
 static struct mutex wm_lock;
@@ -570,18 +571,23 @@ static int menu_item_at(int mx, int my) {
 
 /* ---- dock ---- */
 struct dock_item { int app; const char *icon; const char *label; bool separator; };
-static const struct dock_item dock_items[] = {
+static const struct dock_item dock_items_all[] = {
     { APP_FILES, "files", "Files", false }, { APP_TERMINAL, "terminal", "Terminal", false },
     { APP_EDITOR, "editor", "Text Editor", false }, { APP_CALC, "calculator", "Calculator", false },
     { APP_TASKMAN, "taskman", "Task Manager", false }, { APP_SETTINGS, "settings", "System Settings", false }, { APP_GLDEMO, "gldemo", "OpenGL Demo", false },
+    { APP_INSTALLER, "drive", "Install inFlux", false },
     { -1, NULL, NULL, true }, { -2, "trash", "Trash", false },
 };
-#define NDOCK ((int)ARRAY_LEN(dock_items))
-static int dock_item_x[NDOCK];
+static struct dock_item dock_items[ARRAY_LEN(dock_items_all)];
+static int NDOCK;
+static int dock_item_x[ARRAY_LEN(dock_items_all)];
 static bool app_running_cache[APP_COUNT];
 static bool trash_full;
 
 static void layout_dock(void) {
+    NDOCK = 0;
+    bool installed = install_is_installed_system();
+    for (size_t i = 0; i < ARRAY_LEN(dock_items_all); i++) { if (dock_items_all[i].app == APP_INSTALLER && installed) continue; dock_items[NDOCK++] = dock_items_all[i]; }
     int w = 16;
     for (int i = 0; i < NDOCK; i++) { dock_item_x[i] = w; w += dock_items[i].separator ? 18 : DOCK_ICON + 8; }
     w += 8;
@@ -937,6 +943,39 @@ void wm_init(void) {
     layout_dock();
     wm_notify_app_state();
     wm_dirty_all();
+}
+
+/* change the display mode at runtime (if the GPU supports it) and re-layout */
+bool wm_set_resolution(int w, int h) {
+    struct gpu_device *g = gpu_primary();
+    if (!g || !g->modeset || !g->set_mode) return false;
+    if (w == scr_w && h == scr_h) return true;
+    mutex_lock(&wm_lock);
+    bool ok = g->set_mode(g, w, h);
+    if (ok) {
+        fb_set_mode(g->fb_phys, g->fb_width, g->fb_height, g->fb_pitch);
+        scr_w = g->fb_width; scr_h = g->fb_height;
+        canvas_destroy(wallpaper); wallpaper = NULL; wallpaper_build();
+        layout_dock();
+        struct rect d = wm_desktop_rect();
+        struct window *win;
+        list_for_each_entry(win, &windows, link) {
+            int top = (win->flags & WIN_FULL_TITLE) ? 0 : TITLEBAR_H;
+            if (win->zoomed) { win->frame.x = d.x + 4; win->frame.y = d.y + top + 4; resize_locked(win, d.w - 8, d.h - top - 8); }
+            if (win->frame.x + 80 > scr_w) win->frame.x = MAX(0, scr_w - win->frame.w);
+            if (win->frame.y - top + 40 > d.y + d.h) win->frame.y = MAX(d.y + top, d.y + d.h - win->frame.h);
+            if (win->frame.w > scr_w) resize_locked(win, scr_w - 16, win->frame.h);
+            if (win->frame.h > d.h - top) resize_locked(win, win->frame.w, d.h - top - 8);
+        }
+        mouse_x = CLAMP(mouse_x, 0, scr_w - 1); mouse_y = CLAMP(mouse_y, 0, scr_h - 1);
+        if (hw_cursor) g->move_cursor(g, mouse_x - 1, mouse_y - 1, true);
+        open_menu = -1;
+        spin_lock(&damage_lock); ndamage = 0; spin_unlock(&damage_lock);
+    }
+    mutex_unlock(&wm_lock);
+    if (ok) { wm_dirty_all(); wm_broadcast(EV_THEME); }
+    kprintf("display: %s to %dx%d\n", ok ? "switched" : "failed to switch", w, h);
+    return ok;
 }
 
 void wm_run(void) {

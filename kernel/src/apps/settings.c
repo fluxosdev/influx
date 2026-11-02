@@ -4,6 +4,7 @@
 #include "mm.h"
 #include "string.h"
 #include "gpu.h"
+#include "installer.h"
 
 #define SIDEBAR_W 200
 enum { PANE_GENERAL, PANE_APPEARANCE, PANE_WALLPAPER, PANE_DISPLAYS, PANE_DATETIME, PANE_STORAGE, PANE_ABOUT, NPANES };
@@ -205,6 +206,25 @@ static void click(struct settings *s, int x, int y) {
     case PANE_WALLPAPER:
         for (size_t i = 0; i < ARRAY_LEN(wallpapers); i++) { int wx = cx + (i % 4) * 130, wy = cy + 30 + (i / 4) * 110; if (rect_contains(rect_make(wx, wy, 120, 80), x, y)) { theme_set_wallpaper(wallpapers[i].top, wallpapers[i].bottom); wm_theme_changed(); } }
         break;
+    case PANE_DISPLAYS: {
+        int ty = cy + 160 + 7 * 24;
+        struct display_mode modes[16]; int nm = gpu_list_modes(modes, 16);
+        int chx = cx + 102, chy = ty + 2;
+        for (int i = 0; i < nm; i++) {
+            char m[24]; snprintf(m, sizeof m, "%d \u00d7 %d", modes[i].w, modes[i].h);
+            int w2 = font_text_width(font_ui_small, m) + 16;
+            if (chx + w2 > cx + cw) { chx = cx + 102; chy += 28; }
+            if (rect_contains(rect_make(chx, chy, w2, 22), x, y)) {
+                struct gpu_device *g = gpu_primary();
+                bool live = g && g->modeset && wm_set_resolution(modes[i].w, modes[i].h);
+                int saved = display_persist_resolution(modes[i].w, modes[i].h);
+                if (!live && saved < 0) dialog_message("Displays", "This display cannot change resolution at runtime, and no installed system was found to store the boot resolution.\nInstall inFlux to a disk, then choose the resolution again.");
+                else if (!live) dialog_message("Displays", "The resolution will be used from the next boot.");
+                break;
+            }
+            chx += w2 + 8;
+        }
+        break; }
     case PANE_DATETIME:
         if (rect_contains(rect_make(cx + cw - 16 - 180, cy + 100, 30, 26), x, y)) s->pressed = 2;
         if (rect_contains(rect_make(cx + cw - 16 - 30, cy + 100, 30, 26), x, y)) s->pressed = 3;

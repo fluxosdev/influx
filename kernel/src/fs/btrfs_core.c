@@ -101,7 +101,7 @@ struct tree_block *btrfs_new_block(struct btrfs_fs *fs, uint64_t logical, uint64
     if (fs->sb.incompat_flags & BTRFS_FEATURE_INCOMPAT_METADATA_UUID) memcpy(h->fsid, fs->sb.metadata_uuid, 16);
     memcpy(h->chunk_tree_uuid, fs->sb.dev_item.uuid, 16);   /* overwritten below */
     memcpy(h->chunk_tree_uuid, fs->chunk_tree_uuid, 16);
-    h->bytenr = logical; h->flags = BTRFS_HEADER_FLAG_WRITTEN; h->generation = fs->transid; h->owner = owner; h->nritems = 0; h->level = level;
+    h->bytenr = logical; h->flags = BTRFS_HEADER_FLAG_WRITTEN | BTRFS_HEADER_FLAG_MIXED_BACKREF; h->generation = fs->transid; h->owner = owner; h->nritems = 0; h->level = level;
     b->dirty = true;
     return b;
 }
@@ -212,7 +212,7 @@ uint32_t btrfs_path_size(struct btrfs_path *p) { return btrfs_leaf_item(p->block
 /* ------------------------------------------------------------ roots */
 static void persist_root(struct btrfs_fs *fs, struct btrfs_tree *tree) {
     if (tree->objectid == BTRFS_ROOT_TREE_OBJECTID) { fs->sb.root = tree->bytenr; fs->sb.root_level = tree->level; return; }
-    if (tree->objectid == BTRFS_CHUNK_TREE_OBJECTID) { fs->sb.chunk_root = tree->bytenr; fs->sb.chunk_root_level = tree->level; return; }
+    if (tree->objectid == BTRFS_CHUNK_TREE_OBJECTID) { fs->sb.chunk_root = tree->bytenr; fs->sb.chunk_root_level = tree->level; fs->sb.chunk_root_generation = fs->transid; return; }
     struct btrfs_path p; struct btrfs_key k = { tree->objectid, BTRFS_ROOT_ITEM_KEY, 0 };
     if (btrfs_search(fs, &fs->root_tree, &k, &p) != 0) {
         /* root items may have a non-zero offset (generation): find by objectid+type */
@@ -575,7 +575,7 @@ static uint64_t skip_reserved(struct btrfs_fs *fs, uint64_t cursor, uint64_t len
 uint64_t btrfs_alloc_extent(struct btrfs_fs *fs, uint64_t len, uint64_t type) {
     for (int ci = 0; ci < fs->nchunks; ci++) {
         struct chunk_map *m = &fs->chunks[ci];
-        if (!(m->type & type) || (m->type & BTRFS_BLOCK_GROUP_SYSTEM)) continue;
+        if (!(m->type & type) || ((m->type & BTRFS_BLOCK_GROUP_SYSTEM) && !(type & BTRFS_BLOCK_GROUP_SYSTEM))) continue;
         if (m->type & (BTRFS_BLOCK_GROUP_RAID0 | BTRFS_BLOCK_GROUP_RAID10 | BTRFS_BLOCK_GROUP_RAID5 | BTRFS_BLOCK_GROUP_RAID6)) continue;
         uint64_t chunk_end = m->logical + m->length;
         uint64_t hint = fs->alloc_hint[(type & BTRFS_BLOCK_GROUP_DATA) ? 0 : 1];
@@ -628,9 +628,60 @@ static void pending_add(struct btrfs_fs *fs, uint64_t bytenr, int level, uint64_
     fs->pending[fs->npending++] = (struct pending_block){ bytenr, level, owner, free };
 }
 
+/* ---- chunk allocation: grow the filesystem with a new SINGLE chunk ---- */
+int btrfs_alloc_chunk(struct btrfs_fs *fs, uint64_t type, uint64_t want) {
+    if (fs->readonly || fs->nchunks >= MAX_CHUNKS || fs->in_chunk_alloc) return -ENOSPC;
+    uint64_t dev_size = fs->sb.dev_item.total_bytes;
+    /* physical: after the last chunk on the device; logical: after the highest logical address */
+    uint64_t phys = 1ull << 20, logical = 1ull << 20;
+    for (int i = 0; i < fs->nchunks; i++) {
+        for (int st = 0; st < fs->chunks[i].nstripes; st++) if (fs->chunks[i].stripe_phys[st] + fs->chunks[i].length > phys) phys = fs->chunks[i].stripe_phys[st] + fs->chunks[i].length;
+        if (fs->chunks[i].logical + fs->chunks[i].length > logical) logical = fs->chunks[i].logical + fs->chunks[i].length;
+    }
+    phys = ALIGN_UP(phys, 1 << 20); logical = ALIGN_UP(logical, 1 << 20);
+    if (phys + (1ull << 20) > dev_size) return -ENOSPC;
+    uint64_t len = MIN(want, ALIGN_DOWN(dev_size - phys, 1 << 20));
+    if (len < (8ull << 20) && len < want) { if (len < 1ull << 20) return -ENOSPC; }
+    fs->in_chunk_alloc = true;
+    struct { struct btrfs_chunk c; struct btrfs_stripe s; } PACKED ch;
+    memset(&ch, 0, sizeof ch);
+    ch.c.length = len; ch.c.owner = BTRFS_EXTENT_TREE_OBJECTID; ch.c.stripe_len = 65536; ch.c.type = type;
+    ch.c.io_align = 65536; ch.c.io_width = 65536; ch.c.sector_size = fs->sectorsize; ch.c.num_stripes = 1; ch.c.sub_stripes = 1;
+    ch.s.devid = fs->sb.dev_item.devid; ch.s.offset = phys; memcpy(ch.s.dev_uuid, fs->sb.dev_item.uuid, 16);
+    /* register in the chunk map first so tree blocks for the bookkeeping can land in it if needed */
+    add_chunk(fs, logical, &ch.c);
+    struct btrfs_key k = { BTRFS_FIRST_CHUNK_TREE_OBJECTID, BTRFS_CHUNK_ITEM_KEY, logical };
+    int r = btrfs_insert_item(fs, &fs->chunk_tree, &k, &ch, sizeof ch, NULL);
+    if (r == 0) {
+        struct btrfs_dev_extent de = { BTRFS_CHUNK_TREE_OBJECTID, BTRFS_FIRST_CHUNK_TREE_OBJECTID, logical, len };
+        memcpy(de.chunk_tree_uuid, fs->chunk_tree_uuid, 16);
+        struct btrfs_key dk = { fs->sb.dev_item.devid, BTRFS_DEV_EXTENT_KEY, phys };
+        r = btrfs_insert_item(fs, &fs->dev_tree, &dk, &de, sizeof de, NULL);
+    }
+    if (r == 0) {
+        struct btrfs_tree *t; bg_tree_select(fs, &t);
+        struct btrfs_block_group_item bgi = { 0, BTRFS_FIRST_CHUNK_TREE_OBJECTID, type };
+        struct btrfs_key bk = { logical, BTRFS_BLOCK_GROUP_ITEM_KEY, len };
+        r = btrfs_insert_item(fs, t, &bk, &bgi, sizeof bgi, NULL);
+    }
+    if (r == 0 && fs->fst_ok) {
+        struct btrfs_free_space_info info = { 1, 0 };
+        struct btrfs_key ik = { logical, BTRFS_FREE_SPACE_INFO_KEY, len }, ek = { logical, BTRFS_FREE_SPACE_EXTENT_KEY, len };
+        if (btrfs_insert_item(fs, &fs->fst, &ik, &info, sizeof info, NULL) < 0 || btrfs_insert_item(fs, &fs->fst, &ek, NULL, 0, NULL) < 0) fst_invalidate(fs, "chunk insert failed");
+    }
+    fs->sb.dev_item.bytes_used += len;
+    fs->sb.chunk_root_generation = fs->transid;
+    fs->in_chunk_alloc = false;
+    if (r < 0) { fs->nchunks--; kprintf("btrfs: chunk allocation failed (%d)\n", r); return r; }
+    kprintf("btrfs: allocated %s chunk: logical %lx, physical %lx, %lu MiB\n", (type & BTRFS_BLOCK_GROUP_DATA) ? "data" : "metadata", logical, phys, len >> 20);
+    return 0;
+}
+
 uint64_t btrfs_alloc_tree_block(struct btrfs_fs *fs, uint64_t owner) {
-    uint64_t b = btrfs_alloc_extent(fs, fs->nodesize, BTRFS_BLOCK_GROUP_METADATA);
+    uint64_t type = owner == BTRFS_CHUNK_TREE_OBJECTID ? BTRFS_BLOCK_GROUP_SYSTEM : BTRFS_BLOCK_GROUP_METADATA;
+    uint64_t b = btrfs_alloc_extent(fs, fs->nodesize, type);
     if (!b) b = btrfs_alloc_extent(fs, fs->nodesize, BTRFS_BLOCK_GROUP_DATA | BTRFS_BLOCK_GROUP_METADATA);
+    if (!b && type == BTRFS_BLOCK_GROUP_METADATA && btrfs_alloc_chunk(fs, BTRFS_BLOCK_GROUP_METADATA, 256ull << 20) == 0) b = btrfs_alloc_extent(fs, fs->nodesize, type);
     if (!b) { kprintf("btrfs: out of metadata space\n"); return 0; }
     fs->alloc_hint[1] = b + fs->nodesize;
     pending_add(fs, b, 0, owner, false);
@@ -715,6 +766,7 @@ int btrfs_record_data_extent(struct btrfs_fs *fs, uint64_t bytenr, uint64_t len,
 }
 uint64_t btrfs_alloc_data(struct btrfs_fs *fs, uint64_t len) {
     uint64_t b = btrfs_alloc_extent(fs, len, BTRFS_BLOCK_GROUP_DATA);
+    if (!b && btrfs_alloc_chunk(fs, BTRFS_BLOCK_GROUP_DATA, 1ull << 30) == 0) b = btrfs_alloc_extent(fs, len, BTRFS_BLOCK_GROUP_DATA);
     if (b) fs->alloc_hint[0] = b + len;
     return b;
 }
@@ -819,6 +871,7 @@ int btrfs_commit(struct btrfs_fs *fs) {
     /* root tree root must carry the superblock generation */
     struct tree_block *rt = btrfs_read_block(fs, fs->root_tree.bytenr);
     if (rt) { hdr(rt)->generation = fs->transid; rt->dirty = true; }
+    if (fs->sb.chunk_root_generation == fs->transid) { struct tree_block *ct = btrfs_read_block(fs, fs->chunk_tree.bytenr); if (ct) { hdr(ct)->generation = fs->transid; ct->dirty = true; } }
     for (int i = 0; i < CACHE_BUCKETS; i++) for (struct tree_block *b = fs->cache[i]; b; b = b->hnext) {
         if (!b->dirty) continue;
         uint32_t c = block_csum(fs, b->data);
@@ -902,6 +955,8 @@ struct btrfs_fs *btrfs_open(struct blockdev *dev) {
     if (parse_sys_chunks(fs) < 0) { kprintf("btrfs: %s: no system chunks\n", dev->name); kfree(fs); return NULL; }
     if (load_chunk_tree(fs) < 0) { kprintf("btrfs: %s: cannot read chunk tree\n", dev->name); kfree(fs); return NULL; }
     fs->root_tree = (struct btrfs_tree){ BTRFS_ROOT_TREE_OBJECTID, fs->sb.root, fs->sb.root_level, fs->sb.generation };
+    fs->chunk_tree = (struct btrfs_tree){ BTRFS_CHUNK_TREE_OBJECTID, fs->sb.chunk_root, fs->sb.chunk_root_level, fs->sb.chunk_root_generation };
+    if (btrfs_load_tree(fs, BTRFS_DEV_TREE_OBJECTID, &fs->dev_tree) < 0) { kprintf("btrfs: no dev tree\n"); fs->readonly = true; }
     if (btrfs_load_tree(fs, BTRFS_EXTENT_TREE_OBJECTID, &fs->extent_tree) < 0) { kprintf("btrfs: no extent tree\n"); kfree(fs); return NULL; }
     if (btrfs_load_tree(fs, BTRFS_CSUM_TREE_OBJECTID, &fs->csum_tree) < 0) { kprintf("btrfs: no csum tree\n"); fs->readonly = true; }
     if (fs->sb.incompat_flags & BTRFS_FEATURE_INCOMPAT_BLOCK_GROUP_TREE) { if (btrfs_load_tree(fs, BTRFS_BLOCK_GROUP_TREE_OBJECTID, &fs->bg_tree) < 0) fs->readonly = true; }

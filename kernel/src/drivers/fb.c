@@ -20,6 +20,15 @@ void fb_init(void) {
     kprintf("fb: %dx%d, pitch %d, bpp %d at %p\n", fbw, fbh, fbpitch, fb->bpp, fb_mem);
 }
 int fb_width(void) { return fbw; }
+/* switch to a new scanout buffer (after a GPU mode set) */
+void fb_set_mode(uint64_t phys, int w, int h, int pitch) {
+    fb_mem = vmm_map_wc(phys, (size_t)pitch * h);
+    fbw = w; fbh = h; fbpitch = pitch;
+    canvas_destroy(screen);
+    screen = canvas_create(w, h);
+    extern void fb_reset_flip(void);
+    fb_reset_flip();
+}
 int fb_height(void) { return fbh; }
 
 /* With a page-flipping GPU, damage goes to the VRAM back buffer; the other
@@ -27,6 +36,7 @@ int fb_height(void) { return fbh; }
 static struct rect stale[2][32]; static int nstale[2];
 static int flip_side;              /* which 'stale' list belongs to the current back buffer */
 static bool flip_pending;
+void fb_reset_flip(void) { nstale[0] = nstale[1] = 0; flip_pending = false; }
 static void stale_add(int side, struct rect r) {
     if (nstale[side] < 32) stale[side][nstale[side]++] = r;
     else { struct rect u = stale[side][0]; for (int i = 1; i < nstale[side]; i++) u = rect_union(u, stale[side][i]); stale[side][0] = rect_union(u, r); nstale[side] = 1; }

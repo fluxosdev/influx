@@ -27,7 +27,7 @@ struct event {
 
 /* standard menu commands */
 enum {
-    CMD_NONE = 0, CMD_QUIT, CMD_CLOSE, CMD_ABOUT, CMD_SETTINGS, CMD_TASKMAN, CMD_RESTART, CMD_SHUTDOWN,
+    CMD_NONE = 0, CMD_QUIT, CMD_CLOSE, CMD_ABOUT, CMD_SETTINGS, CMD_TASKMAN, CMD_RESTART, CMD_SHUTDOWN, CMD_INSTALL,
     CMD_NEW = 10, CMD_OPEN, CMD_SAVE, CMD_SAVE_AS, CMD_NEW_WINDOW, CMD_NEW_FOLDER,
     CMD_UNDO = 20, CMD_REDO, CMD_CUT, CMD_COPY, CMD_PASTE, CMD_SELECT_ALL, CMD_DELETE, CMD_FIND,
     CMD_MINIMIZE = 30, CMD_ZOOM, CMD_HELP, CMD_CLEAR,
@@ -134,12 +134,14 @@ int wm_screen_w(void);
 int wm_screen_h(void);
 struct rect wm_desktop_rect(void);   /* area between menu bar and dock */
 void wm_system_command(int cmd);
+bool wm_set_resolution(int w, int h);
+int display_persist_resolution(int w, int h);   /* writes resolution: into the installed limine.conf; <0 if none */
 void wm_notify_app_state(void);      /* dock running indicators changed */
 void wm_broadcast(int type);         /* post an event to every window */
 extern bool clock_24h;
 
 /* apps */
-enum { APP_FILES, APP_TERMINAL, APP_EDITOR, APP_CALC, APP_TASKMAN, APP_SETTINGS, APP_GLDEMO, APP_COUNT };
+enum { APP_FILES, APP_TERMINAL, APP_EDITOR, APP_CALC, APP_TASKMAN, APP_SETTINGS, APP_GLDEMO, APP_INSTALLER, APP_COUNT };
 struct app_info { const char *name; const char *icon; void (*main)(void *arg); bool single_instance; };
 extern const struct app_info app_table[APP_COUNT];
 int app_launch(int id, const char *arg);

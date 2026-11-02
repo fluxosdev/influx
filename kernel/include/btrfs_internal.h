@@ -22,7 +22,8 @@ struct btrfs_fs {
     struct chunk_map chunks[MAX_CHUNKS]; int nchunks;
     uint8_t chunk_tree_uuid[16];
     struct tree_block *cache[CACHE_BUCKETS]; int ncached; uint64_t lru_clock;
-    struct btrfs_tree root_tree, extent_tree, csum_tree, fs_tree, bg_tree, fst;
+    struct btrfs_tree root_tree, extent_tree, csum_tree, fs_tree, bg_tree, fst, chunk_tree, dev_tree;
+    bool in_chunk_alloc;
     bool fst_ok;
     uint64_t transid;
     bool readonly, dirty_super, any_dirty;
@@ -72,3 +73,5 @@ int btrfs_csum_remove(struct btrfs_fs *fs, uint64_t bytenr, uint64_t len);
 int btrfs_commit(struct btrfs_fs *fs);
 void btrfs_begin(struct btrfs_fs *fs);
 void btrfs_flush_pending(struct btrfs_fs *fs);
+int btrfs_alloc_chunk(struct btrfs_fs *fs, uint64_t type, uint64_t want);
+int btrfs_mkfs(struct blockdev *d, const char *label);

@@ -16,6 +16,7 @@ struct blockdev {
     struct vnode *vn;
 };
 void blockdev_register(struct blockdev *d);   /* registers the disk, scans partitions */
+void blockdev_rescan(struct blockdev *d);     /* drop and re-read the partition table */
 int blockdev_count(void);
 struct blockdev *blockdev_at(int i);
 struct blockdev *blockdev_find(const char *name);

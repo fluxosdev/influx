@@ -7,6 +7,7 @@
 #include "arch.h"
 #include "blockdev.h"
 #include "gpu.h"
+#include "installer.h"
 
 #define MAX_ARGS 128
 #define MAX_HIST 500
@@ -575,6 +576,33 @@ static int b_lsgpu(struct ctx *c, int argc, char **argv) {
     }
     return 0;
 }
+static void install_progress(void *ctx, int pct, const char *m) { cprintf((struct ctx *)ctx, "[%3d%%] %s\n", pct, m); }
+static int b_install(struct ctx *c, int argc, char **argv) {
+    if (argc < 2) { cputs(c, "usage: install /dev/<disk>   (erases the whole disk; see also the Install inFlux app)\n"); return 1; }
+    const char *n = argv[1]; if (!strncmp(n, "/dev/", 5)) n += 5;
+    struct blockdev *d = blockdev_find(n);
+    if (!d || d->parent) { eprintf(c, "install: %s is not a whole disk\n", argv[1]); return 1; }
+    int r = install_run(d, install_progress, c);
+    c->sh->last_status = r < 0 ? 1 : 0;
+    return r < 0 ? 1 : 0;
+}
+static int b_display(struct ctx *c, int argc, char **argv) {
+    struct gpu_device *g = gpu_primary();
+    if (argc < 2) {
+        cprintf(c, "current: %dx%d (%s%s)\n", wm_screen_w(), wm_screen_h(), g ? g->name : "?", g && g->modeset ? ", runtime mode setting" : ", boot-time only");
+        struct display_mode m[16]; int n = gpu_list_modes(m, 16);
+        cputs(c, "modes:"); for (int i = 0; i < n; i++) cprintf(c, " %dx%d", m[i].w, m[i].h); cputs(c, "\n");
+        return 0;
+    }
+    int w = atoi(argv[1]); const char *x = strchr(argv[1], 'x'); int h = x ? atoi(x + 1) : 0;
+    if (w < 320 || h < 200) { eprintf(c, "display: usage: display WIDTHxHEIGHT\n"); return 1; }
+    bool live = g && g->modeset && wm_set_resolution(w, h);
+    int saved = display_persist_resolution(w, h);
+    if (live) cprintf(c, "switched to %dx%d%s\n", w, h, saved == 0 ? " (saved as boot resolution)" : "");
+    else if (saved == 0) cprintf(c, "saved %dx%d as the boot resolution (takes effect at next boot)\n", w, h);
+    else { eprintf(c, "display: cannot change mode at runtime and no installed limine.conf found\n"); return 1; }
+    return 0;
+}
 static int b_lspci(struct ctx *c, int argc, char **argv) {
     for (int i = 0; i < pci_device_count(); i++) { struct pci_device *d = pci_device_at(i); cprintf(c, "%02x:%02x.%d %s [%02x%02x]: %04x:%04x\n", d->bus, d->slot, d->func, pci_class_name(d->class_code, d->subclass), d->class_code, d->subclass, d->vendor, d->device); }
     return 0;
@@ -776,7 +804,7 @@ static const struct builtin builtins[] = {
     { "cat", b_cat, "concatenate files (-n numbers lines)" }, { "cd", b_cd, "change directory (cd -, cd ~)" },
     { "clear", b_clear, "clear the screen" }, { "cp", b_cp, "copy files (-r for directories)" },
     { "date", b_date, "show the current date and time" }, { "df", b_df, "show filesystem usage (-h)" },
-    { "dirname", b_dirname, "strip the last component from a path" }, { "du", b_du, "disk usage (-h)" },
+    { "dirname", b_dirname, "strip the last component from a path" }, { "display", b_display, "show or set the display resolution" }, { "du", b_du, "disk usage (-h)" },
     { "echo", b_echo, "print arguments (-n, -e)" }, { "env", b_env, "list environment variables" },
     { "exit", b_exit, "exit the shell" }, { "export", b_export, "set environment variables" },
     { "false", b_false, "return failure" }, { "fetch", b_fetch, "show system information" },
@@ -784,7 +812,7 @@ static const struct builtin builtins[] = {
     { "grep", b_grep, "search for a pattern (-i -v -c -n)" }, { "head", b_head, "first lines of input (-n N)" },
     { "help", b_help, "this list" }, { "hexdump", b_hexdump, "hex dump of a file (-n bytes)" },
     { "history", b_history, "show command history (-c clears)" }, { "hostname", b_hostname, "print the host name" },
-    { "id", b_id, "print user identity" }, { "kill", b_kill, "terminate a process: kill [-9] pid" },
+    { "id", b_id, "print user identity" }, { "install", b_install, "install inFlux to a disk" }, { "kill", b_kill, "terminate a process: kill [-9] pid" },
     { "ls", b_ls, "list directory contents (-l -a -h)" }, { "lsblk", b_lsblk, "list block devices" }, { "lsgpu", b_lsgpu, "show graphics adapters" },
     { "lspci", b_lspci, "list PCI devices" }, { "mkdir", b_mkdir, "create directories (-p)" },
     { "mount", b_mount, "list mounted filesystems" }, { "mv", b_mv, "move or rename files" },

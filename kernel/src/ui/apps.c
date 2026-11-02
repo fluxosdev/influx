@@ -11,6 +11,7 @@ void calc_main(void *arg);
 void taskman_main(void *arg);
 void settings_main(void *arg);
 void gldemo_main(void *arg);
+void installer_main(void *arg);
 
 const struct app_info app_table[APP_COUNT] = {
     [APP_FILES]   = { "Files", "files", files_main, false },
@@ -20,6 +21,7 @@ const struct app_info app_table[APP_COUNT] = {
     [APP_TASKMAN]  = { "Task Manager", "taskman", taskman_main, true },
     [APP_SETTINGS] = { "System Settings", "settings", settings_main, true },
     [APP_GLDEMO]   = { "OpenGL Demo", "gldemo", gldemo_main, false },
+    [APP_INSTALLER] = { "Install inFlux", "drive", installer_main, true },
 };
 
 struct app_start { int id; char *arg; };
@@ -176,6 +178,7 @@ void wm_system_command(int cmd) {
     case CMD_ABOUT: about_show(); break;
     case CMD_SETTINGS: app_launch(APP_SETTINGS, NULL); break;
     case CMD_TASKMAN: app_launch(APP_TASKMAN, NULL); break;
+    case CMD_INSTALL: app_launch(APP_INSTALLER, NULL); break;
     case CMD_RESTART: { struct process *p = process_create("Restart", false); extern void power_restart_thread(void *); thread_create(p, "restart", power_restart_thread, NULL); break; }
     case CMD_SHUTDOWN: { struct process *p = process_create("Shut Down", false); extern void power_shutdown_thread(void *); thread_create(p, "shutdown", power_shutdown_thread, NULL); break; }
     }

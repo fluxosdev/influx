@@ -2,6 +2,7 @@
 #include "kernel.h"
 
 uint32_t crc32c(uint32_t seed, const void *data, size_t n);
+uint32_t crc32_ieee(const void *data, size_t n);
 
 #define BTRFS_MAGIC "_BHRfS_M"
 #define BTRFS_SUPER_OFFSET 0x10000
@@ -58,6 +59,7 @@ uint32_t crc32c(uint32_t seed, const void *data, size_t n);
 #define BTRFS_EXTENT_FLAG_DATA 1
 #define BTRFS_EXTENT_FLAG_TREE_BLOCK 2
 #define BTRFS_HEADER_FLAG_WRITTEN 1
+#define BTRFS_HEADER_FLAG_MIXED_BACKREF (1ULL << 56)   /* backref revision 1 */
 
 #define BTRFS_FEATURE_INCOMPAT_MIXED_GROUPS 0x4
 #define BTRFS_FEATURE_INCOMPAT_EXTENDED_IREF 0x40

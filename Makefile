@@ -15,7 +15,7 @@ KCFLAGS := -std=gnu11 -ffreestanding -fno-stack-protector -fno-stack-check \
            -fno-lto -fno-pic -fno-pie -m64 -march=x86-64 -mabi=sysv \
            -mno-80387 -mno-mmx -mno-sse -mno-sse2 -mno-red-zone \
            -mcmodel=kernel -mgeneral-regs-only -O2 -g \
-           -Wall -Wextra -Wno-unused-parameter -Wno-unused-function -Wno-misleading-indentation -Wno-type-limits -Wno-missing-field-initializers -Wno-sign-compare \
+           -Wall -Wextra -Wno-unused-parameter -Wno-unused-function -Wno-misleading-indentation -Wno-type-limits -Wno-missing-field-initializers -Wno-sign-compare -Wno-address-of-packed-member \
            -Ikernel/include -Ithird_party/limine -MMD -MP
 # the OpenGL software renderer and its demo use SSE floating point (FPU state is saved per thread)
 KCFLAGS_SSE := $(filter-out -mno-sse -mno-sse2 -mgeneral-regs-only -mno-mmx,$(KCFLAGS)) -msse -msse2 -mno-mmx -Igl
@@ -120,9 +120,11 @@ SKEL_FILES := $(shell find sysroot -type f 2>/dev/null)
 
 initrd: $(INITRD)
 
-$(INITRD): $(FONT_FILES) $(ICON_FILES) $(UPROGS) $(SKEL_FILES)
-	@mkdir -p $(SYSROOT)
+$(INITRD): $(FONT_FILES) $(ICON_FILES) $(UPROGS) $(SKEL_FILES) $(KERNEL)
+	@mkdir -p $(SYSROOT)/boot/limine
 	cp -r sysroot/. $(SYSROOT)/
+	cp $(KERNEL) $(SYSROOT)/boot/influx.elf
+	cp $(LIMINE)/BOOTX64.EFI $(LIMINE)/BOOTIA32.EFI $(LIMINE)/limine-bios.sys $(SYSROOT)/boot/limine/
 	tar --format=ustar --owner=0 --group=0 --mtime='2026-01-01' -C $(SYSROOT) -cf $@ .
 
 # ---- ISO ----
@@ -148,7 +150,12 @@ $(ISO): $(KERNEL) $(INITRD) limine.conf $(BUILD)/limine
 DISK_SATA := $(BUILD)/sata.img
 DISK_NVME := $(BUILD)/nvme.img
 
-disk: $(DISK_SATA) $(DISK_NVME)
+DISK_INSTALL := $(BUILD)/install.img
+
+disk: $(DISK_SATA) $(DISK_NVME) $(DISK_INSTALL)
+
+$(DISK_INSTALL):
+	truncate -s 1G $@
 
 $(DISK_SATA): tools/mkdisk.sh
 	tools/mkdisk.sh $@ "inFlux SATA" 256
@@ -162,6 +169,7 @@ QEMU_ARGS := -M q35 -m 2G -cdrom $(ISO) -boot d -serial stdio \
              -device ahci,id=ahci -device ide-hd,drive=sata0,bus=ahci.0 \
              -drive id=nvme0,file=$(DISK_NVME),format=raw,if=none \
              -device nvme,serial=INFLUX01,drive=nvme0 \
+             -drive id=inst,file=$(DISK_INSTALL),format=raw,if=none -device ide-hd,drive=inst,bus=ahci.1 \
              -vga std -display gtk,zoom-to-fit=on
 
 run: $(ISO) disk
@@ -169,6 +177,18 @@ run: $(ISO) disk
 
 run-kvm: $(ISO) disk
 	$(QEMU) -enable-kvm -cpu host $(QEMU_ARGS)
+
+# boot an installed system (after using the installer on build/install.img)
+run-installed: $(DISK_INSTALL)
+	$(QEMU) -M q35 -m 2G -serial stdio -vga std -display gtk,zoom-to-fit=on -drive file=$(DISK_INSTALL),format=raw,if=none,id=d -device ahci,id=ahci -device ide-hd,drive=d,bus=ahci.0
+
+OVMF_CODE ?= /usr/share/OVMF/OVMF_CODE_4M.fd
+OVMF_VARS ?= /usr/share/OVMF/OVMF_VARS_4M.fd
+run-installed-uefi: $(DISK_INSTALL)
+	cp -n $(OVMF_VARS) $(BUILD)/ovmf_vars.fd || true
+	$(QEMU) -M q35 -m 2G -serial stdio -vga std -display gtk,zoom-to-fit=on \
+	    -drive if=pflash,format=raw,readonly=on,file=$(OVMF_CODE) -drive if=pflash,format=raw,file=$(BUILD)/ovmf_vars.fd \
+	    -drive file=$(DISK_INSTALL),format=raw,if=none,id=d -device ahci,id=ahci -device ide-hd,drive=d,bus=ahci.0
 
 clean:
 	rm -rf $(BUILD)/kernel $(BUILD)/user $(BUILD)/sysroot $(BUILD)/iso $(KERNEL) $(INITRD) $(ISO)
