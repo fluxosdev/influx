@@ -111,7 +111,7 @@ static bool load_file(struct editor *e, const char *path) {
     /* strip NULs / CR */
     int k = 0; for (int i = 0; i < e->len; i++) if (e->text[i] != '\r' && e->text[i]) e->text[k++] = e->text[i];
     e->len = k; e->text[k] = 0;
-    e->cursor = 0; e->anchor = -1; e->scroll_y = 0; e->dirty = false;
+    e->cursor = 0; e->anchor = -1; e->scroll_y = e->scroll_x = 0; e->pref_col = -1; e->dragging = false; e->dirty = false;
     kfree(e->undo_text); e->undo_text = NULL;
     strlcpy(e->path, path, sizeof e->path);
     reindex(e); update_title(e);
@@ -206,9 +206,23 @@ static void move_cursor(struct editor *e, int off, bool extend) {
     if (extend) { if (e->anchor < 0) e->anchor = e->cursor; } else e->anchor = -1;
     e->cursor = CLAMP(off, 0, e->len);
 }
-static bool is_word(char c) { return isalnum(c) || c == '_'; }
+static bool is_word(char c) { return isalnum(c) || c == '_' || (unsigned char)c >= 0x80; }   /* non-ASCII counts as a letter so "café" is one word */
+/* step one whole code point (skip UTF-8 continuation bytes) */
+static int cp_prev(struct editor *e, int off) { if (off > 0) off--; while (off > 0 && (e->text[off] & 0xC0) == 0x80) off--; return off; }
+static int cp_next(struct editor *e, int off) { if (off < e->len) off++; while (off < e->len && (e->text[off] & 0xC0) == 0x80) off++; return off; }
 static int word_left(struct editor *e, int off) { while (off > 0 && !is_word(e->text[off - 1])) off--; while (off > 0 && is_word(e->text[off - 1])) off--; return off; }
 static int word_right(struct editor *e, int off) { while (off < e->len && !is_word(e->text[off])) off++; while (off < e->len && is_word(e->text[off])) off++; return off; }
+/* double-click: select the run (word, whitespace or punctuation) containing the character under the click, within its line */
+static int char_class(char c) { return is_word(c) ? 2 : c == ' ' || c == '\t'; }
+static void select_word_at(struct editor *e, int x, int y) {
+    int off = offset_at(e, x, y), l = line_of(e, off), s = e->line_starts[l], end = line_end(e, l);
+    if (off > s && (off == end || text_x(e, s, off) > x - PAD_X + e->scroll_x)) off = cp_prev(e, off);   /* nearest boundary is right of the click: the char under it starts earlier */
+    if (off >= end) { e->anchor = -1; e->cursor = off; return; }
+    int k = char_class(e->text[off]), a = off, b = off;
+    while (a > s && char_class(e->text[a - 1]) == k) a--;
+    while (b < end && char_class(e->text[b]) == k) b++;
+    e->anchor = a; e->cursor = b;
+}
 
 static bool confirm_discard(struct editor *e) {
     if (!e->dirty) return true;
@@ -222,8 +236,8 @@ static void handle_key(struct editor *e, struct event *ev) {
     int k = ev->key; if (k >= 'A' && k <= 'Z') k += 32;
     int l = line_of(e, e->cursor);
     switch (ev->key) {
-    case KEY_LEFT: if (!shift && e->anchor >= 0) { int a, b; sel_range(e, &a, &b); move_cursor(e, a, false); } else move_cursor(e, alt ? word_left(e, e->cursor) : cmd ? e->line_starts[l] : e->cursor - 1, shift); e->pref_col = -1; return;
-    case KEY_RIGHT: if (!shift && e->anchor >= 0) { int a, b; sel_range(e, &a, &b); move_cursor(e, b, false); } else move_cursor(e, alt ? word_right(e, e->cursor) : cmd ? line_end(e, l) : e->cursor + 1, shift); e->pref_col = -1; return;
+    case KEY_LEFT: if (!shift && e->anchor >= 0) { int a, b; sel_range(e, &a, &b); move_cursor(e, a, false); } else move_cursor(e, alt ? word_left(e, e->cursor) : cmd ? e->line_starts[l] : cp_prev(e, e->cursor), shift); e->pref_col = -1; return;
+    case KEY_RIGHT: if (!shift && e->anchor >= 0) { int a, b; sel_range(e, &a, &b); move_cursor(e, b, false); } else move_cursor(e, alt ? word_right(e, e->cursor) : cmd ? line_end(e, l) : cp_next(e, e->cursor), shift); e->pref_col = -1; return;
     case KEY_UP: case KEY_DOWN: {
         if (cmd) { move_cursor(e, ev->key == KEY_UP ? 0 : e->len, shift); return; }
         int nl = ev->key == KEY_UP ? l - 1 : l + 1;
@@ -285,16 +299,16 @@ void editor_main(void *arg) {
         case EV_QUIT: quit = true; break;
         case EV_CLOSE: handle_command(e, CMD_CLOSE, &quit, &close); break;
         case EV_MENU: handle_command(e, ev.cmd, &quit, &close); ensure_cursor_visible(e); break;
-        case EV_OPEN: if (confirm_discard(e)) load_file(e, ev.path); kfree(ev.path); break;
+        case EV_OPEN: if (confirm_discard(e)) { load_file(e, ev.path); ensure_cursor_visible(e); } kfree(ev.path); break;
         case EV_RESIZE: clamp_scroll(e); break;
         case EV_TIMER: break;
-        case EV_MOUSE_SCROLL: e->scroll_y += ev.scroll * 3; clamp_scroll(e); break;
+        case EV_MOUSE_SCROLL: e->scroll_y -= ev.scroll * 3; clamp_scroll(e); break;
         case EV_MOUSE_DOWN:
             if (ev.button == BTN_LEFT && ev.y < text_rect(e).h) {
                 int off = offset_at(e, ev.x, ev.y);
                 bool dbl = system_ticks - e->last_click < 450; e->last_click = system_ticks;
                 e->click_count = dbl ? e->click_count + 1 : 1;
-                if (e->click_count == 2) { e->anchor = word_left(e, off); e->cursor = word_right(e, off); }
+                if (e->click_count == 2) select_word_at(e, ev.x, ev.y);
                 else if (e->click_count >= 3) { int l = line_of(e, off); e->anchor = e->line_starts[l]; e->cursor = line_end(e, l); }
                 else { move_cursor(e, off, ev.mods & MOD_SHIFT); e->dragging = true; }
                 e->pref_col = -1;

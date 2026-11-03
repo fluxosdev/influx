@@ -8,7 +8,7 @@ typedef __int128 dec_t;
 
 struct calc {
     struct window *w;
-    char entry[32]; bool entering; bool has_dot;
+    char entry[32]; bool entering; bool has_dot; bool computed;   /* computed: entry came from %, next digit starts afresh */
     dec_t acc; int op; bool have_acc; bool error, overflow;
     dec_t last_operand; int last_op;
     int pressed; int hover;
@@ -67,6 +67,8 @@ ovf:
     c->error = c->overflow = true; return 0;
 }
 static dec_t current_value(struct calc *c) { return c->entering ? dec_parse(c->entry, NULL) : c->acc; }
+/* make v the operand being entered, as if typed */
+static void set_entry(struct calc *c, dec_t v) { dec_format(v, c->entry, sizeof c->entry); c->entering = true; c->has_dot = strchr(c->entry, '.') != NULL; c->computed = false; }
 
 static void draw(struct calc *c) {
     struct canvas *cv = window_begin_draw(c->w);
@@ -107,7 +109,7 @@ static void draw(struct calc *c) {
 static void press_key(struct calc *c, const char *k) {
     if (c->error && strcmp(k, "AC")) return;
     if (isdigit(k[0]) || !strcmp(k, ".")) {
-        if (!c->entering) { c->entry[0] = 0; c->entering = true; c->has_dot = false; }
+        if (!c->entering || c->computed) { c->entry[0] = 0; c->entering = true; c->has_dot = false; c->computed = false; }
         size_t l = strlen(c->entry);
         if (!strcmp(k, ".")) { if (c->has_dot) return; if (l == 0) { strcpy(c->entry, "0"); l = 1; } c->has_dot = true; }
         if (l >= 16) return;
@@ -121,7 +123,13 @@ static void press_key(struct calc *c, const char *k) {
         else c->acc = -c->acc;
         return;
     }
-    if (!strcmp(k, "%")) { dec_t v = current_value(c) / 100; c->acc = v; c->entering = false; c->have_acc = true; return; }
+    if (!strcmp(k, "%")) {
+        /* a + b% → a + a·b/100; a × b% → a × b/100; alone → value/100 */
+        if (!c->have_acc || !c->op) { c->acc = current_value(c) / 100; c->entering = false; c->have_acc = true; return; }
+        dec_t b = current_value(c), v = c->op == '+' || c->op == '-' ? apply(c, c->acc, '*', b) / 100 : b / 100;
+        if (!c->error) { set_entry(c, v); c->computed = true; }
+        return;
+    }
     int op = 0;
     if (!strcmp(k, "÷")) op = '/'; else if (!strcmp(k, "×")) op = '*'; else if (!strcmp(k, "−")) op = '-'; else if (!strcmp(k, "+")) op = '+';
     if (op) {
@@ -136,7 +144,7 @@ static void press_key(struct calc *c, const char *k) {
             if (c->entering) { c->last_operand = v; c->last_op = c->op; }
             c->acc = apply(c, c->acc, c->op, v);
             c->op = 0;
-        }
+        } else if (c->entering) c->acc = dec_parse(c->entry, NULL);
         c->entering = false; c->have_acc = true;
     }
 }
@@ -176,13 +184,13 @@ void calc_main(void *arg) {
             else if (ev.ch == '.') strcpy(k, "."); else if (ev.ch == '+') strcpy(k, "+"); else if (ev.ch == '-') strcpy(k, "−");
             else if (ev.ch == '*') strcpy(k, "×"); else if (ev.ch == '/') strcpy(k, "÷"); else if (ev.ch == '%') strcpy(k, "%");
             else if (ev.ch == '=' || ev.key == KEY_ENTER) strcpy(k, "="); else if (ev.key == KEY_ESC) strcpy(k, "AC");
-            else if (ev.key == KEY_BACKSPACE && c.entering) { size_t l = strlen(c.entry); if (l) { if (c.entry[l - 1] == '.') c.has_dot = false; c.entry[l - 1] = 0; } if (!c.entry[0]) c.entering = false; }
+            else if (ev.key == KEY_BACKSPACE && c.entering) { c.computed = false; size_t l = strlen(c.entry); if (l) { if (c.entry[l - 1] == '.') c.has_dot = false; c.entry[l - 1] = 0; } if (!c.entry[0]) c.entering = false; }
             if (k[0]) press_key(&c, k);
             draw(&c);
         } else if (ev.type == EV_MENU) {
             if (ev.cmd == CMD_CLEAR) press_key(&c, "AC");
             else if (ev.cmd == CMD_COPY) { char d[48]; dec_format(current_value(&c), d, sizeof d); clipboard_set(d, strlen(d)); }
-            else if (ev.cmd == CMD_PASTE) { char *s = clipboard_get(); if (s) { bool ovf = false; c.acc = dec_parse(s, &ovf); c.entering = false; c.have_acc = true; if (ovf) c.error = c.overflow = true; kfree(s); } }
+            else if (ev.cmd == CMD_PASTE) { char *s = clipboard_get(); if (s) { bool ovf = false; dec_t v = dec_parse(s, &ovf); if (ovf) c.error = c.overflow = true; else if (!c.error) set_entry(&c, v); kfree(s); } }
             draw(&c);
         }
     }

@@ -415,7 +415,7 @@ void settings_main(void *arg) {
             if (s->pane == PANE_DISPLAYS && s->dd_open) { struct disp_layout L; displays_layout(s, &L); int k = (ev.y - L.list.y - 4) / DROPDOWN_ITEM_H; s->dd_hover = rect_contains(L.list, ev.x, ev.y) && k >= 0 && k < L.list_visible ? s->dd_first + k : -1; }
             break;
         case EV_MOUSE_SCROLL:
-            if (s->pane == PANE_DISPLAYS && s->dd_open) { struct disp_layout L; displays_layout(s, &L); s->dd_first = CLAMP(s->dd_first - ev.scroll, 0, MAX(0, L.nmodes + 1 - L.list_visible)); }
+            if (s->pane == PANE_DISPLAYS && s->dd_open) { struct disp_layout L; displays_layout(s, &L); s->dd_first = CLAMP(s->dd_first - ev.scroll, 0, MAX(0, L.nmodes - L.list_visible)); }
             break;
         case EV_TIMER: if (s->confirming && (int64_t)system_ticks >= (int64_t)s->confirm_deadline) disp_revert(s, true); break;
         case EV_BLUR: s->dd_open = false; break;

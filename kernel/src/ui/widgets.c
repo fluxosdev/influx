@@ -80,7 +80,24 @@ void ui_icon_label(struct canvas *c, int x, int y, struct canvas *icon, int icon
 
 /* ---- text field ---- */
 void textfield_init(struct textfield *t, const char *initial) { memset(t, 0, sizeof *t); textfield_set(t, initial ? initial : ""); t->sel_anchor = -1; }
-void textfield_set(struct textfield *t, const char *text) { strlcpy(t->buf, text, sizeof t->buf); t->len = strlen(t->buf); t->cursor = t->len; t->sel_anchor = -1; }
+/* UTF-8 aware stepping: cursor positions always sit on a character boundary */
+static bool tf_cont(char c) { return ((uint8_t)c & 0xC0) == 0x80; }
+static int tf_prev(const struct textfield *t, int i) { if (i > 0) i--; while (i > 0 && tf_cont(t->buf[i])) i--; return i; }
+static int tf_next(const struct textfield *t, int i) { if (i < t->len) i++; while (i < t->len && tf_cont(t->buf[i])) i++; return i; }
+/* bytes of s (n long) that fit in 'room' without splitting a character */
+static int tf_fit(const char *s, int n, int room) { if (n <= room) return n; n = room; while (n > 0 && tf_cont(s[n])) n--; return n; }
+static void tf_insert(struct textfield *t, const char *s, int n) {
+    n = tf_fit(s, n, (int)sizeof t->buf - 1 - t->len);
+    if (n <= 0) return;
+    memmove(t->buf + t->cursor + n, t->buf + t->cursor, t->len - t->cursor + 1);
+    memcpy(t->buf + t->cursor, s, n);
+    t->cursor += n; t->len += n;
+}
+void textfield_set(struct textfield *t, const char *text) {
+    int n = tf_fit(text, strlen(text), sizeof t->buf - 1);
+    memcpy(t->buf, text, n); t->buf[n] = 0;
+    t->len = n; t->cursor = t->len; t->sel_anchor = -1;
+}
 
 static void tf_sel(struct textfield *t, int *a, int *b) {
     if (t->sel_anchor < 0 || t->sel_anchor == t->cursor) { *a = *b = t->cursor; return; }
@@ -119,20 +136,25 @@ bool textfield_key(struct textfield *t, const struct event *ev) {
     if (cmd && k == 'a') { t->sel_anchor = 0; t->cursor = t->len; return true; }
     if (cmd && k == 'c') { int a, b; tf_sel(t, &a, &b); if (a != b) clipboard_set(t->buf + a, b - a); return true; }
     if (cmd && k == 'x') { int a, b; tf_sel(t, &a, &b); if (a != b) { clipboard_set(t->buf + a, b - a); tf_delete_sel(t); } return true; }
-    if (cmd && k == 'v') { char *s = clipboard_get(); if (s) { tf_delete_sel(t); for (char *p = s; *p && t->len < (int)sizeof t->buf - 1; p++) { if (*p == '\n') continue; memmove(t->buf + t->cursor + 1, t->buf + t->cursor, t->len - t->cursor + 1); t->buf[t->cursor++] = *p; t->len++; } kfree(s); } return true; }
+    if (cmd && k == 'v') {
+        char *s = clipboard_get();
+        if (s) { int n = 0; for (char *p = s; *p; p++) if (*p != '\n' && *p != '\r') s[n++] = *p; tf_delete_sel(t); tf_insert(t, s, n); kfree(s); }
+        return true;
+    }
     switch (ev->key) {
     case KEY_LEFT: if (!shift && t->sel_anchor >= 0 && t->sel_anchor != t->cursor) { int a, b; tf_sel(t, &a, &b); t->cursor = a; t->sel_anchor = -1; return true; }
-                   if (shift && t->sel_anchor < 0) t->sel_anchor = t->cursor; if (!shift) t->sel_anchor = -1; if (t->cursor > 0) t->cursor--; return true;
+                   if (shift && t->sel_anchor < 0) t->sel_anchor = t->cursor; if (!shift) t->sel_anchor = -1; t->cursor = tf_prev(t, t->cursor); return true;
     case KEY_RIGHT: if (!shift && t->sel_anchor >= 0 && t->sel_anchor != t->cursor) { int a, b; tf_sel(t, &a, &b); t->cursor = b; t->sel_anchor = -1; return true; }
-                    if (shift && t->sel_anchor < 0) t->sel_anchor = t->cursor; if (!shift) t->sel_anchor = -1; if (t->cursor < t->len) t->cursor++; return true;
+                    if (shift && t->sel_anchor < 0) t->sel_anchor = t->cursor; if (!shift) t->sel_anchor = -1; t->cursor = tf_next(t, t->cursor); return true;
     case KEY_HOME: if (shift && t->sel_anchor < 0) t->sel_anchor = t->cursor; if (!shift) t->sel_anchor = -1; t->cursor = 0; return true;
     case KEY_END: if (shift && t->sel_anchor < 0) t->sel_anchor = t->cursor; if (!shift) t->sel_anchor = -1; t->cursor = t->len; return true;
-    case KEY_BACKSPACE: { int a, b; tf_sel(t, &a, &b); if (a != b) { tf_delete_sel(t); return true; } if (t->cursor > 0) { memmove(t->buf + t->cursor - 1, t->buf + t->cursor, t->len - t->cursor + 1); t->cursor--; t->len--; } return true; }
-    case KEY_DELETE: { int a, b; tf_sel(t, &a, &b); if (a != b) { tf_delete_sel(t); return true; } if (t->cursor < t->len) { memmove(t->buf + t->cursor, t->buf + t->cursor + 1, t->len - t->cursor); t->len--; } return true; }
+    case KEY_BACKSPACE: { int a, b; tf_sel(t, &a, &b); if (a != b) { tf_delete_sel(t); return true; } t->sel_anchor = tf_prev(t, t->cursor); tf_delete_sel(t); t->sel_anchor = -1; return true; }
+    case KEY_DELETE: { int a, b; tf_sel(t, &a, &b); if (a != b) { tf_delete_sel(t); return true; } t->sel_anchor = tf_next(t, t->cursor); tf_delete_sel(t); t->sel_anchor = -1; return true; }
     }
-    if (ev->ch >= 32 && ev->ch < 127 && !cmd) {
+    if (ev->ch >= 32 && ev->ch != 127 && ev->ch <= 0x10FFFF && !cmd) {
+        char u[4]; int n = utf8_encode(ev->ch, u);
         tf_delete_sel(t);
-        if (t->len < (int)sizeof t->buf - 1) { memmove(t->buf + t->cursor + 1, t->buf + t->cursor, t->len - t->cursor + 1); t->buf[t->cursor++] = (char)ev->ch; t->len++; }
+        tf_insert(t, u, n);
         return true;
     }
     return false;
@@ -140,6 +162,6 @@ bool textfield_key(struct textfield *t, const struct event *ev) {
 void textfield_mouse(struct textfield *t, struct rect r, int x, int y) {
     int rel = x - (r.x + 8) + t->scroll;
     int best = 0, bestd = 1 << 30;
-    for (int i = 0; i <= t->len; i++) { int w = font_text_width_n(font_ui, t->buf, i); int d = w > rel ? w - rel : rel - w; if (d < bestd) { bestd = d; best = i; } }
+    for (int i = 0; i <= t->len; i = i < t->len ? tf_next(t, i) : i + 1) { int w = font_text_width_n(font_ui, t->buf, i); int d = w > rel ? w - rel : rel - w; if (d < bestd) { bestd = d; best = i; } }
     t->cursor = best; t->sel_anchor = -1; t->focused = true;
 }

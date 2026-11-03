@@ -20,6 +20,7 @@ struct tm_app {
     uint64_t last_click; int last_click_pid;
     int total_threads;
     bool show_threads;
+    int scroll;                        /* table scroll offset in pixels */
 };
 enum { TCMD_QUIT_PROC = CMD_APP + 1, TCMD_SORT_CPU, TCMD_SORT_MEM, TCMD_SORT_NAME, TCMD_SORT_PID, TCMD_INFO, TCMD_REFRESH };
 static const struct menu_item proc_items[] = { MENU("Force Quit Process…", TCMD_QUIT_PROC, KEY_BACKSPACE, MOD_CMD), MENU("Process Info", TCMD_INFO, 'i', MOD_CMD), MENU_SEP, MENU("Refresh Now", TCMD_REFRESH, 'r', MOD_CMD), MENU_SEP, MENU("Close", CMD_CLOSE, 'w', MOD_CMD), MENU("Quit Task Manager", CMD_QUIT, 'q', MOD_CMD) };
@@ -66,6 +67,8 @@ static void refresh(struct tm_app *t) {
 
 static struct rect btn_quit(struct tm_app *t) { return rect_make(14, TITLEBAR_H + 8, 32, 28); }
 static struct rect table_rect(struct tm_app *t) { return rect_make(0, TITLEBAR_H + TOOLBAR_H, t->w->frame.w, t->w->frame.h - TITLEBAR_H - TOOLBAR_H - SUMMARY_H); }
+static int rows_h(struct tm_app *t) { return table_rect(t).h - HDR_H; }
+static void clamp_scroll(struct tm_app *t) { t->scroll = CLAMP(t->scroll, 0, MAX(0, t->nrows * ROW_H - rows_h(t))); }
 static int col_x(struct tm_app *t, int col) { int W = t->w->frame.w; static const int widths[] = { 0, 70, 90, 70, 60, 70 }; int x = W; for (int i = 5; i >= col; i--) x -= widths[i]; return col == 0 ? 12 : x; }
 
 static void draw(struct tm_app *t) {
@@ -107,7 +110,8 @@ static void draw(struct tm_app *t) {
     struct canvas rows = canvas_sub(c, rect_make(0, tr.y + HDR_H, W, tr.h - HDR_H));
     for (int i = 0; i < t->nrows; i++) {
         struct prow *r = &t->rows[i];
-        int y = i * ROW_H;
+        int y = i * ROW_H - t->scroll;
+        if (y + ROW_H <= 0) continue;
         if (y > rows.h) break;
         bool sel = r->pid == t->selected_pid;
         if (sel) gfx_fill_rect(&rows, 0, y, W, ROW_H, theme.selection);
@@ -126,6 +130,7 @@ static void draw(struct tm_app *t) {
         snprintf(buf, sizeof buf, "%d", r->pid); font_draw_aligned(&rows, font_ui, rect_make(col_x(t, 4), y, col_x(t, 5) - col_x(t, 4) - 8, ROW_H), sc, buf, 2);
         font_draw_aligned(&rows, font_ui, rect_make(col_x(t, 5), y, W - col_x(t, 5) - 12, ROW_H), sc, r->exited ? "Zombie" : r->user ? "User" : "Kernel", 2);
     }
+    ui_scrollbar_v(c, rect_make(W - 12, tr.y + HDR_H, 12, tr.h - HDR_H), t->nrows * ROW_H, tr.h - HDR_H, t->scroll);
     /* summary */
     int sy = H - SUMMARY_H;
     gfx_fill_rect(c, 0, sy, W, SUMMARY_H, theme.bg_secondary);
@@ -222,7 +227,7 @@ void taskman_main(void *arg) {
             struct rect tr = table_rect(t);
             if (ev.y >= tr.y && ev.y < tr.y + HDR_H) { int col = 0; for (int i = 1; i < 5; i++) if (ev.x >= col_x(t, i) - 6) col = i; if (t->sort_col == col) t->sort_desc = !t->sort_desc; else { t->sort_col = col; t->sort_desc = col != 0 && col != 4; } refresh(t); break; }
             if (ev.y >= tr.y + HDR_H && ev.y < tr.y + tr.h) {
-                int i = (ev.y - tr.y - HDR_H) / ROW_H;
+                int i = (ev.y - tr.y - HDR_H + t->scroll) / ROW_H;
                 if (i < t->nrows) {
                     bool dbl = t->rows[i].pid == t->last_click_pid && system_ticks - t->last_click < 450;
                     t->selected_pid = t->rows[i].pid; t->last_click = system_ticks; t->last_click_pid = t->selected_pid;
@@ -230,15 +235,21 @@ void taskman_main(void *arg) {
                 } else t->selected_pid = 0;
             }
             break; }
+        case EV_MOUSE_SCROLL: t->scroll -= ev.scroll * 3 * ROW_H; break;   /* wheel up (scroll > 0) moves toward the top */
         case EV_MOUSE_UP: if (t->pressed_btn == 1 && rect_contains(btn_quit(t), ev.x, ev.y)) { t->pressed_btn = 0; draw(t); force_quit(t); refresh(t); } t->pressed_btn = 0; break;
         case EV_KEY_DOWN:
-            if (ev.key == KEY_DOWN || ev.key == KEY_UP) { int idx = -1; for (int i = 0; i < t->nrows; i++) if (t->rows[i].pid == t->selected_pid) idx = i; idx = CLAMP(idx + (ev.key == KEY_DOWN ? 1 : -1), 0, t->nrows - 1); t->selected_pid = t->rows[idx].pid; }
+            if ((ev.key == KEY_DOWN || ev.key == KEY_UP) && t->nrows) {
+                int idx = -1; for (int i = 0; i < t->nrows; i++) if (t->rows[i].pid == t->selected_pid) idx = i; idx = CLAMP(idx + (ev.key == KEY_DOWN ? 1 : -1), 0, t->nrows - 1); t->selected_pid = t->rows[idx].pid;
+                /* keep the selection in view */
+                if (idx * ROW_H < t->scroll) t->scroll = idx * ROW_H;
+                if ((idx + 1) * ROW_H > t->scroll + rows_h(t)) t->scroll = (idx + 1) * ROW_H - rows_h(t);
+            }
             else if (ev.key == KEY_DELETE || (ev.key == KEY_BACKSPACE && (ev.mods & (MOD_CMD | MOD_CTRL)))) { force_quit(t); refresh(t); }
             else if (ev.key == KEY_ENTER) process_info(t);
             break;
         default: break;
         }
-        if (!quit) draw(t);
+        if (!quit) { clamp_scroll(t); draw(t); }   /* also re-clamps after refresh / resize */
     }
     window_destroy(t->w);
     kfree(t);

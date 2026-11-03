@@ -193,14 +193,21 @@ struct window *window_create(const char *title, int cw, int ch, int flags) {
     return w;
 }
 
+static void close_menu(void);
 static void set_focus_locked(struct window *w) {
     if (focused == w) return;
     struct window *old = focused;
     focused = w;
     if (old) { struct event e = { .type = EV_BLUR }; window_post_event(old, &e); damage_add(win_shadow_rect(old)); }
     if (w) { struct event e = { .type = EV_FOCUS }; window_post_event(w, &e); damage_add(win_shadow_rect(w)); }
-    open_menu = -1;
+    close_menu();   /* repaints where the popup was, not just the menu bar */
     damage_add(rect_make(0, 0, scr_w, MENUBAR_H));
+}
+/* topmost window that isn't minimized, or NULL */
+static struct window *top_visible_locked(void) {
+    struct window *t, *top = NULL;
+    list_for_each_entry(t, &windows, link) if (!(t->flags & WIN_MINIMIZED)) top = t;
+    return top;
 }
 
 void window_show(struct window *w) {
@@ -220,13 +227,10 @@ void window_destroy(struct window *w) {
     w->flags &= ~WIN_VISIBLE;
     if (focused == w) {
         focused = NULL;
-        /* focus the topmost remaining window */
-        if (!list_empty(&windows)) {
-            struct window *t = list_entry(windows.prev, struct window, link);
-            if (!(t->flags & WIN_MINIMIZED)) set_focus_locked(t);
-        }
+        /* focus the topmost remaining window that isn't minimized */
+        set_focus_locked(top_visible_locked());
         damage_add(rect_make(0, 0, scr_w, MENUBAR_H));
-        if (open_menu >= 0) { damage_add(rect_make(menu_popup.x - 30, menu_popup.y - 10, menu_popup.w + 60, menu_popup.h + 50)); open_menu = -1; menu_hover = -1; }
+        close_menu();
     }
     if (drag_win == w) drag_win = NULL;
     if (resize_win == w) resize_win = NULL;
@@ -303,14 +307,7 @@ void window_minimize(struct window *w) {
     mutex_lock(&wm_lock);
     w->flags |= WIN_MINIMIZED;
     damage_add(win_shadow_rect(w));
-    if (focused == w) {
-        focused = NULL;
-        struct window *t;
-        list_for_each_entry(t, &windows, link) if (!(t->flags & WIN_MINIMIZED)) focused = t;   /* topmost visible */
-        if (focused) { struct event e = { .type = EV_FOCUS }; window_post_event(focused, &e); damage_add(win_shadow_rect(focused)); }
-        damage_add(rect_make(0, 0, scr_w, MENUBAR_H));
-        if (open_menu >= 0) { damage_add(rect_make(menu_popup.x - 30, menu_popup.y - 10, menu_popup.w + 60, menu_popup.h + 50)); open_menu = -1; menu_hover = -1; }
-    }
+    if (focused == w) set_focus_locked(top_visible_locked());   /* blurs w; NULL if nothing is left */
     mutex_unlock(&wm_lock);
 }
 
@@ -789,7 +786,11 @@ static void on_mouse_button(const struct input_event *in) {
         if (open_menu != -1) {
             int item = menu_item_at(x, y);
             int title = menu_title_at(x, y);
-            if (item >= 0) { const struct menu *m = open_menu_def(); int cmd = m ? m->items[item].cmd : 0; close_menu(); if (m) handle_menu_command(cmd); }
+            if (item >= 0) {
+                const struct menu *m = open_menu_def();
+                if (m && m->items[item].disabled) return;   /* greyed out: keep the menu open, do nothing */
+                int cmd = m ? m->items[item].cmd : 0; close_menu(); if (m) handle_menu_command(cmd);
+            }
             else if (title != -1 && title != open_menu) open_menu_idx(title);
             else close_menu();
             return;
@@ -799,6 +800,7 @@ static void on_mouse_button(const struct input_event *in) {
         if (y < MENUBAR_H) return;
         int di = dock_item_at(x, y);
         if (di >= 0) { dock_pressed = di; damage_add(dock_damage()); return; }
+        if (rect_contains(dock_rect, x, y)) return;   /* the dock covers whatever is behind it */
         bool in_title = false;
         struct window *w = window_at(x, y, &in_title);
         if (!w) { if (focused) { struct window *f = focused; UNUSED(f); } return; }
@@ -819,6 +821,7 @@ static void on_mouse_button(const struct input_event *in) {
         return;
     }
     if (in->pressed) {   /* right / middle */
+        if (y < MENUBAR_H || rect_contains(dock_rect, x, y)) return;
         struct window *w = window_at(x, y, NULL);
         if (w && rect_contains(w->frame, x, y)) { if (w != focused) { set_focus_locked(w); raise_locked(w); } send_mouse(w, EV_MOUSE_DOWN, x, y, in->button, 0); }
         return;
@@ -837,9 +840,9 @@ static void on_mouse_button(const struct input_event *in) {
             }
             return;
         }
-        if (light_press_win_light >= 0 && focused) {
+        if (light_press_win_light >= 0) {
             int l = light_press_win_light; light_press_win_light = -1;
-            if (traffic_light_at(focused, x, y) == l) {
+            if (focused && traffic_light_at(focused, x, y) == l) {
                 if (l == 0 && (focused->flags & WIN_CLOSABLE)) { struct event e = { .type = EV_CLOSE }; window_post_event(focused, &e); }
                 else if (l == 1 && (focused->flags & WIN_MINIMIZABLE)) { struct window *f = focused; mutex_unlock(&wm_lock); window_minimize(f); mutex_lock(&wm_lock); }
                 else if (l == 2) toggle_zoom(focused);
@@ -890,7 +893,7 @@ static void on_mouse_move(const struct input_event *in) {
     if (di != dock_hover) { dock_hover = di; damage_add(dock_damage()); }
     if (capture_win) { send_mouse(capture_win, EV_MOUSE_MOVE, x, y, 0, 0); return; }
     bool in_title = false;
-    struct window *w = window_at(x, y, &in_title);
+    struct window *w = rect_contains(dock_rect, x, y) ? NULL : window_at(x, y, &in_title);
     /* traffic light hover feedback */
     struct window *f = focused;
     if (f) {
@@ -904,6 +907,7 @@ static void on_mouse_move(const struct input_event *in) {
 }
 
 static void on_scroll(const struct input_event *in) {
+    if (open_menu != -1 || mouse_y < MENUBAR_H || rect_contains(dock_rect, mouse_x, mouse_y)) return;
     struct window *w = window_at(mouse_x, mouse_y, NULL);
     if (w && rect_contains(w->frame, mouse_x, mouse_y)) send_mouse(w, EV_MOUSE_SCROLL, mouse_x, mouse_y, 0, in->scroll);
 }
@@ -943,11 +947,14 @@ static void on_key(const struct input_event *in) {
             const struct menu *m = open_menu_def();
             if (!m) { close_menu(); return; }
             if (in->key == KEY_DOWN || in->key == KEY_UP) {
-                int dir = in->key == KEY_DOWN ? 1 : -1, i = menu_hover;
-                for (int k = 0; k < m->count; k++) { i = (i + dir + m->count) % m->count; if (!m->items[i].separator && !m->items[i].disabled) break; }
-                menu_hover = i; damage_add(menu_popup); return;
+                int dir = in->key == KEY_DOWN ? 1 : -1;
+                /* with nothing highlighted, Down starts at the first item and Up at the last */
+                int i = menu_hover >= 0 ? menu_hover : dir > 0 ? -1 : 0, found = -1;
+                for (int k = 0; k < m->count; k++) { i = (i + dir + m->count) % m->count; if (!m->items[i].separator && !m->items[i].disabled) { found = i; break; } }
+                if (found >= 0) { menu_hover = found; damage_add(menu_popup); }
+                return;
             }
-            if (in->key == KEY_ENTER && menu_hover >= 0) { int cmd = m->items[menu_hover].cmd; close_menu(); handle_menu_command(cmd); return; }
+            if (in->key == KEY_ENTER && menu_hover >= 0 && !m->items[menu_hover].disabled) { int cmd = m->items[menu_hover].cmd; close_menu(); handle_menu_command(cmd); return; }
             if (in->key == KEY_LEFT || in->key == KEY_RIGHT) {
                 const struct app_menus *am = current_menus(); int n = am ? am->count : 0;
                 int cur = open_menu == -2 ? -1 : open_menu;
@@ -962,7 +969,7 @@ static void on_key(const struct input_event *in) {
         bool cmd = (in->mods & MOD_CMD) || ((in->mods & MOD_CTRL) && ctrl_alias);
         int k = in->key; if (k >= 'A' && k <= 'Z') k += 32;
         if (cmd && !(in->mods & MOD_SHIFT) && k == 'q' && focused && !(focused->flags & WIN_UTILITY)) { struct event e = { .type = EV_MENU, .cmd = CMD_QUIT }; window_post_event(focused, &e); return; }
-        if (cmd && k == 'w' && focused) { struct event e = { .type = EV_CLOSE }; window_post_event(focused, &e); return; }
+        if (cmd && !(in->mods & MOD_SHIFT) && k == 'w' && focused) { struct event e = { .type = EV_CLOSE }; window_post_event(focused, &e); return; }
         if (cmd && k == 'm' && focused && (focused->flags & WIN_MINIMIZABLE)) { struct window *f = focused; mutex_unlock(&wm_lock); window_minimize(f); mutex_lock(&wm_lock); return; }
         if (cmd && k == KEY_TAB) { cycle_windows(); return; }
         if (cmd && k == ',') { mutex_unlock(&wm_lock); wm_system_command(CMD_SETTINGS); mutex_lock(&wm_lock); return; }

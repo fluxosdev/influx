@@ -2,9 +2,16 @@
 #include "string.h"
 
 /* Modal dialogs run on the calling thread with their own event loop. */
-struct dlg { struct window *w; const char *title, *msg, *ok; bool has_field, destructive; struct textfield tf; int hover, pressed; int result; };
 #define DW 420
+#define DLG_MAX_LINES 24
+struct dlg {
+    struct window *w; const char *title, *msg, *ok; bool has_field, destructive, alert; struct textfield tf; int hover, pressed; int result;
+    /* layout, computed once and shared by drawing and hit-testing */
+    const char *starts[DLG_MAX_LINES]; int lens[DLG_MAX_LINES]; int nlines;
+    int text_y, h; struct rect field, cancel, ok_btn;
+};
 
+/* Word-wrap at spaces; a word wider than the line (a long path) is broken mid-word. */
 static int wrap_lines(const char *s, int maxw, const char **starts, int *lens, int max) {
     int n = 0; const char *p = s;
     while (*p && n < max) {
@@ -12,7 +19,10 @@ static int wrap_lines(const char *s, int maxw, const char **starts, int *lens, i
         while (*p && *p != '\n') {
             const char *q = p; uint32_t cp = utf8_decode(&q);
             int cw = font_char_width(font_ui, cp);
-            if (w + cw > maxw && last_space) { p = last_space + 1; break; }
+            if (w + cw > maxw) {
+                if (last_space) { p = last_space + 1; break; }
+                if (p > line) break;
+            }
             if (cp == ' ') last_space = p;
             w += cw; p = q;
         }
@@ -24,40 +34,44 @@ static int wrap_lines(const char *s, int maxw, const char **starts, int *lens, i
     return n;
 }
 
+static void dlg_layout(struct dlg *d) {
+    d->nlines = wrap_lines(d->msg, DW - 60, d->starts, d->lens, DLG_MAX_LINES);
+    d->text_y = 88 + 26;
+    int y = d->text_y + d->nlines * (font_height(font_ui) + 2) + 10;
+    if (d->has_field) { d->field = rect_make(30, y, DW - 60, 26); y += 36; }
+    int bw = (DW - 60 - 10) / 2;
+    d->cancel = d->alert ? rect_make(0, 0, 0, 0) : rect_make(30, y, bw, 28);
+    d->ok_btn = d->alert ? rect_make((DW - bw) / 2, y, bw, 28) : rect_make(30 + bw + 10, y, bw, 28);
+    d->h = y + 28 + 24;
+}
+
 static void dlg_draw(struct dlg *d) {
     struct canvas *c = window_begin_draw(d->w);
     gfx_fill(c, theme.bg);
     struct canvas *icon = icon_get("logo", 64);
     if (icon) gfx_blit_scaled_tinted(c, (DW - 48) / 2, 26, 48, 48, icon, theme.text);
-    int y = 88;
-    font_draw_centered(c, font_ui_semibold, rect_make(0, y, DW, 20), theme.text, d->title);
-    y += 26;
-    const char *starts[8]; int lens[8];
-    int n = wrap_lines(d->msg, DW - 60, starts, lens, 8);
-    for (int i = 0; i < n; i++) {
-        int w = font_text_width_n(font_ui, starts[i], lens[i]);
-        font_draw_n(c, font_ui, (DW - w) / 2, y, theme.text_secondary, starts[i], lens[i]);
+    font_draw_centered(c, font_ui_semibold, rect_make(0, 88, DW, 20), theme.text, d->title);
+    int y = d->text_y;
+    for (int i = 0; i < d->nlines; i++) {
+        int w = font_text_width_n(font_ui, d->starts[i], d->lens[i]);
+        font_draw_n(c, font_ui, (DW - w) / 2, y, theme.text_secondary, d->starts[i], d->lens[i]);
         y += font_height(font_ui) + 2;
     }
-    y += 10;
-    if (d->has_field) { textfield_draw(c, &d->tf, rect_make(30, y, DW - 60, 26)); y += 36; }
-    int bw = (DW - 60 - 10) / 2;
-    ui_button(c, rect_make(30, y, bw, 28), "Cancel", BTN_NORMAL, d->pressed == 1, true);
-    ui_button(c, rect_make(30 + bw + 10, y, bw, 28), d->ok, d->destructive ? BTN_DESTRUCTIVE : BTN_DEFAULT, d->pressed == 2, true);
+    if (d->has_field) textfield_draw(c, &d->tf, d->field);
+    if (!d->alert) ui_button(c, d->cancel, "Cancel", BTN_NORMAL, d->pressed == 1, true);
+    ui_button(c, d->ok_btn, d->ok, d->destructive ? BTN_DESTRUCTIVE : BTN_DEFAULT, d->pressed == 2, true);
     window_end_draw(d->w, NULL);
 }
 
 static int dlg_run(struct dlg *d) {
-    int lines = 1; for (const char *p = d->msg; *p; p++) if (*p == '\n') lines++;
-    int h = 88 + 26 + MAX(lines, (int)strlen(d->msg) / 50 + 1) * 17 + 10 + (d->has_field ? 36 : 0) + 28 + 24;
-    d->w = window_create("", DW, h, WIN_DIALOG | WIN_UTILITY | WIN_FULL_TITLE);
+    dlg_layout(d);
+    int h = d->h;
+    /* the layout's y coordinates already include the title strip that WIN_FULL_TITLE adds */
+    d->w = window_create("", DW, h - TITLEBAR_H, WIN_DIALOG | WIN_UTILITY | WIN_FULL_TITLE);
     d->w->flags &= ~WIN_CLOSABLE;
     d->tf.focused = d->has_field;
     d->hover = 0; d->pressed = 0; d->result = -1;
-    int y_btn = h - 28 - 24;
-    int bw = (DW - 60 - 10) / 2;
-    struct rect cancel = rect_make(30, y_btn, bw, 28), ok = rect_make(30 + bw + 10, y_btn, bw, 28);
-    struct rect field = rect_make(30, h - 28 - 24 - 36, DW - 60, 26);
+    struct rect cancel = d->cancel, ok = d->ok_btn, field = d->field;
     dlg_draw(d);
     window_show(d->w);
     window_set_timer(d->w, 500);
@@ -86,7 +100,7 @@ static int dlg_run(struct dlg *d) {
 }
 
 void dialog_message(const char *title, const char *message) {
-    struct dlg d = { .title = title, .msg = message, .ok = "OK" };
+    struct dlg d = { .title = title, .msg = message, .ok = "OK", .alert = true };
     dlg_run(&d);
 }
 bool dialog_confirm(const char *title, const char *message, const char *ok_label, bool destructive) {

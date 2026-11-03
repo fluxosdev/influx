@@ -432,7 +432,12 @@ static __attribute__((noinline)) void flow_field(struct flow *F, struct html_nod
 static __attribute__((noinline)) void flow_image(struct flow *F, struct html_node *n, const struct style *st) {
     struct html_image *im = n->image;
     int avail = MAX(1, F->right - F->left);
-    int w = parse_length(html_attr(n, "width"), avail), h = parse_length(html_attr(n, "height"), avail);
+    const char *wa = html_attr(n, "width"), *ha = html_attr(n, "height");
+    int w = parse_length(wa, avail), h = parse_length(ha, avail);
+    /* measuring (avail is a huge placeholder): percentages resolve later against the real width */
+    bool pct_w = !F->emit && wa && strchr(wa, '%');
+    if (pct_w) w = -1;
+    if (!F->emit && ha && strchr(ha, '%')) h = -1;
     w = MIN(w, MAX_IMG_SIDE); h = MIN(h, MAX_IMG_SIDE);
     struct canvas *img = im ? im->img : NULL;
     if (img) {
@@ -452,7 +457,9 @@ static __attribute__((noinline)) void flow_image(struct flow *F, struct html_nod
     if (w <= 0 || h <= 0) return;
     if (w > avail) { h = (int)((int64_t)h * avail / w); w = avail; }
     w = CLAMP(w, 1, MAX_IMG_SIDE); h = CLAMP(h, 1, MAX_IMG_SIDE);
+    int min_w = F->min_w;
     add_box(F, st, DI_IMAGE, n, w, h, 0);
+    if (pct_w) F->min_w = min_w;   /* it shrinks with the cell */
 }
 
 /* ---- tables ---- */
@@ -680,6 +687,7 @@ static __attribute__((noinline)) void flow_table(struct flow *F, struct html_nod
 
 /* ---- blocks ---- */
 static void list_marker(struct flow *F, struct html_node *li, const struct style *st) {
+    if (F->has_marker) flush_line(F, false);   /* an earlier marker still waiting for text */
     struct html_node *list = li->parent;
     bool ordered = list && list->tag == T_OL;
     const char *type = html_attr(li, "type");
@@ -858,7 +866,11 @@ static void flow_node(struct flow *F, struct html_node *n, const struct style *s
     case T_FORM: mb = 0; break;
     }
     if (st.list_depth > 0 && (tag == T_UL || tag == T_OL) && st.list_depth > 1) mt = mb = 0;
+    /* <li><p>…: keep a pending marker for the block's first line instead of a line of its own */
+    bool keep_marker = F->has_marker && !F->nfrags && !indent_l;
+    if (keep_marker) F->has_marker = false;
     block_break(F, mt);
+    if (keep_marker) F->has_marker = true;
     int save_l = F->left, save_r = F->right, save_align = F->align;
     struct font *save_strut = F->strut;
     F->left += indent_l; F->right -= indent_r;
@@ -976,7 +988,7 @@ static void paint_field(struct canvas *c, struct display_item *it, int y, struct
         if (focused) gfx_draw_rect(c, r.x - 1, r.y - 1, r.w + 2, r.h + 2, color_with_alpha(theme.accent, 0x70));
         struct canvas sub = canvas_sub(c, rect_make(r.x + 5, r.y + 2, r.w - 10, r.h - 4));
         char shown[512];
-        if (f->kind == FF_PASSWORD) { size_t l = MIN(strlen(f->value), sizeof shown - 1); memset(shown, '*', l); shown[l] = 0; }
+        if (f->kind == FF_PASSWORD) { size_t l = 0; for (const char *p = f->value; *p && l < sizeof shown - 1; p++) if ((*p & 0xC0) != 0x80) shown[l++] = '*'; shown[l] = 0; }
         else strlcpy(shown, f->value, sizeof shown);
         const char *ph = html_attr(it->node, "placeholder");
         int tw = font_text_width(font_ui, shown);

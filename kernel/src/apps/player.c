@@ -29,6 +29,7 @@ struct player {
     struct wav_info wav;
     char desc[64], error[96];
     volatile bool playing;        /* playback thread running */
+    int threads;                  /* playback threads that may still touch this struct */
     volatile bool stop_req;
     volatile uint64_t pos;        /* frame the playback is at */
     enum { DRAG_NONE, DRAG_SEEK, DRAG_VOLUME } drag;
@@ -70,6 +71,7 @@ static void play_thread(void *arg) {
     kfree(buf);
     p->playing = false;
     struct event e = { .type = EV_USER }; window_post_event(p->w, &e);
+    __atomic_sub_fetch(&p->threads, 1, __ATOMIC_SEQ_CST);   /* last access to p */
 }
 
 static void start(struct player *p) {
@@ -78,6 +80,7 @@ static void start(struct player *p) {
     p->error[0] = 0;
     p->stop_req = false;
     p->playing = true;
+    __atomic_add_fetch(&p->threads, 1, __ATOMIC_SEQ_CST);
     thread_create(current_thread->proc, "playback", play_thread, p);
 }
 static void stop(struct player *p) {
@@ -235,6 +238,8 @@ void player_main(void *arg) {
         draw(p);
     }
     stop(p);
+    /* 'playing' drops before the thread posts its final event: wait until it is really done with p */
+    while (__atomic_load_n(&p->threads, __ATOMIC_SEQ_CST)) thread_sleep_ms(5);
     if (p->vn) vnode_unref(p->vn);
     window_destroy(p->w);
     kfree(p);

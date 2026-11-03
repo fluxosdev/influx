@@ -9,6 +9,8 @@ struct inst { struct window *w; int page; int selected; struct blockdev *disks[1
 static void format_size(uint64_t b, char *out, size_t n) { if (b >= 1ull << 30) snprintf(out, n, "%lu.%lu GB", b >> 30, ((b >> 20) % 1024) / 103); else snprintf(out, n, "%lu MB", b >> 20); }
 static struct rect btn_next(struct inst *s) { return rect_make(s->w->frame.w - 130, s->w->frame.h - 44, 110, 30); }
 static struct rect btn_back(struct inst *s) { return rect_make(s->w->frame.w - 250, s->w->frame.h - 44, 110, 30); }
+/* the Back/Close button exists on the confirm page and after a successful install only */
+static bool back_shown(struct inst *s) { return s->page == 1 || (s->page == 3 && s->result == 0); }
 
 static void draw(struct inst *s) {
     struct canvas *c = window_begin_draw(s->w);
@@ -97,7 +99,7 @@ void installer_main(void *arg) {
         case EV_MOUSE_DOWN:
             if (s->running || ev.button != BTN_LEFT) break;
             if (s->page == 0) for (int i = 0; i < s->ndisks; i++) if (rect_contains(rect_make(190, 94 + i * 48, s->w->frame.w - 214, 42), ev.x, ev.y)) s->selected = i;
-            if (rect_contains(btn_next(s), ev.x, ev.y)) s->pressed = 1; else if (rect_contains(btn_back(s), ev.x, ev.y)) s->pressed = 2;
+            if (rect_contains(btn_next(s), ev.x, ev.y)) s->pressed = 1; else if (back_shown(s) && rect_contains(btn_back(s), ev.x, ev.y)) s->pressed = 2;
             break;
         case EV_MOUSE_UP: {
             if (s->running) break;
@@ -109,6 +111,14 @@ void installer_main(void *arg) {
                 s->page = 2; s->running = true; s->nlog = 0; s->percent = 0; draw(s);
                 s->result = install_run(s->disks[s->selected], progress, s);
                 s->running = false; s->page = 3; refresh_disks(s);
+                /* clicks and keys queued while the install blocked this loop were aimed at
+                 * the progress page: drop them so they can't hit Restart/Close unseen */
+                struct event q;
+                while (window_wait_event(s->w, &q, 0)) {
+                    if (q.type == EV_QUIT) { quit = true; break; }
+                    if (q.type == EV_OPEN) kfree(q.path);
+                }
+                s->pressed = 0;
             }
             else if (s->page == 3 && next) { if (s->result == 0) power_restart(); else quit = true; }
             else if (s->page == 3 && back) quit = true;

@@ -37,7 +37,7 @@ enum { FCMD_NEW_WINDOW = CMD_APP + 1, FCMD_RENAME, FCMD_TRASH, FCMD_INFO, FCMD_I
 
 static const struct menu_item file_items[] = {
     MENU("New Files Window", FCMD_NEW_WINDOW, 'n', MOD_CMD), MENU("New Folder", CMD_NEW_FOLDER, 'n', MOD_CMD | MOD_SHIFT), MENU("New Document", CMD_NEW, 'n', MOD_CMD | MOD_ALT), MENU_SEP,
-    MENU("Open", CMD_OPEN, 'o', MOD_CMD), MENU("Open in Terminal", FCMD_OPEN_TERMINAL, 't', MOD_CMD | MOD_SHIFT), MENU("Get Info", FCMD_INFO, 'i', MOD_CMD), MENU("Rename…", FCMD_RENAME, KEY_ENTER, 0), MENU("Duplicate", FCMD_DUPLICATE, 'd', MOD_CMD), MENU_SEP,
+    MENU("Open", CMD_OPEN, 'o', MOD_CMD), MENU("Open in Terminal", FCMD_OPEN_TERMINAL, 't', MOD_CMD | MOD_SHIFT), MENU("Get Info", FCMD_INFO, 'i', MOD_CMD), MENU("Rename…", FCMD_RENAME, KEY_ENTER, MOD_CMD), MENU("Duplicate", FCMD_DUPLICATE, 'd', MOD_CMD), MENU_SEP,
     MENU("Move to Trash", FCMD_TRASH, KEY_BACKSPACE, MOD_CMD), MENU("Empty Trash…", FCMD_EMPTY_TRASH, KEY_BACKSPACE, MOD_CMD | MOD_SHIFT), MENU_SEP,
     MENU("Close Window", CMD_CLOSE, 'w', MOD_CMD), MENU("Quit Files", CMD_QUIT, 'q', MOD_CMD),
 };
@@ -106,7 +106,7 @@ static void load_dir(struct files *f) {
         f->entries[j + 1] = t;
     }
     f->sel = kzalloc(f->nentries ? f->nentries : 1);
-    f->selected = -1; f->scroll = 0;
+    f->selected = -1; f->anchor = -1; f->scroll = 0;
 }
 
 static void build_sidebar(struct files *f) {
@@ -146,6 +146,14 @@ static void navigate(struct files *f, const char *path, bool push) {
 }
 
 /* ---- geometry ---- */
+/* list view column x positions (content coordinates); -1 = hidden at this width */
+static void list_cols(int w, int colx[4]) {
+    colx[0] = 10;
+    if (w >= 620) { colx[1] = w - 400; colx[2] = w - 230; colx[3] = w - 130; }
+    else if (w >= 440) { colx[1] = w - 270; colx[2] = w - 100; colx[3] = -1; }   /* drop Kind */
+    else { colx[1] = -1; colx[2] = w - 100; colx[3] = -1; }                      /* Name and Size only */
+}
+static int col_end(const int colx[4], int k, int w) { for (int j = k + 1; j < 4; j++) if (colx[j] >= 0) return colx[j]; return w; }
 static struct rect content_rect(struct files *f) { return rect_make(SIDEBAR_W, TITLEBAR_H + TOOLBAR_H, f->w->frame.w - SIDEBAR_W, f->w->frame.h - TITLEBAR_H - TOOLBAR_H - STATUS_H); }
 static int cols_per_row(struct files *f) { int c = (content_rect(f).w - 16) / CELL_W; return c < 1 ? 1 : c; }
 static int content_height(struct files *f) {
@@ -225,9 +233,10 @@ static void draw(struct files *f) {
     struct canvas sub = canvas_sub(c, cr);
     if (f->list_view) {
         gfx_fill_rect(&sub, 0, 0, cr.w, LIST_HEADER_H, theme.bg);
-        int colx[4] = { 10, cr.w - 400, cr.w - 230, cr.w - 130 };
+        int colx[4]; list_cols(cr.w, colx);
         const char *cols[4] = { "Name", "Date Modified", "Size", "Kind" };
         for (int k = 0; k < 4; k++) {
+            if (colx[k] < 0) continue;
             char hdr[40]; snprintf(hdr, sizeof hdr, "%s%s", cols[k], f->sort_col == k ? (f->sort_desc ? " ▼" : " ▲") : "");
             font_draw(&sub, font_ui_medium_small, colx[k] + (k ? 0 : 26), 6, theme.text_secondary, hdr);
             if (k) gfx_vline(&sub, colx[k] - 8, 4, LIST_HEADER_H - 8, theme.separator);
@@ -244,12 +253,12 @@ static void draw(struct files *f) {
             color_t tc = sel ? theme.accent_text : theme.text, sc = sel ? theme.accent_text : theme.text_secondary;
             struct canvas *ic = icon_get(icon_for_file(e->name, e->type), 32);
             if (ic) gfx_blit_scaled(&rows, colx[0], ry + 3, 18, 18, ic);
-            font_draw_ellipsized(&rows, font_ui, colx[0] + 26, ry + (LIST_ROW_H - font_height(font_ui)) / 2, colx[1] - colx[0] - 40, tc, e->name);
-            char buf[64]; format_date(e->mtime, buf, sizeof buf);
-            font_draw_ellipsized(&rows, font_ui, colx[1], ry + 5, colx[2] - colx[1] - 12, sc, buf);
+            font_draw_ellipsized(&rows, font_ui, colx[0] + 26, ry + (LIST_ROW_H - font_height(font_ui)) / 2, col_end(colx, 0, cr.w) - colx[0] - 40, tc, e->name);
+            char buf[64];
+            if (colx[1] >= 0) { format_date(e->mtime, buf, sizeof buf); font_draw_ellipsized(&rows, font_ui, colx[1], ry + 5, col_end(colx, 1, cr.w) - colx[1] - 12, sc, buf); }
             if (e->type == VN_DIR) strcpy(buf, "--"); else format_size(e->size, buf, sizeof buf);
-            font_draw_aligned(&rows, font_ui, rect_make(colx[2], ry, colx[3] - colx[2] - 14, LIST_ROW_H), sc, buf, 2);
-            font_draw_ellipsized(&rows, font_ui, colx[3], ry + 5, cr.w - colx[3] - 10, sc, kind_of(e));
+            font_draw_aligned(&rows, font_ui, rect_make(colx[2], ry, col_end(colx, 2, cr.w) - colx[2] - 14, LIST_ROW_H), sc, buf, 2);
+            if (colx[3] >= 0) font_draw_ellipsized(&rows, font_ui, colx[3], ry + 5, cr.w - colx[3] - 10, sc, kind_of(e));
         }
     } else {
         for (int i = 0; i < f->nentries; i++) {
@@ -495,7 +504,7 @@ void files_main(void *arg) {
         case EV_RESIZE: clamp_scroll(f); break;
         case EV_OPEN: navigate(f, ev.path, true); kfree(ev.path); break;
         case EV_MENU: handle_command(f, ev.cmd, &quit, &close); break;
-        case EV_MOUSE_SCROLL: f->scroll += ev.scroll * 40; clamp_scroll(f); break;
+        case EV_MOUSE_SCROLL: f->scroll -= ev.scroll * 40; clamp_scroll(f); break;
         case EV_MOUSE_DOWN: {
             if (ev.button != BTN_LEFT) break;
             if (rect_contains(btn_back(f), ev.x, ev.y)) { f->pressed_btn = 1; break; }
@@ -514,8 +523,8 @@ void files_main(void *arg) {
             }
             struct rect cr = content_rect(f);
             if (f->list_view && rect_contains(rect_make(cr.x, cr.y, cr.w, LIST_HEADER_H), ev.x, ev.y)) {
-                int colx[4] = { 10, cr.w - 400, cr.w - 230, cr.w - 130 }; int rel = ev.x - cr.x, col = 0;
-                for (int k = 1; k < 4; k++) if (rel >= colx[k] - 8) col = k;
+                int colx[4]; list_cols(cr.w, colx); int rel = ev.x - cr.x, col = 0;
+                for (int k = 1; k < 4; k++) if (colx[k] >= 0 && rel >= colx[k] - 8) col = k;
                 if (f->sort_col == col) f->sort_desc = !f->sort_desc; else { f->sort_col = col; f->sort_desc = false; }
                 load_dir(f); break;
             }

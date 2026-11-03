@@ -64,6 +64,7 @@ struct browser {
     char pending_fragment[256];
     uint64_t load_start;
     int restore_scroll;
+    int shown_pos; char shown_url[2048];   /* history entry of the displayed document */
 };
 
 
@@ -250,7 +251,9 @@ static void page_worker(void *arg) {
     else if (!strcmp(url, HOME_URL)) doc = home_page();
     else if (!strncmp(url, "file://", 7)) {
         void *data; size_t sz;
-        const char *path = url + 7;
+        char path[PATH_MAX];
+        strlcpy(path, url + 7, sizeof path);
+        for (char *q = path; *q; q++) if (*q == '?' || *q == '#') { *q = 0; break; }
         if (vfs_read_file(path, &data, &sz) < 0) doc = error_page(url, "File not found", "The file could not be opened.", false);
         else {
             const char *ext = strrchr(path, '.');
@@ -288,11 +291,12 @@ done:
     struct job *stale = NULL;
     mutex_lock(&b->lock);
     if (!j->cancel && doc) { j->doc = doc; doc = NULL; j->refs++; stale = b->page_ready; b->page_ready = j; post_update(b); }
-    b->workers--;
     mutex_unlock(&b->lock);
     if (doc) html_free(doc);
     job_release(b, stale);
     job_release(b, j);
+    /* last touch of b: the window thread frees it once workers reaches 0 */
+    mutex_lock(&b->lock); b->workers--; mutex_unlock(&b->lock);
 }
 
 static void image_worker(void *arg) {
@@ -302,8 +306,10 @@ static void image_worker(void *arg) {
         struct canvas *img = NULL;
         const char *u = j->urls[i];
         if (!strncmp(u, "file://", 7)) {
-            void *data; size_t sz;
-            if (vfs_read_file(u + 7, &data, &sz) == 0) { img = image_decode(data, sz); kfree(data); }
+            void *data; size_t sz; char path[PATH_MAX];
+            strlcpy(path, u + 7, sizeof path);
+            for (char *q = path; *q; q++) if (*q == '?' || *q == '#') { *q = 0; break; }
+            if (vfs_read_file(path, &data, &sz) == 0) { img = image_decode(data, sz); kfree(data); }
         } else if (!strncmp(u, "http://", 7)) {
             struct http_request req = { .url = u, .cancel = &j->cancel, .max_redirects = 4, .max_body = 4 * 1024 * 1024 };
             struct http_response r;
@@ -320,10 +326,9 @@ static void image_worker(void *arg) {
         if (!j->cancel) post_update(b);
         mutex_unlock(&b->lock);
     }
-    mutex_lock(&b->lock);
-    b->workers--;
-    mutex_unlock(&b->lock);
     job_release(b, j);
+    /* last touch of b: the window thread frees it once workers reaches 0 */
+    mutex_lock(&b->lock); b->workers--; mutex_unlock(&b->lock);
 }
 
 static void cancel_job(struct browser *b, struct job **jp) {
@@ -367,7 +372,7 @@ static void relayout(struct browser *b) {
 }
 
 static void set_address(struct browser *b, const char *url) {
-    if (b->addr.focused) return;
+    if (b->addr.focused) return;   /* don't clobber typing; navigation unfocuses first */
     textfield_set(&b->addr, url);
 }
 
@@ -394,16 +399,17 @@ static bool same_document(const char *a, const char *b) {
 }
 
 static void scroll_to_fragment(struct browser *b, const char *frag) {
-    if (!b->lay || !frag || !*frag) return;
-    int y = layout_anchor_y(b->lay, frag);
+    if (!b->lay || !frag) return;
+    int y = *frag ? layout_anchor_y(b->lay, frag) : -1;
     if (y >= 0) { b->scroll_y = y - 8; clamp_scroll(b); }
+    else if (!*frag || !strcasecmp(frag, "top")) b->scroll_y = 0;
 }
 
 static void push_history(struct browser *b, const char *url) {
     if (b->hist_pos >= 0 && b->hist_pos < b->hist_len) b->hist_scroll[b->hist_pos] = b->scroll_y;
     for (int i = b->hist_pos + 1; i < b->hist_len; i++) kfree(b->hist[i]);
     b->hist_len = b->hist_pos + 1;
-    if (b->hist_len == HIST_MAX) { kfree(b->hist[0]); memmove(b->hist, b->hist + 1, (HIST_MAX - 1) * sizeof b->hist[0]); memmove(b->hist_scroll, b->hist_scroll + 1, (HIST_MAX - 1) * sizeof b->hist_scroll[0]); b->hist_len--; }
+    if (b->hist_len == HIST_MAX) { b->shown_pos--; kfree(b->hist[0]); memmove(b->hist, b->hist + 1, (HIST_MAX - 1) * sizeof b->hist[0]); memmove(b->hist_scroll, b->hist_scroll + 1, (HIST_MAX - 1) * sizeof b->hist_scroll[0]); b->hist_len--; }
     b->hist[b->hist_len] = kstrdup(url);
     b->hist_scroll[b->hist_len] = 0;
     b->hist_pos = b->hist_len++;
@@ -414,11 +420,13 @@ static void navigate(struct browser *b, const char *url, const char *post, size_
     if (!post && hash && b->doc && same_document(url, current_url(b))) {
         /* in-page link: no reload */
         push_history(b, url);
-        set_address(b, url);
+        b->addr.focused = false; set_address(b, url);
+        b->shown_pos = b->hist_pos; strlcpy(b->shown_url, url, sizeof b->shown_url);
         scroll_to_fragment(b, hash + 1);
         return;
     }
     push_history(b, url);
+    b->addr.focused = false;
     strlcpy(b->pending_fragment, hash ? hash + 1 : "", sizeof b->pending_fragment);
     b->restore_scroll = -1;
     set_address(b, url);
@@ -432,8 +440,8 @@ static void go_history(struct browser *b, int delta) {
     bool same = b->doc && same_document(b->hist[np], current_url(b));
     b->hist_pos = np;
     const char *url = b->hist[np];
-    set_address(b, url);
-    if (same) { b->scroll_y = b->hist_scroll[np]; clamp_scroll(b); return; }
+    b->addr.focused = false; set_address(b, url);
+    if (same) { b->shown_pos = np; strlcpy(b->shown_url, url, sizeof b->shown_url); b->scroll_y = b->hist_scroll[np]; clamp_scroll(b); return; }
     const char *hash = strchr(url, '#');
     strlcpy(b->pending_fragment, hash ? hash + 1 : "", sizeof b->pending_fragment);
     b->restore_scroll = b->hist_scroll[np];
@@ -441,9 +449,15 @@ static void go_history(struct browser *b, int delta) {
 }
 
 static void stop_loading(struct browser *b) {
+    bool was_loading = b->page_job != NULL;
     cancel_job(b, &b->page_job);
     cancel_job(b, &b->img_job);
     strcpy(b->status, "Stopped");
+    if (!was_loading || !b->doc || b->hist_pos < 0) return;
+    /* back to the document still on screen */
+    if (b->shown_pos >= 0 && b->shown_pos < b->hist_len && !strcmp(b->hist[b->shown_pos], b->shown_url)) b->hist_pos = b->shown_pos;
+    else { kfree(b->hist[b->hist_pos]); b->hist[b->hist_pos] = kstrdup(b->shown_url); b->shown_pos = b->hist_pos; }
+    b->addr.focused = false; set_address(b, current_url(b));
 }
 
 static void install_page(struct browser *b, struct job *j) {
@@ -462,6 +476,7 @@ static void install_page(struct browser *b, struct job *j) {
         snprintf(full, sizeof full, "%s%s", j->final_url, hash && !strchr(j->final_url, '#') ? hash : "");
         kfree(b->hist[b->hist_pos]); b->hist[b->hist_pos] = kstrdup(full);
     }
+    b->shown_pos = b->hist_pos; strlcpy(b->shown_url, current_url(b), sizeof b->shown_url);
     set_address(b, current_url(b));
     mark_visited(b, current_url(b));
     mark_visited(b, j->final_url);
@@ -711,7 +726,7 @@ static void page_click(struct browser *b, int x, int y, bool shift) {
 static void scrollbar_drag(struct browser *b, int y) {
     struct rect pr = page_rect(b);
     if (!b->lay || b->lay->height <= pr.h) return;
-    int thumb = MAX(30, pr.h * pr.h / b->lay->height);
+    int thumb = MAX(24, pr.h * pr.h / b->lay->height);
     int track = pr.h - thumb;
     int pos = y - pr.y - b->drag_off;
     b->scroll_y = track > 0 ? (int)((int64_t)pos * max_scroll(b) / track) : 0;
@@ -723,7 +738,7 @@ static void handle_command(struct browser *b, int cmd, bool *quit) {
     case CMD_QUIT: case CMD_CLOSE: *quit = true; break;
     case CMD_NEW_WINDOW: app_launch(APP_BROWSER, NULL); break;
     case BCMD_LOCATION: b->addr.focused = true; b->focus = NULL; b->addr.sel_anchor = 0; b->addr.cursor = b->addr.len; break;
-    case BCMD_RELOAD: if (b->hist_len) { b->restore_scroll = b->scroll_y; b->pending_fragment[0] = 0; start_load(b, current_url(b), NULL, 0); } break;
+    case BCMD_RELOAD: if (b->hist_len) { b->addr.focused = false; set_address(b, current_url(b)); b->restore_scroll = b->scroll_y; b->pending_fragment[0] = 0; start_load(b, current_url(b), NULL, 0); } break;
     case BCMD_STOP: stop_loading(b); break;
     case BCMD_BACK: go_history(b, -1); break;
     case BCMD_FORWARD: go_history(b, 1); break;
@@ -795,7 +810,7 @@ static void handle_key(struct browser *b, struct event *ev, bool *quit) {
 void browser_main(void *arg) {
     struct browser *b = kzalloc(sizeof *b);
     mutex_init(&b->lock);
-    b->hist_pos = -1; b->hover_link = -1; b->restore_scroll = -1;
+    b->hist_pos = -1; b->hover_link = -1; b->restore_scroll = -1; b->shown_pos = -1;
     textfield_init(&b->addr, "");
     b->addr.placeholder = "Search or enter address";
     strcpy(b->status, "Ready");
@@ -830,15 +845,15 @@ void browser_main(void *arg) {
             break; }
         case EV_TIMER:
             if (b->relayout_pending && time_ms() - b->last_layout > 250) relayout(b);
-            if (b->img_job && b->img_job->done == (size_t)b->img_job->nurls && !b->relayout_pending) { apply_images(b); cancel_job(b, &b->img_job); }
+            if (b->img_job && b->img_job->done == (size_t)b->img_job->nurls && !b->relayout_pending) { bool any = apply_images(b); cancel_job(b, &b->img_job); if (any) relayout(b); }
             break;
-        case EV_MOUSE_SCROLL: b->scroll_y += ev.scroll * 48; clamp_scroll(b); break;
+        case EV_MOUSE_SCROLL: b->scroll_y -= ev.scroll * 48; clamp_scroll(b); break;
         case EV_MOUSE_DOWN: {
             if (ev.button != BTN_LEFT) break;
             struct rect pr = page_rect(b);
             b->pressed = 0;
             for (int i = 0; i < 3; i++) if (rect_contains(btn_rect(i), ev.x, ev.y)) b->pressed = i + 1;
-            if (b->pressed) break;
+            if (b->pressed) { b->addr.focused = false; break; }
             struct rect ar = addr_rect(b);
             if (rect_contains(ar, ev.x, ev.y)) {
                 bool was = b->addr.focused;
@@ -849,7 +864,7 @@ void browser_main(void *arg) {
             }
             b->addr.focused = false;
             if (ev.x >= b->w->frame.w - SCROLLBAR_W && ev.y >= pr.y && ev.y < pr.y + pr.h && b->lay && b->lay->height > pr.h) {
-                int thumb = MAX(30, pr.h * pr.h / b->lay->height);
+                int thumb = MAX(24, pr.h * pr.h / b->lay->height);
                 int ty = pr.y + (int)((int64_t)(pr.h - thumb) * b->scroll_y / MAX(1, max_scroll(b)));
                 b->drag_off = (ev.y >= ty && ev.y < ty + thumb) ? ev.y - ty : thumb / 2;
                 b->dragging_scroll = true;

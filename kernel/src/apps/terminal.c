@@ -228,12 +228,24 @@ static void resize_grid(struct term *t, int cols, int rows) {
     for (int y = 0; y < rows; y++) clear_cells(t, row(t, y), cols);
     for (int i = 0; i < SCROLLBACK; i++) clear_cells(t, nsb + i * cols, cols);
     if (og) {
-        for (int y = 0; y < MIN(rows, orows); y++) memcpy(row(t, y), og + y * oc, MIN(cols, oc) * sizeof(struct cell));
         for (int i = 0; i < SCROLLBACK; i++) memcpy(nsb + i * cols, osb + i * oc, MIN(cols, oc) * sizeof(struct cell));
+        /* shrinking below the cursor: move the top rows into scrollback so the cursor
+         * line (the prompt) and the output just above it stay on screen */
+        int drop = MAX(0, t->cy - (rows - 1));
+        for (int y = 0; y < drop; y++) {
+            struct cell *d = nsb + t->sb_head * cols;
+            clear_cells(t, d, cols);
+            memcpy(d, og + y * oc, MIN(cols, oc) * sizeof(struct cell));
+            t->sb_head = (t->sb_head + 1) % SCROLLBACK;
+            if (t->sb_lines < SCROLLBACK) t->sb_lines++;
+        }
+        for (int y = 0; y < MIN(rows, orows - drop); y++) memcpy(row(t, y), og + (y + drop) * oc, MIN(cols, oc) * sizeof(struct cell));
+        t->cy -= drop;
         kfree(og); kfree(osb);
     }
     t->fg = ofg; t->bg = obg;
     t->cx = MIN(t->cx, cols - 1); t->cy = MIN(t->cy, rows - 1);
+    t->view = MIN(t->view, t->sb_lines);
     t->tty->cols = cols; t->tty->rows = rows;
     mutex_unlock(&t->lock);
 }

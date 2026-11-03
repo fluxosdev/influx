@@ -153,8 +153,7 @@ struct canvas *icon_get(const char *name, int size) {
 }
 
 /* ---- About window ---- */
-static void about_thread(void *arg) {
-    struct window *w = window_create("", 300, 400, WIN_DIALOG | WIN_UTILITY | WIN_FULL_TITLE);
+static void about_draw(struct window *w) {
     struct canvas *c = window_begin_draw(w);
     gfx_fill(c, theme.bg);
     struct canvas *logo = icon_get("logo", 128);
@@ -177,11 +176,16 @@ static void about_thread(void *arg) {
     font_draw_centered(c, font_ui_small, rect_make(0, 340, 300, 16), theme.text_tertiary, "Built entirely with Claude by Anthropic");
     font_draw_centered(c, font_ui_small, rect_make(0, 358, 300, 16), theme.text_tertiary, "Icons: Kora  ·  Fonts: Inter, Source Code Pro");
     window_end_draw(w, NULL);
+}
+static void about_thread(void *arg) {
+    struct window *w = window_create("", 300, 400, WIN_DIALOG | WIN_UTILITY | WIN_FULL_TITLE);
+    about_draw(w);
     window_show(w);
     struct event ev;
     while (window_wait_event(w, &ev, -1)) {
         if (ev.type == EV_CLOSE || ev.type == EV_QUIT || (ev.type == EV_KEY_DOWN && ev.key == KEY_ESC)) break;
         if (ev.type == EV_MENU && ev.cmd == CMD_QUIT) break;
+        if (ev.type == EV_THEME) about_draw(w);
     }
     window_destroy(w);
 }
