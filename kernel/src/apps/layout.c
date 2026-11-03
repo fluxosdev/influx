@@ -12,7 +12,7 @@
 #include "net.h"
 
 #define PAGE_MARGIN 14
-#define MAX_LAYOUT_DEPTH 120
+#define MAX_LAYOUT_DEPTH 100   /* x ~384 bytes of stack per level (flow_node + flow_table every other level) */
 #define MAX_COLS 64
 #define MAX_ROWS 2048
 
@@ -194,7 +194,7 @@ static void add_word(struct flow *F, const struct style *st, struct font *f, con
     if (!F->nfrags && w > avail && avail > 20 && !st->nowrap) {
         /* a word wider than the line: break it between characters */
         while (n > 0) {
-            int k = font_fit_chars(f, s, avail);
+            int k = MIN(font_fit_chars(f, s, avail), n);
             if (k <= 0) { const char *q = s; utf8_decode(&q); k = q - s; }
             int kw = font_text_width_n(f, s, k);
             add_text_frag(F, st, f, s, k, kw, 0);
@@ -343,6 +343,7 @@ static int align_attr(const struct html_node *n, int dflt) {
 }
 
 static void flow_node(struct flow *F, struct html_node *n, const struct style *st_in);
+static void flow_flat(struct flow *F, struct html_node *n, const struct style *st);
 static void flow_children(struct flow *F, struct html_node *n, const struct style *st) {
     for (struct html_node *c = n->first; c; c = c->next) flow_node(F, c, st);
 }
@@ -385,7 +386,7 @@ const char *select_option_text(struct html_node *sel, int index, char *out, size
     return out;
 }
 
-static void flow_field(struct flow *F, struct html_node *n, const struct style *st) {
+static __attribute__((noinline)) void flow_field(struct flow *F, struct html_node *n, const struct style *st) {
     struct form_field *f = n->field;
     if (!f || f->kind == FF_HIDDEN) return;
     struct font *uf = font_ui;
@@ -401,8 +402,20 @@ static void flow_field(struct flow *F, struct html_node *n, const struct style *
         w = font_text_width(uf, label) + 24;
         break; }
     case FF_SELECT: {
+        /* one walk over the options (select_option_text per index would be quadratic) */
         int maxw = 40; char buf[128];
-        for (int i = 0; i < f->noptions; i++) maxw = MAX(maxw, font_text_width(uf, select_option_text(n, i, buf, sizeof buf, NULL)));
+        struct html_node *stack[16]; int sp = 0;
+        for (struct html_node *c = n->first; c || sp; ) {
+            if (!c) { c = stack[--sp]->next; continue; }
+            if (c->type == HN_ELEMENT && c->tag == T_OPTION) {
+                buf[0] = 0; collect_text(c, buf, sizeof buf);
+                size_t l = strlen(buf); while (l && buf[l - 1] == ' ') buf[--l] = 0;
+                maxw = MAX(maxw, font_text_width(uf, buf));
+                c = c->next; continue;
+            }
+            if (c->type == HN_ELEMENT && c->first && sp < 16) { stack[sp++] = c; c = c->first; continue; }
+            c = c->next;
+        }
         w = MIN(maxw, 400) + 34;
         break; }
     case FF_TEXTAREA: {
@@ -415,10 +428,12 @@ static void flow_field(struct flow *F, struct html_node *n, const struct style *
     add_box(F, st, DI_FIELD, n, w, h, 6);
 }
 
-static void flow_image(struct flow *F, struct html_node *n, const struct style *st) {
+#define MAX_IMG_SIDE 4096
+static __attribute__((noinline)) void flow_image(struct flow *F, struct html_node *n, const struct style *st) {
     struct html_image *im = n->image;
     int avail = MAX(1, F->right - F->left);
     int w = parse_length(html_attr(n, "width"), avail), h = parse_length(html_attr(n, "height"), avail);
+    w = MIN(w, MAX_IMG_SIDE); h = MIN(h, MAX_IMG_SIDE);
     struct canvas *img = im ? im->img : NULL;
     if (img) {
         if (w <= 0 && h <= 0) { w = img->w; h = img->h; }
@@ -435,8 +450,8 @@ static void flow_image(struct flow *F, struct html_node *n, const struct style *
         return;
     }
     if (w <= 0 || h <= 0) return;
-    if (w > avail) { h = h * avail / w; w = avail; }
-    if (h < 1) h = 1;
+    if (w > avail) { h = (int)((int64_t)h * avail / w); w = avail; }
+    w = CLAMP(w, 1, MAX_IMG_SIDE); h = CLAMP(h, 1, MAX_IMG_SIDE);
     add_box(F, st, DI_IMAGE, n, w, h, 0);
 }
 
@@ -478,7 +493,9 @@ static void table_collect(struct table *t, struct html_node *n, int depth) {
     }
 }
 
-static void flow_table(struct flow *F, struct html_node *tn, const struct style *st) {
+struct tcols { int min[MAX_COLS], max[MAX_COLS], pct[MAX_COLS], w[MAX_COLS], x[MAX_COLS + 1]; };
+
+static __attribute__((noinline)) void flow_table(struct flow *F, struct html_node *tn, const struct style *st) {
     struct lay *lay = F->lay;
     block_break(F, 0);
     F->y += F->margin; F->margin = 0;
@@ -506,8 +523,10 @@ static void flow_table(struct flow *F, struct html_node *tn, const struct style 
     color_t tbg;
     bool has_tbg = html_parse_color(html_attr(tn, "bgcolor"), &tbg) || (tcss.has_bg && (tbg = tcss.bg, true));
 
+    bool depth_ok = lay->depth < MAX_LAYOUT_DEPTH;
     /* measure every cell: minimum (longest unbreakable run) and preferred (unwrapped) widths */
-    int colmin[MAX_COLS] = { 0 }, colmax[MAX_COLS] = { 0 }, colpct[MAX_COLS] = { 0 };
+    struct tcols *tc = kzalloc(sizeof *tc);
+    int *colmin = tc->min, *colmax = tc->max, *colpct = tc->pct, *colw = tc->w, *colx = tc->x;
     for (int pass = 0; pass < 2; pass++) {
         for (int i = 0; i < t.ncells; i++) {
             struct tcell *c = &t.cells[i];
@@ -518,7 +537,7 @@ static void flow_table(struct flow *F, struct html_node *tn, const struct style 
                 struct style cst = tst;
                 if (c->node->tag == T_TH) cst.bold = true;
                 if (html_attr(c->node, "nowrap")) cst.nowrap = true;
-                flow_children(&M, c->node, &cst);
+                if (depth_ok) { lay->depth++; flow_children(&M, c->node, &cst); lay->depth--; } else flow_flat(&M, c->node, &cst);
                 flush_line(&M, false);
                 kfree(M.frags);
                 c->maxw = MAX(M.max_right, M.min_w) + 2 * pad;
@@ -535,7 +554,7 @@ static void flow_table(struct flow *F, struct html_node *tn, const struct style 
                 struct flow M = { 0 };
                 M.lay = lay; M.right = 100000; M.emit = false; M.strut = F->strut;
                 struct style cst = tst;
-                flow_children(&M, c->node, &cst);
+                if (depth_ok) { lay->depth++; flow_children(&M, c->node, &cst); lay->depth--; } else flow_flat(&M, c->node, &cst);
                 flush_line(&M, false);
                 kfree(M.frags);
                 int mn = M.min_w + 2 * pad, mx = MAX(M.max_right, M.min_w) + 2 * pad;
@@ -554,7 +573,6 @@ static void flow_table(struct flow *F, struct html_node *tn, const struct style 
     if (fixed_w > 0) target = MAX(fixed_w - extra, summin);
     else target = MIN(summax, avail - extra);
     target = MAX(target, summin);
-    int colw[MAX_COLS];
     if (target >= summax) {
         /* spare room (fixed-width table): percentage columns first, then proportionally */
         int spare = target - summax, weight = 0;
@@ -579,15 +597,21 @@ static void flow_table(struct flow *F, struct html_node *tn, const struct style 
     for (int k = 0; k < t.ncols; k++) tw += colw[k];
     int talign = align_attr(tn, F->align == 1 ? 1 : 0);
     int tx = F->left + (talign == 1 ? MAX(0, (avail - tw) / 2) : talign == 2 ? MAX(0, avail - tw) : 0);
-    int colx[MAX_COLS + 1];
     colx[0] = tx + border + spacing;
     for (int k = 0; k < t.ncols; k++) colx[k + 1] = colx[k] + colw[k] + spacing;
+    if (!F->emit) {
+        /* measuring an enclosing table: the widths are all it needs, and laying the
+           cells out here too would make nested tables cost 2^depth */
+        F->max_right = MAX(F->max_right, tx + tw);
+        note_min(F, summin + extra);
+        kfree(tc); kfree(t.cells); kfree(t.rows);
+        return;
+    }
 
     int ty = F->y;
     int tbg_item = -1;
     if (has_tbg) { struct display_item it = { .type = DI_RECT, .x = tx, .y = ty, .w = tw, .h = 0, .color = tbg, .link = -1 }; tbg_item = add_item(F, &it); }
     int y = ty + border + spacing;
-    bool depth_ok = lay->depth < MAX_LAYOUT_DEPTH;
     for (int r = 0; r < t.nrows; r++) {
         struct trow *row = &t.rows[r];
         struct css rcss = { 0 };
@@ -617,6 +641,7 @@ static void flow_table(struct flow *F, struct html_node *tn, const struct style 
             if (ccss.align) C.align = ccss.align;
             c->first_item = lay->L->nitems;
             if (depth_ok) { lay->depth++; flow_children(&C, c->node, &cst); lay->depth--; }
+            else flow_flat(&C, c->node, &cst);
             flush_line(&C, false);
             kfree(C.frags);
             c->last_item = lay->L->nitems;
@@ -650,7 +675,7 @@ static void flow_table(struct flow *F, struct html_node *tn, const struct style 
     F->y = ty + th;
     F->max_right = MAX(F->max_right, tx + tw);
     note_min(F, summin + extra);
-    kfree(t.cells); kfree(t.rows);
+    kfree(tc); kfree(t.cells); kfree(t.rows);
 }
 
 /* ---- blocks ---- */
@@ -687,6 +712,56 @@ static void list_marker(struct flow *F, struct html_node *li, const struct style
     F->has_marker = true;
 }
 
+/* <a>: link style and named anchor (kept out of flow_node's recursive frame) */
+static __attribute__((noinline)) void flow_anchor(struct flow *F, struct html_node *n, struct style *st) {
+    struct html_doc *doc = F->lay->doc;
+    const char *href = html_attr(n, "href");
+    if (href && *href && !starts_with_ci(href, "javascript:")) {
+        char abs[1024];
+        url_resolve(doc->base, href, abs, sizeof abs);
+        st->link = add_link(F->lay->L, abs, n);
+        st->color = doc->link;
+        st->underline = true;
+    }
+    const char *name = html_attr(n, "name");
+    if (name) add_anchor(F, name);
+}
+
+static __attribute__((noinline)) void flow_frame(struct flow *F, struct html_node *n, const struct style *st) {
+    struct lay *lay = F->lay;
+    const char *src = html_attr(n, "src");
+    if (!src || !*src) return;
+    char abs[1024], label[1100];
+    url_resolve(lay->doc->base, src, abs, sizeof abs);
+    const char *nm = html_attr(n, "name");
+    snprintf(label, sizeof label, "[%s: %s]", n->tag == T_FRAME ? "frame" : "embedded page", nm && *nm ? nm : src);
+    if (n->tag == T_FRAME) block_break(F, 4);
+    struct style ls = *st; ls.link = add_link(lay->L, abs, n); ls.color = lay->doc->link; ls.underline = true;
+    const char *keep = keep_string(lay->L, label);
+    flow_text(F, &ls, keep, strlen(keep));
+    if (n->tag == T_FRAME) block_break(F, 4);
+}
+
+/* content nested deeper than MAX_LAYOUT_DEPTH: flow its text without recursing */
+static __attribute__((noinline)) void flow_flat(struct flow *F, struct html_node *n, const struct style *st) {
+    if (n->tag == T_BR) { flush_line(F, false); return; }
+    bool blk = is_block_tag(n->tag);
+    if (blk) block_break(F, 0);
+    struct html_node *c = n->first;
+    while (c) {
+        if (c->type == HN_TEXT) { if (st->pre) flow_pre(F, st, c->text, c->text_len); else flow_text(F, st, c->text, c->text_len); }
+        else if (c->tag == T_BR) flush_line(F, false);
+        else if (!is_hidden_tag(c->tag) && !html_attr(c, "hidden")) {
+            if (is_block_tag(c->tag)) block_break(F, 0);
+            if (c->first) { c = c->first; continue; }
+        }
+        while (c != n && !c->next) { c = c->parent; if (c != n && is_block_tag(c->tag)) block_break(F, 0); }
+        if (c == n) break;
+        c = c->next;
+    }
+    if (blk) block_break(F, 0);
+}
+
 static void flow_node(struct flow *F, struct html_node *n, const struct style *st_in) {
     struct lay *lay = F->lay;
     if (n->type == HN_TEXT) {
@@ -696,10 +771,9 @@ static void flow_node(struct flow *F, struct html_node *n, const struct style *s
     }
     int tag = n->tag;
     if (is_hidden_tag(tag) || html_attr(n, "hidden")) return;
-    if (lay->depth >= MAX_LAYOUT_DEPTH) return;
+    if (lay->depth >= MAX_LAYOUT_DEPTH) { flow_flat(F, n, st_in); return; }
     struct style st = *st_in;
     struct css css = { 0 };
-    struct html_doc *doc = lay->doc;
     switch (tag) {
     case T_B: case T_STRONG: case T_DT: st.bold = true; break;
     case T_I: case T_EM: case T_CITE: case T_VAR: case T_DFN: case T_ADDRESS: st.italic = true; break;
@@ -724,18 +798,7 @@ static void flow_node(struct flow *F, struct html_node *n, const struct style *s
         const char *face = html_attr(n, "face");
         if (face && (strstr(face, "ourier") || strstr(face, "ono"))) st.family = 1;
         break; }
-    case T_A: {
-        const char *href = html_attr(n, "href");
-        if (href && *href && !starts_with_ci(href, "javascript:")) {
-            char abs[1024];
-            url_resolve(doc->base, href, abs, sizeof abs);
-            st.link = add_link(lay->L, abs, n);
-            st.color = doc->link;
-            st.underline = true;
-        }
-        const char *name = html_attr(n, "name");
-        if (name) add_anchor(F, name);
-        break; }
+    case T_A: flow_anchor(F, n, &st); break;
     }
     apply_inline_css(html_attr(n, "style"), &st, &css);
     if (css.hidden) return;
@@ -762,19 +825,7 @@ static void flow_node(struct flow *F, struct html_node *n, const struct style *s
         F->margin = 8;
         return; }
     case T_TABLE: lay->depth++; flow_table(F, n, &st); lay->depth--; return;
-    case T_FRAME: case T_IFRAME: {
-        const char *src = html_attr(n, "src");
-        if (!src || !*src) return;
-        char abs[1024], label[1100];
-        url_resolve(doc->base, src, abs, sizeof abs);
-        const char *nm = html_attr(n, "name");
-        snprintf(label, sizeof label, "[%s: %s]", tag == T_FRAME ? "frame" : "embedded page", nm && *nm ? nm : src);
-        if (tag == T_FRAME) block_break(F, 4);
-        struct style ls = st; ls.link = add_link(lay->L, abs, n); ls.color = doc->link; ls.underline = true;
-        const char *keep = keep_string(lay->L, label);
-        flow_text(F, &ls, keep, strlen(keep));
-        if (tag == T_FRAME) block_break(F, 4);
-        return; }
+    case T_FRAME: case T_IFRAME: flow_frame(F, n, &st); return;
     }
 
     if (!is_block_tag(tag)) {
@@ -973,7 +1024,11 @@ void layout_paint(struct layout *L, struct canvas *c, int scroll_y, struct form_
             struct html_image *im = it->node->image;
             if (!im || !im->img) { gfx_draw_rect(c, it->x, y, it->w, it->h, RGB(0xC8, 0xC8, 0xCC)); break; }
             if (im->img->w == it->w && im->img->h == it->h) { gfx_blit(c, it->x, y, im->img); }
-            else {
+            else if ((int64_t)it->w * it->h > (4 << 20)) {
+                /* too big to cache a scaled copy: scale the visible part on every paint */
+                canvas_destroy(im->scaled); im->scaled = NULL;
+                gfx_blit_scaled(c, it->x, y, it->w, it->h, im->img);
+            } else {
                 if (!im->scaled || im->scaled->w != it->w || im->scaled->h != it->h) {
                     canvas_destroy(im->scaled);
                     im->scaled = canvas_create(it->w, it->h);

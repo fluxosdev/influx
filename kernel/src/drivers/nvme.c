@@ -17,6 +17,7 @@ struct nvme_ctrl {
     uint16_t cid;
     char model[41], serial[21];
     uint32_t max_transfer;   /* bytes */
+    bool failed;             /* a command timed out: the controller was disabled */
 };
 struct nvme_ns { struct nvme_ctrl *c; uint32_t nsid; uint32_t lba_size; uint64_t nlba; };
 
@@ -32,6 +33,7 @@ static void queue_init(struct nvme_ctrl *c, struct nvme_queue *q, uint16_t id, u
 }
 
 static int submit(struct nvme_ctrl *c, struct nvme_queue *q, struct nvme_cmd *cmd, uint32_t *dw0) {
+    if (c->failed) return -EIO;
     cmd->cid = c->cid++;
     q->sq[q->sq_tail] = *cmd;
     q->sq_tail = (q->sq_tail + 1) % q->size;
@@ -39,17 +41,22 @@ static int submit(struct nvme_ctrl *c, struct nvme_queue *q, struct nvme_cmd *cm
     for (int i = 0; i < 10000000; i++) {
         volatile struct nvme_cpl *cpl = &q->cq[q->cq_head];
         if ((cpl->status & 1) == q->phase) {
-            uint16_t status = cpl->status >> 1;
-            if (dw0) *dw0 = cpl->dw0;
+            uint16_t status = cpl->status >> 1, cid = cpl->cid; uint32_t d0 = cpl->dw0;
             q->cq_head = (q->cq_head + 1) % q->size;
             if (q->cq_head == 0) q->phase ^= 1;
             *q->cq_db = q->cq_head;
+            if (cid != cmd->cid) continue;   /* stale completion of an earlier command */
+            if (dw0) *dw0 = d0;
             if (status) { kprintf("nvme: command %02x failed, status %04x\n", cmd->opc, status); return -EIO; }
             return 0;
         }
         if (i > 1000) thread_yield(); else pause();
     }
-    kprintf("nvme: command %02x timed out\n", cmd->opc);
+    /* still outstanding: it may DMA into a buffer the caller frees. Disabling the controller aborts it. */
+    kprintf("nvme: command %02x timed out, disabling the controller\n", cmd->opc);
+    REG32(c, 0x14) = REG32(c, 0x14) & ~1u;
+    for (int i = 0; i < 1000000 && (REG32(c, 0x1C) & 1); i++) pause();
+    c->failed = true;
     return -EIO;
 }
 

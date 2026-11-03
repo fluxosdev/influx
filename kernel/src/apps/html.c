@@ -206,7 +206,7 @@ bool html_parse_color(const char *s, color_t *out) {
         const char *p = strchr(s, '(');
         if (!p) return false;
         int v[3] = { 0 };
-        for (int i = 0; i < 3; i++) {
+        for (int i = 0; i < 3 && *p; i++) {
             p++; while (isspace(*p)) p++;
             v[i] = CLAMP(atoi(p), 0, 255);
             while (*p && *p != ',' && *p != ')' && *p != ' ') p++;
@@ -235,6 +235,9 @@ struct parser {
     struct html_node *stack[MAX_DEPTH];
     int depth;
     struct html_node *form;   /* the open <form> (forms do not nest) */
+    struct form_field **field_tail;
+    struct html_image **image_tail;
+    struct html_image *image_hash[256];
 };
 
 static struct html_node *node_new(int type, int tag) {
@@ -255,18 +258,20 @@ const char *html_attr(const struct html_node *n, const char *name) {
     return NULL;
 }
 
+static size_t text_cap(size_t n) { size_t c = 32; while (c < n) c <<= 1; return c; }
 static void add_text(struct parser *p, const char *s, int n) {
     if (n <= 0) return;
     struct html_node *cur = current(p);
     struct html_node *last = cur->last;
     if (last && last->type == HN_TEXT) {
-        last->text = krealloc(last->text, last->text_len + n + 1);
+        /* grow geometrically: pages can append to the same node many times */
+        if (last->text_len + n + 1 > text_cap(last->text_len + 1)) last->text = krealloc(last->text, text_cap(last->text_len + n + 1));
         memcpy(last->text + last->text_len, s, n);
         last->text_len += n; last->text[last->text_len] = 0;
         return;
     }
     struct html_node *t = node_new(HN_TEXT, 0);
-    t->text = kmalloc(n + 1);
+    t->text = kmalloc(text_cap(n + 1));
     memcpy(t->text, s, n); t->text[n] = 0; t->text_len = n;
     append_child(cur, t);
 }
@@ -327,9 +332,8 @@ static void register_field(struct parser *p, struct html_node *n) {
     f->checked = html_attr(n, "checked") != NULL;
     n->field = f;
     /* keep document order */
-    struct form_field **pp = &p->doc->fields;
-    while (*pp) pp = &(*pp)->next;
-    *pp = f;
+    if (!p->field_tail) p->field_tail = &p->doc->fields;
+    *p->field_tail = f; p->field_tail = &f->next;
 }
 
 static void start_tag(struct parser *p, int tag, struct html_attr *attrs, int nattrs, bool self_closing) {
@@ -388,13 +392,15 @@ static void start_tag(struct parser *p, int tag, struct html_attr *attrs, int na
             char abs[1024];
             url_resolve(d->base, src, abs, sizeof abs);
             struct html_image *im = NULL;
-            for (struct html_image *x = d->images; x; x = x->next) if (!strcmp(x->url, abs)) { im = x; break; }
+            uint32_t h = 5381;
+            for (const char *q = abs; *q; q++) h = h * 33 + (unsigned char)*q;
+            for (struct html_image *x = p->image_hash[h & 255]; x; x = x->hnext) if (!strcmp(x->url, abs)) { im = x; break; }
             if (!im) {
                 im = kzalloc(sizeof *im);
                 im->url = kstrdup(abs);
-                struct html_image **pp = &d->images;
-                while (*pp) pp = &(*pp)->next;
-                *pp = im;
+                im->hnext = p->image_hash[h & 255]; p->image_hash[h & 255] = im;
+                if (!p->image_tail) p->image_tail = &d->images;
+                *p->image_tail = im; p->image_tail = &im->next;
             }
             n->image = im;
         }

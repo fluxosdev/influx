@@ -95,6 +95,53 @@ static bool gpe_locate(int gpe, int *b, int *i) {
     return false;
 }
 
+/* ---- FACS global lock: AML (Acquire(\_GL), fields with LockRule) vs. SMM firmware ---- */
+#define PM1_GBL_RLS (1u << 2)
+static volatile uint32_t *gl_word;
+static bool gl_probed;
+static int gl_depth;
+
+static volatile uint32_t *facs_lock(void) {
+    if (gl_probed) return gl_word;
+    gl_probed = true;
+    if (!fadt || hw_reduced) return NULL;
+    uint64_t phys = fadt->len >= offsetof(struct acpi_fadt, x_firmware_ctrl) + 8 && fadt->x_firmware_ctrl ? fadt->x_firmware_ctrl : fadt->firmware_ctrl;
+    if (!phys) return NULL;
+    uint8_t *facs = acpi_map_phys(phys, 64);
+    if (memcmp(facs, "FACS", 4) || *(uint32_t *)(facs + 4) < 24) { kprintf("acpi: bad FACS, no global lock\n"); return NULL; }
+    return gl_word = (volatile uint32_t *)(facs + 16);
+}
+
+/* spec 5.2.10.1: set owned; if it already was, set pending and wait for the
+ * firmware to release (spinning here instead of waiting for GBL_STS) */
+bool acpi_gl_acquire(uint32_t timeout_ms) {
+    volatile uint32_t *w = facs_lock();
+    if (!w) return true;
+    if (gl_depth) { gl_depth++; return true; }
+    for (uint64_t spins = 0;; spins++) {
+        uint32_t old, new;
+        do { old = *w; new = (old & ~1u) | 2 | ((old >> 1) & 1); } while (!__sync_bool_compare_and_swap(w, old, new));
+        if (!(old & 2)) { gl_depth = 1; return true; }
+        if (spins >= (uint64_t)timeout_ms * 20) break;
+        acpi_stall_us(50);
+    }
+    static bool warned;
+    if (!warned) { warned = true; kprintf("acpi: firmware holds the global lock, timed out\n"); }
+    return false;
+}
+
+void acpi_gl_release(void) {
+    if (!gl_depth || --gl_depth) return;
+    volatile uint32_t *w = facs_lock();
+    if (!w) return;
+    uint32_t old;
+    do old = *w; while (!__sync_bool_compare_and_swap(w, old, old & ~3u));
+    if (old & 1) {   /* firmware is waiting for it */
+        gas_write(&pm1a_cnt, gas_read(&pm1a_cnt) | PM1_GBL_RLS);
+        if (pm1b_cnt.address) gas_write(&pm1b_cnt, gas_read(&pm1b_cnt) | PM1_GBL_RLS);
+    }
+}
+
 /* ---- bring-up ---- */
 static void enable_acpi_mode(void) {
     if (hw_reduced) return;
@@ -162,8 +209,7 @@ static void sci_irq(struct regs *r, void *ctx) {
             gpe_pending[b][i] |= s;
             any = true;
         }
-    if (any) sem_post(&sci_sem);
-    lapic_eoi();
+    if (any) sem_post(&sci_sem);   /* the shared dispatcher in arch/pci.c sends the EOI */
 }
 
 static void power_button_pressed(void) {
@@ -266,10 +312,8 @@ static void sci_init(void) {
     sci_gsi = irq;
     if (irq < 16) { sci_gsi = madt.iso_src[irq]; fl = madt.iso_flags[irq]; }
     bool active_low = (fl & 3) != 1, level = ((fl >> 2) & 3) != 1;
-    int vec = irq_alloc_vector();
-    if (!vec) { kprintf("acpi: no interrupt vector for the SCI\n"); return; }
-    irq_register(vec, sci_irq, NULL);
-    if (!ioapic_route_gsi(sci_gsi, vec, level, active_low)) { kprintf("acpi: cannot route SCI GSI %u\n", sci_gsi); return; }
+    /* PCI INTx lines may land on the same GSI: share one vector and dispatcher */
+    if (!pci_irq_share_gsi(sci_gsi, level, active_low, sci_irq, NULL)) { kprintf("acpi: cannot route SCI GSI %u\n", sci_gsi); return; }
     for (int b = 0; b < 2; b++) for (int i = 0; i < gpe_bytes[b]; i++) gpe_write(b, i, true, gpe_enabled[b][i]);
     sci_running = true;
     kprintf("acpi: SCI on GSI %u (%s, active %s), %d runtime GPEs\n", sci_gsi, level ? "level" : "edge", active_low ? "low" : "high", gpe_runtime);
@@ -280,6 +324,7 @@ void acpi_namespace_init(void) {
     if (!fadt) { kprintf("acpi: no FADT, AML disabled\n"); return; }
     hw_reduced = fadt->len >= offsetof(struct acpi_fadt, flags) + 4 && (fadt->flags & FADT_HW_REDUCED);
     uint64_t dsdt = fadt->len >= offsetof(struct acpi_fadt, x_dsdt) + 8 && fadt->x_dsdt ? fadt->x_dsdt : fadt->dsdt;
+    setup_registers();   /* before any AML: releasing the global lock writes PM1 control */
     aml_init();
     uint8_t rev = 0;
     if (dsdt) {
@@ -287,19 +332,19 @@ void acpi_namespace_init(void) {
         uint32_t len = *(uint32_t *)(h + 4);
         rev = h[8];
         aml_int64 = rev >= 2;
-        aml_load_table(acpi_map_phys(dsdt, len), len, "DSDT");
+        if (len >= 36 && len <= ACPI_MAX_TABLE) aml_load_table(acpi_map_phys(dsdt, len), len, "DSDT");
+        else kprintf("acpi: DSDT has bad length %u\n", len);
     }
     char sig[5];
     for (int i = 0; acpi_table_at(i, sig); i++) {
         if (memcmp(sig, "SSDT", 4) && memcmp(sig, "PSDT", 4)) continue;
-        uint8_t *t = acpi_table_at(i, sig);
+        uint8_t *t = acpi_table_at(i, sig);   /* length already checked when mapped */
         aml_load_table(t, *(uint32_t *)(t + 4), "SSDT");
         nssdt++;
     }
     ready = true;
     kprintf("acpi: namespace: %d objects from the DSDT (revision %u, %d-bit integers) and %d SSDTs, %d AML errors\n",
             ns_node_count(), rev, aml_int64 ? 64 : 32, nssdt, aml_errors);
-    setup_registers();
     enable_acpi_mode();
     ns_walk(aml_root, reg_cb, NULL);
     ec_init();
@@ -350,8 +395,7 @@ void acpi_reboot(void) {
     kprintf("acpi: reset register (space %d, 0x%lx) <- 0x%x\n", g->space, g->address, fadt->reset_value);
     if (g->space == SPACE_PCI) {   /* bus 0; device, function, offset packed into the address */
         uint8_t dev = (g->address >> 32) & 0x1F, fn = (g->address >> 16) & 7, off = g->address & 0xFF;
-        uint32_t cur = pci_read32(0, dev, fn, off & ~3), sh = (off & 3) * 8;
-        pci_write32(0, dev, fn, off & ~3, (cur & ~(0xFFu << sh)) | ((uint32_t)fadt->reset_value << sh));
+        pci_write8(0, dev, fn, off, fadt->reset_value);
     } else {
         struct acpi_gas r = *g; r.bit_width = 8; r.access_size = 0;
         gas_write(&r, fadt->reset_value);

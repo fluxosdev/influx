@@ -87,7 +87,7 @@ int dhcp_configure(struct netif *n, int timeout_ms) {
     if (!s) return -EADDRINUSE;
     struct dhcp_msg *m = kmalloc(sizeof *m);
     uint32_t xid = (uint32_t)rdtsc() ^ ((uint32_t)n->mac[5] << 24);
-    struct dhcp_lease offer, ack;
+    struct dhcp_lease offer = { 0 }, ack = { 0 };
     int step = timeout_ms / 8 > 500 ? timeout_ms / 8 : 500;
     int r = -ETIMEDOUT;
     size_t len = build(m, n, xid, DHCP_DISCOVER, 0, 0);

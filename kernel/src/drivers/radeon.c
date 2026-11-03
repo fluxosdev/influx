@@ -11,17 +11,20 @@
  *   - inspects the scanout the video BIOS (BIOS boot through VBE) or the
  *     GOP (UEFI boot) configured, and verifies it is the bootloader's
  *     framebuffer
- *   - parses the AtomBIOS ROM: bootup message, part number, default clocks
+ *   - finds the video BIOS (ACPI VFCT table on UEFI, the C000:0000 shadow
+ *     after a BIOS boot, VRAM on the IGP, or the PCI expansion ROM), keeps a
+ *     copy and parses it: bootup message, part number, default clocks
  *   - provides a 64x64 ARGB hardware cursor
  *   - provides vblank-synchronised double-buffered page flipping of the
  *     primary surface (the compositor renders into the VRAM back buffer)
+ *   - runtime mode setting through the AtomBIOS command tables, with the
+ *     mode list from the monitor's EDID (radeon_kms.c, atom.c)
  *
  * The 3D engine (command processor + shaders) needs the R700 CP microcode
  * and a full command-stream backend; rendering therefore uses the software
  * rasteriser, which is the fallback for every other adapter as well.
  */
-#include "gpu.h"
-#include "arch.h"
+#include "radeon.h"
 #include "mm.h"
 #include "string.h"
 #include "io.h"
@@ -37,6 +40,8 @@ extern volatile struct limine_framebuffer_request framebuffer_request;
 #define R700_MC_VM_FB_LOCATION   0x2024
 #define R600_MC_VM_FB_LOCATION   0x2180
 #define HDP_NONSURFACE_BASE      0x2C04
+#define BUS_CNTL                 0x5420
+#define BIOS_ROM_DIS             (1u << 1)
 #define CONFIG_MEMSIZE           0x5428
 #define GRBM_STATUS              0x8010
 #define CC_GC_SHADER_PIPE_CONFIG 0x8950
@@ -53,8 +58,11 @@ extern volatile struct limine_framebuffer_request framebuffer_request;
 #define D1GRPH_X_END             0x6134
 #define D1GRPH_Y_END             0x6138
 #define D1GRPH_UPDATE            0x6144
+/* the R700 high-address registers are not at the usual CRTC2 stride */
 #define D1GRPH_PRIMARY_SURFACE_ADDRESS_HIGH   0x6914
 #define D1GRPH_SECONDARY_SURFACE_ADDRESS_HIGH 0x691C
+#define D2GRPH_PRIMARY_SURFACE_ADDRESS_HIGH   0x6114
+#define D2GRPH_SECONDARY_SURFACE_ADDRESS_HIGH 0x611C
 #define D1CUR_CONTROL            0x6400
 #define D1CUR_SURFACE_ADDRESS    0x6408
 #define D1CUR_SIZE               0x6410
@@ -62,8 +70,7 @@ extern volatile struct limine_framebuffer_request framebuffer_request;
 #define D1CUR_HOT_SPOT           0x6418
 #define D1CUR_UPDATE             0x6424
 #define D1MODE_VIEWPORT_SIZE     0x6584
-#define CRTC2_OFFSET             0x0800
-#define GRPH_UPDATE_LOCK         (1u << 16)
+#define GRPH_UPDATE_LOCK        (1u << 16)
 #define GRPH_SURFACE_UPDATE_PENDING (1u << 2)
 #define CRTC_V_BLANK             (1u << 0)
 #define CURSOR_EN                (1u << 0)
@@ -90,48 +97,114 @@ static const struct model models[] = {
     { 0x9710, "Radeon HD 4200" }, { 0x9712, "Mobility Radeon HD 4200" }, { 0x9713, "Mobility Radeon HD 4100" }, { 0x9714, "Radeon HD 4290" }, { 0x9715, "Radeon HD 4250" },
 };
 
-struct radeon {
-    struct gpu_device gpu;
-    volatile uint32_t *mmio; uint64_t mmio_phys, mmio_len;
-    uint8_t *vram; uint64_t vram_phys, aper_len;
-    uint64_t fb_start_gpu;               /* MC address of VRAM start */
-    uint32_t scan_gpu_addr, pitch_px, width, height;
-    uint64_t scan_off;                   /* VRAM offset of the bootloader framebuffer */
-    uint64_t buf_off[2]; int back;       /* page-flip buffers (VRAM offsets); back = index being drawn */
-    uint64_t cursor_off;
-    bool is_rs880, igp_vram_unknown;
-    int crtc;                            /* which CRTC scans out the framebuffer */
-};
 static struct radeon rdev;
 
-static inline uint32_t rreg(struct radeon *r, uint32_t reg) {
+uint32_t radeon_rreg(struct radeon *r, uint32_t reg) {
     if (reg < r->mmio_len) return r->mmio[reg / 4];
     r->mmio[MM_INDEX / 4] = reg; return r->mmio[MM_DATA / 4];
 }
-static inline void wreg(struct radeon *r, uint32_t reg, uint32_t v) {
+void radeon_wreg(struct radeon *r, uint32_t reg, uint32_t v) {
     if (reg < r->mmio_len) { r->mmio[reg / 4] = v; return; }
     r->mmio[MM_INDEX / 4] = reg; r->mmio[MM_DATA / 4] = v;
 }
-static void udelay(uint32_t us) { uint64_t t = rdtsc() + (uint64_t)us * (cpu_tsc_hz() ? cpu_tsc_hz() / 1000000 : 2000); while (rdtsc() < t) pause(); }
+#define rreg radeon_rreg
+#define wreg radeon_wreg
+void radeon_udelay(uint32_t us) { uint64_t t = rdtsc() + (uint64_t)us * (cpu_tsc_hz() ? cpu_tsc_hz() / 1000000 : 2000); while (rdtsc() < t) pause(); }
+#define udelay radeon_udelay
+
+/* ---- video BIOS ---- */
+#define ROM_MAX     (128u << 10)
+#define PCI_ROM_BAR 0x30
+
+/* an x86 option ROM whose PCI data structure names ATI */
+static bool rom_valid(const uint8_t *rom, size_t len) {
+    if (len < 0x200 || rom[0] != 0x55 || rom[1] != 0xAA) return false;
+    uint16_t pcir = *(const uint16_t *)(rom + 0x18);
+    if ((size_t)pcir + 8 > len || memcmp(rom + pcir, "PCIR", 4)) return false;
+    return *(const uint16_t *)(rom + pcir + 4) == 0x1002;
+}
+static bool rom_take(struct radeon *r, const uint8_t *src, size_t avail, const char *how) {
+    if (!rom_valid(src, avail)) return false;
+    size_t len = (size_t)src[2] * 512;   /* the first (legacy x86) image holds the AtomBIOS tables */
+    if (len < 0x200 || len > avail) len = avail;
+    len = MIN(len, (size_t)ROM_MAX);
+    r->rom = kmalloc(len);
+    if (!r->rom) return false;
+    memcpy(r->rom, src, len); r->rom_len = len;
+    kprintf("radeon: video BIOS from %s (%zu KiB)\n", how, len >> 10);
+    return true;
+}
+
+/* UEFI firmware hands the GOP-era VBIOS to the OS in the ACPI VFCT table */
+struct vfct { char sig[4]; uint32_t len; uint8_t rev, csum; char oem[6], oem_table[8]; uint32_t oem_rev, creator, creator_rev;
+              uint8_t uuid[16]; uint32_t vbios_offset, lib1_offset, reserved[4]; } PACKED;
+struct vfct_image { uint32_t bus, device, function; uint16_t vendor, device_id, ss_vendor, ss_id; uint32_t revision, length; } PACKED;
+static bool rom_from_vfct(struct radeon *r, struct pci_device *pd) {
+    const struct vfct *t = acpi_find_table("VFCT");
+    if (!t) return false;
+    for (uint32_t off = t->vbios_offset; off + sizeof(struct vfct_image) <= t->len; ) {
+        const struct vfct_image *im = (const void *)((const uint8_t *)t + off);
+        off += sizeof *im;
+        if (im->length > t->len - off) break;
+        if (im->length && im->bus == pd->bus && im->device == pd->slot && im->function == pd->func && im->vendor == pd->vendor && im->device_id == pd->device)
+            return rom_take(r, (const uint8_t *)(im + 1), im->length, "the ACPI VFCT table");
+        off += im->length;
+    }
+    return false;
+}
+
+/* the PCI expansion ROM, if the firmware assigned it an address. The ROM BAR
+ * is sized and enabled only for the copy; BIOS_ROM_DIS gates the decode on R600+ */
+static bool rom_from_bar(struct radeon *r, struct pci_device *pd) {
+    if (pd->header_type & 0x7F) return false;
+    uint32_t orig = pci_read32(pd->bus, pd->slot, pd->func, PCI_ROM_BAR);
+    uint32_t addr = orig & 0xFFFFF800;
+    if (!addr) { kprintf("radeon: expansion ROM BAR not assigned\n"); return false; }
+    pci_write32(pd->bus, pd->slot, pd->func, PCI_ROM_BAR, 0xFFFFF800);
+    uint32_t mask = pci_read32(pd->bus, pd->slot, pd->func, PCI_ROM_BAR) & 0xFFFFF800;
+    pci_write32(pd->bus, pd->slot, pd->func, PCI_ROM_BAR, addr);
+    if (!mask) return false;
+    size_t size = MIN((size_t)(~mask + 1), (size_t)ROM_MAX);
+    uint8_t *tmp = kmalloc(size);
+    if (!tmp) { pci_write32(pd->bus, pd->slot, pd->func, PCI_ROM_BAR, orig); return false; }
+    uint32_t bus_cntl = rreg(r, BUS_CNTL);
+    wreg(r, BUS_CNTL, bus_cntl & ~BIOS_ROM_DIS);
+    pci_write32(pd->bus, pd->slot, pd->func, PCI_ROM_BAR, addr | 1);
+    const volatile uint32_t *src = vmm_map_mmio(addr, size);
+    for (size_t i = 0; i < size / 4; i++) ((uint32_t *)tmp)[i] = src[i];
+    pci_write32(pd->bus, pd->slot, pd->func, PCI_ROM_BAR, orig);
+    wreg(r, BUS_CNTL, bus_cntl);
+    bool ok = rom_take(r, tmp, size, "the PCI expansion ROM");
+    kfree(tmp);
+    return ok;
+}
+
+static bool find_rom(struct radeon *r, struct pci_device *pd) {
+    if (rom_from_vfct(r, pd)) return true;
+    if (rom_take(r, acpi_map_phys(0xC0000, 0x20000), 0x20000, "the C000:0000 shadow")) return true;   /* legacy option ROM shadow after a BIOS boot */
+    if (r->is_rs880 && rom_take(r, r->vram, MIN(r->aper_len, (uint64_t)ROM_MAX), "VRAM")) return true;   /* IGPs keep it in stolen memory */
+    if (rom_from_bar(r, pd)) return true;
+    kprintf("radeon: no video BIOS found (VFCT, C000:0000 shadow, expansion ROM)\n");
+    return false;
+}
 
 /* ---- AtomBIOS ROM ---- */
 static void parse_atombios(struct radeon *r) {
-    const uint8_t *rom = P2V(0xC0000);   /* legacy option ROM shadow, present after a BIOS boot */
-    if (rom[0] != 0x55 || rom[1] != 0xAA) { kprintf("radeon: no video BIOS shadow at C000:0000 (UEFI boot?)\n"); return; }
-    size_t rom_size = (size_t)rom[2] * 512; if (rom_size > 0x20000) rom_size = 0x20000;
+    const uint8_t *rom = r->rom;
+    size_t rom_size = r->rom_len;
     uint16_t hdr = *(const uint16_t *)(rom + 0x48);
     if (hdr + 36 > rom_size || memcmp(rom + hdr + 4, "ATOM", 4)) { kprintf("radeon: video BIOS is not AtomBIOS\n"); return; }
     uint16_t msg = *(const uint16_t *)(rom + hdr + 16);
     if (msg && msg < rom_size) {
-        const char *s = (const char *)rom + msg; size_t i = 0;
-        while (*s == '\r' || *s == '\n') s++;
-        while (s[i] && s[i] != '\n' && s[i] != '\r' && i < sizeof r->gpu.bios_message - 1 && msg + (s - (const char *)rom) + i < rom_size) { r->gpu.bios_message[i] = s[i]; i++; }
+        const char *s = (const char *)rom + msg, *end = (const char *)rom + rom_size; size_t i = 0;
+        while (s < end && (*s == '\r' || *s == '\n')) s++;
+        while (s + i < end && s[i] && s[i] != '\n' && s[i] != '\r' && i < sizeof r->gpu.bios_message - 1) { r->gpu.bios_message[i] = s[i]; i++; }
         r->gpu.bios_message[i] = 0;
         while (i > 0 && r->gpu.bios_message[i - 1] == ' ') r->gpu.bios_message[--i] = 0;
     }
     /* part numbers look like "113-xxxxxxx-xxx" */
     for (size_t i = 0; i + 16 < rom_size; i++) if (rom[i] == '1' && rom[i + 1] == '1' && rom[i + 2] == '3' && rom[i + 3] == '-' && isalnum(rom[i + 4])) {
-        size_t n = 0; while (n < sizeof r->gpu.bios_part - 1 && isprint(rom[i + n]) && rom[i + n] != ' ') { r->gpu.bios_part[n] = rom[i + n]; n++; }
+        size_t n = 0; while (n < sizeof r->gpu.bios_part - 1 && i + n < rom_size && isprint(rom[i + n]) && rom[i + n] != ' ') { r->gpu.bios_part[n] = rom[i + n]; n++; }
         r->gpu.bios_part[n] = 0; break;
     }
     uint16_t master = *(const uint16_t *)(rom + hdr + 32);
@@ -146,21 +219,22 @@ static void parse_atombios(struct radeon *r) {
 }
 
 /* ---- scanout / page flip ---- */
-static uint32_t crtc_reg(struct radeon *r, uint32_t reg) { return reg + (r->crtc ? CRTC2_OFFSET : 0); }
+uint32_t radeon_crtc_reg(struct radeon *r, uint32_t reg) { return reg + (r->crtc ? CRTC2_OFFSET : 0); }
+#define crtc_reg radeon_crtc_reg
 
 static void wait_vblank(struct radeon *r) {
     /* wait for the start of the next vertical blank (bounded) */
     for (int i = 0; i < 40000 && (rreg(r, crtc_reg(r, D1CRTC_STATUS)) & CRTC_V_BLANK); i++) udelay(1);
     for (int i = 0; i < 40000 && !(rreg(r, crtc_reg(r, D1CRTC_STATUS)) & CRTC_V_BLANK); i++) udelay(1);
 }
-static void set_primary_surface(struct radeon *r, uint32_t gpu_addr) {
+void radeon_set_surface_address(struct radeon *r, uint64_t gpu_addr) {
     uint32_t upd = crtc_reg(r, D1GRPH_UPDATE);
     uint32_t tmp = rreg(r, upd);
     wreg(r, upd, tmp | GRPH_UPDATE_LOCK);
-    wreg(r, crtc_reg(r, D1GRPH_SECONDARY_SURFACE_ADDRESS_HIGH), 0);
-    wreg(r, crtc_reg(r, D1GRPH_PRIMARY_SURFACE_ADDRESS_HIGH), 0);
-    wreg(r, crtc_reg(r, D1GRPH_SECONDARY_SURFACE_ADDRESS), gpu_addr);
-    wreg(r, crtc_reg(r, D1GRPH_PRIMARY_SURFACE_ADDRESS), gpu_addr);
+    wreg(r, r->crtc ? D2GRPH_SECONDARY_SURFACE_ADDRESS_HIGH : D1GRPH_SECONDARY_SURFACE_ADDRESS_HIGH, (uint32_t)(gpu_addr >> 32));
+    wreg(r, r->crtc ? D2GRPH_PRIMARY_SURFACE_ADDRESS_HIGH : D1GRPH_PRIMARY_SURFACE_ADDRESS_HIGH, (uint32_t)(gpu_addr >> 32));
+    wreg(r, crtc_reg(r, D1GRPH_SECONDARY_SURFACE_ADDRESS), (uint32_t)gpu_addr);
+    wreg(r, crtc_reg(r, D1GRPH_PRIMARY_SURFACE_ADDRESS), (uint32_t)gpu_addr);
     for (int i = 0; i < 10000 && !(rreg(r, upd) & GRPH_SURFACE_UPDATE_PENDING); i++) udelay(1);
     wreg(r, upd, tmp & ~GRPH_UPDATE_LOCK);
     /* the new surface becomes visible at the next vblank */
@@ -173,28 +247,33 @@ static uint8_t *radeon_back_buffer(struct gpu_device *g, int *pitch) {
 }
 static void radeon_flip(struct gpu_device *g) {
     struct radeon *r = g->priv;
-    set_primary_surface(r, (uint32_t)(r->fb_start_gpu + r->buf_off[r->back]));
+    radeon_set_surface_address(r, r->fb_start_gpu + r->buf_off[r->back]);
     r->back ^= 1;
 }
 
 /* ---- hardware cursor ---- */
+void radeon_cursor_upload(struct radeon *r) {
+    if (!r->cursor_valid) return;
+    memcpy(r->vram + r->cursor_off, r->cursor_img, sizeof r->cursor_img);
+    wreg(r, crtc_reg(r, D1CUR_UPDATE), CURSOR_UPDATE_LOCK);
+    wreg(r, crtc_reg(r, D1CUR_SURFACE_ADDRESS), (uint32_t)(r->fb_start_gpu + r->cursor_off));
+    wreg(r, crtc_reg(r, D1CUR_SIZE), (63u << 16) | 63u);
+    wreg(r, crtc_reg(r, D1CUR_HOT_SPOT), ((uint32_t)r->cursor_hot_x << 16) | (uint32_t)r->cursor_hot_y);
+    wreg(r, crtc_reg(r, D1CUR_CONTROL), CURSOR_EN | (CURSOR_MODE_ARGB_PREMUL << CURSOR_MODE_SHIFT));
+    wreg(r, crtc_reg(r, D1CUR_UPDATE), 0);
+}
 static bool radeon_set_cursor(struct gpu_device *g, const uint32_t *argb, int w, int h, int hot_x, int hot_y) {
     struct radeon *r = g->priv;
     if (w > 64 || h > 64) return false;
-    uint32_t *dst = (uint32_t *)(r->vram + r->cursor_off);
     for (int y = 0; y < 64; y++) for (int x = 0; x < 64; x++) {
         uint32_t p = (x < w && y < h) ? argb[y * w + x] : 0;
         uint32_t a = p >> 24;
         /* the AVIVO cursor expects premultiplied alpha */
         uint32_t rr = ((p >> 16) & 0xFF) * a / 255, gg = ((p >> 8) & 0xFF) * a / 255, bb = (p & 0xFF) * a / 255;
-        dst[y * 64 + x] = (a << 24) | (rr << 16) | (gg << 8) | bb;
+        r->cursor_img[y * 64 + x] = (a << 24) | (rr << 16) | (gg << 8) | bb;
     }
-    wreg(r, crtc_reg(r, D1CUR_UPDATE), CURSOR_UPDATE_LOCK);
-    wreg(r, crtc_reg(r, D1CUR_SURFACE_ADDRESS), (uint32_t)(r->fb_start_gpu + r->cursor_off));
-    wreg(r, crtc_reg(r, D1CUR_SIZE), (63u << 16) | 63u);
-    wreg(r, crtc_reg(r, D1CUR_HOT_SPOT), ((uint32_t)hot_x << 16) | (uint32_t)hot_y);
-    wreg(r, crtc_reg(r, D1CUR_CONTROL), CURSOR_EN | (CURSOR_MODE_ARGB_PREMUL << CURSOR_MODE_SHIFT));
-    wreg(r, crtc_reg(r, D1CUR_UPDATE), 0);
+    r->cursor_hot_x = hot_x; r->cursor_hot_y = hot_y; r->cursor_valid = true;
+    radeon_cursor_upload(r);
     return true;
 }
 static void radeon_move_cursor(struct gpu_device *g, int x, int y, bool visible) {
@@ -219,10 +298,14 @@ static bool probe(struct pci_device *pd, const struct chip_info *ci) {
     if (model) snprintf(r->gpu.name, sizeof r->gpu.name, "ATI %s", model);
     else snprintf(r->gpu.name, sizeof r->gpu.name, "ATI %s [%04x]", ci->chip, pd->device);
     snprintf(r->gpu.bus, sizeof r->gpu.bus, "PCI %02x:%02x.%d", pd->bus, pd->slot, pd->func);
+    r->pd = pd;
     r->is_rs880 = !strcmp(ci->chip, "RS880");
-    /* BAR0: VRAM aperture (prefetchable), BAR2: registers (64 KiB) */
+    /* display engine: RV770 and the RS880 IGP are DCE 3.0, RV710/RV730/RV740 DCE 3.2 */
+    r->dce32 = !strcmp(ci->chip, "RV730") || !strcmp(ci->chip, "RV710") || !strcmp(ci->chip, "RV740");
+    /* BAR0: VRAM aperture (prefetchable), BAR2: registers (64 KiB), an I/O BAR for AtomBIOS indirect I/O */
     uint64_t vram_bar = 0, mmio_bar = 0;
     for (int i = 0; i < 6; i++) {
+        if (!pd->bar_is_mmio[i] && (pd->bar[i] & 1) && (pd->bar[i] & ~3u) && !r->io_port) r->io_port = (uint16_t)(pd->bar[i] & ~3u);
         if (!pd->bar_is_mmio[i] || !pd->bar_addr[i]) continue;
         bool prefetch = pd->bar[i] & 8;
         if (prefetch && !vram_bar) vram_bar = pd->bar_addr[i];
@@ -255,7 +338,7 @@ static bool probe(struct pci_device *pd, const struct chip_info *ci) {
     r->scan_off = r->scan_gpu_addr - r->fb_start_gpu;
     kprintf("radeon: %s (%s, %d SPs) at %s, VRAM %lu MiB (aperture %lu MiB), MC fb %lx-%lx\n", r->gpu.name, ci->chip, ci->sps, r->gpu.bus, memsize >> 20, r->aper_len >> 20, r->fb_start_gpu, fb_end_gpu);
     kprintf("radeon: crtc%d scanout %ux%u pitch %u px, surface %08x (VRAM offset %lx), format %s\n", r->crtc, r->width, r->height, r->pitch_px, r->scan_gpu_addr, r->scan_off, (grph & 3) == 2 ? "32bpp" : "non-32bpp");
-    parse_atombios(r);
+    if (find_rom(r, pd)) parse_atombios(r);
     /* verify the bootloader framebuffer is this scanout surface */
     struct limine_framebuffer *fb = framebuffer_request.response && framebuffer_request.response->framebuffer_count ? framebuffer_request.response->framebuffers[0] : NULL;
     uint64_t fb_phys = fb ? (uint64_t)fb->address - hhdm_offset : 0;
@@ -274,6 +357,7 @@ static bool probe(struct pci_device *pd, const struct chip_info *ci) {
             r->gpu.back_buffer = radeon_back_buffer; r->gpu.flip = radeon_flip;
             r->gpu.set_cursor = radeon_set_cursor; r->gpu.move_cursor = radeon_move_cursor;
             kprintf("radeon: scanout verified; page flipping (back buffer at %lx) and hardware cursor enabled\n", next);
+            if (r->rom) radeon_kms_init(r);
         } else kprintf("radeon: scanout verified; not enough aperture for a back buffer\n");
     } else kprintf("radeon: bootloader framebuffer is not this adapter's scanout; using the software path\n");
     gpu_register(&r->gpu);

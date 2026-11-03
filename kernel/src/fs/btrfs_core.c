@@ -12,8 +12,11 @@
 #include "string.h"
 
 /* ------------------------------------------------------------ chunk map */
-static void add_chunk(struct btrfs_fs *fs, uint64_t logical, const struct btrfs_chunk *c) {
-    if (fs->nchunks >= MAX_CHUNKS) return;
+static void add_chunk(struct btrfs_fs *fs, uint64_t logical, const struct btrfs_chunk *c, uint32_t size) {
+    if (size < sizeof *c || !c->num_stripes || size < sizeof *c + (uint64_t)c->num_stripes * sizeof(struct btrfs_stripe) || !c->length || logical + c->length < logical) {
+        kprintf("btrfs: malformed chunk item at %lx, mounting read-only\n", logical); fs->readonly = true; return;
+    }
+    if (fs->nchunks >= MAX_CHUNKS) { if (!fs->readonly) kprintf("btrfs: more than %d chunks, mounting read-only\n", MAX_CHUNKS); fs->readonly = true; return; }
     struct chunk_map *m = &fs->chunks[fs->nchunks++];
     m->logical = logical; m->length = c->length; m->type = c->type;
     m->nstripes = MIN(c->num_stripes, 4);
@@ -65,15 +68,28 @@ static void cache_remove(struct btrfs_fs *fs, struct tree_block *b) {
     fs->ncached--;
     kfree(b->data); kfree(b);
 }
+/* blocks touched during the current operation may be referenced by a live btrfs_path: never evict those */
 static void cache_evict(struct btrfs_fs *fs) {
     while (fs->ncached > CACHE_MAX) {
         struct tree_block *victim = NULL;
-        for (int i = 0; i < CACHE_BUCKETS; i++) for (struct tree_block *b = fs->cache[i]; b; b = b->hnext) if (!b->dirty && !b->pinned && (!victim || b->lru < victim->lru)) victim = b;
+        for (int i = 0; i < CACHE_BUCKETS; i++) for (struct tree_block *b = fs->cache[i]; b; b = b->hnext) if (!b->dirty && !b->pinned && b->lru < fs->op_start && (!victim || b->lru < victim->lru)) victim = b;
         if (!victim) break;
         cache_remove(fs, victim);
     }
 }
+void btrfs_op_begin(struct btrfs_fs *fs) { fs->op_start = fs->lru_clock + 1; cache_evict(fs); }
 static uint32_t block_csum(struct btrfs_fs *fs, const uint8_t *data) { return ~crc32c(~0u, data + BTRFS_CSUM_SIZE, fs->nodesize - BTRFS_CSUM_SIZE); }
+/* structural checks (like Linux's tree-checker) so later code can trust counts and item bounds */
+static bool block_ok(struct btrfs_fs *fs, struct tree_block *b) {
+    struct btrfs_header *h = (struct btrfs_header *)b->data;
+    uint32_t n = h->nritems, space = fs->nodesize - sizeof(struct btrfs_header);
+    if (h->level >= BTRFS_MAX_LEVEL) return false;
+    if (h->level) return n >= 1 && n <= space / sizeof(struct btrfs_key_ptr);
+    if ((uint64_t)n * sizeof(struct btrfs_item) > space) return false;
+    uint32_t end = space;
+    for (uint32_t i = 0; i < n; i++) { struct btrfs_item *it = btrfs_leaf_item(b, i); if ((uint64_t)it->offset + it->size != end) return false; end = it->offset; }
+    return end >= n * sizeof(struct btrfs_item);
+}
 
 struct tree_block *btrfs_read_block(struct btrfs_fs *fs, uint64_t logical) {
     struct tree_block *b = cache_lookup(fs, logical);
@@ -85,7 +101,8 @@ struct tree_block *btrfs_read_block(struct btrfs_fs *fs, uint64_t logical) {
     struct btrfs_header *h = (struct btrfs_header *)b->data;
     if (h->bytenr != logical) { kprintf("btrfs: block %lx has bytenr %lx\n", logical, h->bytenr); kfree(b->data); kfree(b); return NULL; }
     uint32_t want; memcpy(&want, h->csum, 4);
-    if (want != block_csum(fs, b->data)) kprintf("btrfs: checksum mismatch on tree block %lx\n", logical);
+    if (want != block_csum(fs, b->data)) { kprintf("btrfs: checksum mismatch on tree block %lx\n", logical); kfree(b->data); kfree(b); return NULL; }
+    if (!block_ok(fs, b)) { kprintf("btrfs: corrupt tree block %lx\n", logical); kfree(b->data); kfree(b); return NULL; }
     cache_evict(fs);
     cache_insert(fs, b);
     return b;
@@ -148,6 +165,7 @@ static int bin_search(struct tree_block *b, const struct btrfs_key *key, int *ex
 int btrfs_search(struct btrfs_fs *fs, struct btrfs_tree *tree, const struct btrfs_key *key, struct btrfs_path *p) {
     memset(p, 0, sizeof *p);
     uint64_t bytenr = tree->bytenr; int level = tree->level;
+    if (level < 0 || level >= BTRFS_MAX_LEVEL) { kprintf("btrfs: tree %lu has bad level %d\n", tree->objectid, level); return -EIO; }
     p->tree = tree; p->top = level;
     for (;;) {
         struct tree_block *b = btrfs_read_block(fs, bytenr);
@@ -221,8 +239,10 @@ static void persist_root(struct btrfs_fs *fs, struct btrfs_tree *tree) {
         struct btrfs_key *fk = btrfs_path_key(&p);
         if (fk->objectid != tree->objectid || fk->type != BTRFS_ROOT_ITEM_KEY) return;
     }
-    struct btrfs_root_item *ri = btrfs_path_data(&p);
-    ri->bytenr = tree->bytenr; ri->level = tree->level; ri->generation = tree->generation; ri->generation_v2 = tree->generation;
+    struct btrfs_root_item *ri = btrfs_path_data(&p); uint32_t isz = btrfs_path_size(&p);
+    if (isz < offsetof(struct btrfs_root_item, level) + 1) return;
+    ri->bytenr = tree->bytenr; ri->level = tree->level; ri->generation = tree->generation;
+    if (isz >= offsetof(struct btrfs_root_item, generation_v2) + 8) ri->generation_v2 = tree->generation;   /* old, short root items lack it */
     btrfs_mark_dirty(fs, p.blocks[0]);
 }
 
@@ -233,6 +253,7 @@ int btrfs_load_tree(struct btrfs_fs *fs, uint64_t objectid, struct btrfs_tree *o
     if (r == 1) { if (btrfs_prev_item(fs, &p)) return -ENOENT; }
     struct btrfs_key *fk = btrfs_path_key(&p);
     if (fk->objectid != objectid || fk->type != BTRFS_ROOT_ITEM_KEY) return -ENOENT;
+    if (btrfs_path_size(&p) < offsetof(struct btrfs_root_item, level) + 1) return -EIO;
     struct btrfs_root_item *ri = btrfs_path_data(&p);
     out->objectid = objectid; out->bytenr = ri->bytenr; out->level = ri->level; out->generation = ri->generation;
     return 0;
@@ -300,6 +321,7 @@ static void node_delete_raw(struct btrfs_fs *fs, struct tree_block *node, int sl
 /* insert a pointer into the parent at 'level' (creating a new root if needed). Path slots above are updated. */
 static int insert_ptr(struct btrfs_fs *fs, struct btrfs_path *p, int level, const struct btrfs_key *key, uint64_t blockptr) {
     struct btrfs_tree *tree = p->tree;
+    if (level >= BTRFS_MAX_LEVEL) return -ENOSPC;
     if (level > p->top) {
         /* grow the tree: new root with two pointers */
         uint64_t nb = btrfs_alloc_tree_block(fs, tree->objectid);
@@ -449,17 +471,20 @@ int btrfs_resize_item(struct btrfs_fs *fs, struct btrfs_path *p, uint32_t new_si
         uint8_t *tmp = kmalloc(new_size); memcpy(tmp, btrfs_item_data(leaf, p->slots[0]), old); memset(tmp + old, 0, new_size - old);
         btrfs_delete_item(fs, p);
         int r = btrfs_insert_item(fs, p->tree, &key, tmp, new_size, p);
+        if (r < 0) btrfs_insert_item(fs, p->tree, &key, tmp, old, p);   /* best effort: put the old item back */
         kfree(tmp);
         return r;
     }
+    /* the head of the item is kept (callers compact toward the front / append at the end). Its end is
+     * fixed by the previous slot, so its kept bytes and all data of later slots move by -delta. */
     int n = btrfs_nritems(leaf), slot = p->slots[0];
     uint8_t *base = leaf->data + sizeof(struct btrfs_header);
-    uint32_t data_end = btrfs_leaf_item(leaf, n - 1)->offset;
-    int32_t delta = (int32_t)new_size - (int32_t)it->size;
-    /* move data of slots >= slot by -delta */
-    memmove(base + data_end - delta, base + data_end, it->offset - data_end);
+    uint32_t data_end = btrfs_leaf_item(leaf, n - 1)->offset, old = it->size;
+    int32_t delta = (int32_t)new_size - (int32_t)old;
+    memmove(base + data_end - delta, base + data_end, it->offset + MIN(old, new_size) - data_end);
     for (int i = slot; i < n; i++) btrfs_leaf_item(leaf, i)->offset -= delta;
     it->size = new_size;
+    if (delta > 0) memset(base + it->offset + old, 0, delta);
     btrfs_mark_dirty(fs, leaf);
     return 0;
 }
@@ -475,7 +500,7 @@ static int adjust_block_group(struct btrfs_fs *fs, uint64_t bytenr, int64_t delt
     if (!m) return -EIO;
     struct btrfs_key k = { m->logical, BTRFS_BLOCK_GROUP_ITEM_KEY, m->length };
     struct btrfs_path p;
-    if (btrfs_search(fs, t, &k, &p) != 0) { kprintf("btrfs: block group %lx not found\n", m->logical); return -EIO; }
+    if (btrfs_search(fs, t, &k, &p) != 0 || btrfs_path_size(&p) < sizeof(struct btrfs_block_group_item)) { kprintf("btrfs: block group %lx not found\n", m->logical); return -EIO; }
     struct btrfs_block_group_item *bgi = btrfs_path_data(&p);
     bgi->used += delta;
     btrfs_mark_dirty(fs, p.blocks[0]);
@@ -499,7 +524,7 @@ static int fst_adjust_count(struct btrfs_fs *fs, uint64_t start, int delta) {
     if (!m) return -EIO;
     struct btrfs_key k = { m->logical, BTRFS_FREE_SPACE_INFO_KEY, m->length };
     struct btrfs_path p;
-    if (btrfs_search(fs, &fs->fst, &k, &p) != 0) { fst_invalidate(fs, "missing free space info"); return -EIO; }
+    if (btrfs_search(fs, &fs->fst, &k, &p) != 0 || btrfs_path_size(&p) < sizeof(struct btrfs_free_space_info)) { fst_invalidate(fs, "missing free space info"); return -EIO; }
     struct btrfs_free_space_info *info = btrfs_path_data(&p);
     if (info->flags & 1) { fst_invalidate(fs, "bitmap format"); return -EIO; }
     info->extent_count += delta;
@@ -649,7 +674,7 @@ int btrfs_alloc_chunk(struct btrfs_fs *fs, uint64_t type, uint64_t want) {
     ch.c.io_align = 65536; ch.c.io_width = 65536; ch.c.sector_size = fs->sectorsize; ch.c.num_stripes = 1; ch.c.sub_stripes = 1;
     ch.s.devid = fs->sb.dev_item.devid; ch.s.offset = phys; memcpy(ch.s.dev_uuid, fs->sb.dev_item.uuid, 16);
     /* register in the chunk map first so tree blocks for the bookkeeping can land in it if needed */
-    add_chunk(fs, logical, &ch.c);
+    add_chunk(fs, logical, &ch.c, sizeof ch);
     struct btrfs_key k = { BTRFS_FIRST_CHUNK_TREE_OBJECTID, BTRFS_CHUNK_ITEM_KEY, logical };
     int r = btrfs_insert_item(fs, &fs->chunk_tree, &k, &ch, sizeof ch, NULL);
     if (r == 0) {
@@ -679,8 +704,8 @@ int btrfs_alloc_chunk(struct btrfs_fs *fs, uint64_t type, uint64_t want) {
 
 uint64_t btrfs_alloc_tree_block(struct btrfs_fs *fs, uint64_t owner) {
     uint64_t type = owner == BTRFS_CHUNK_TREE_OBJECTID ? BTRFS_BLOCK_GROUP_SYSTEM : BTRFS_BLOCK_GROUP_METADATA;
+    /* metadata never goes into data chunks; chunk tree blocks only into SYSTEM chunks */
     uint64_t b = btrfs_alloc_extent(fs, fs->nodesize, type);
-    if (!b) b = btrfs_alloc_extent(fs, fs->nodesize, BTRFS_BLOCK_GROUP_DATA | BTRFS_BLOCK_GROUP_METADATA);
     if (!b && type == BTRFS_BLOCK_GROUP_METADATA && btrfs_alloc_chunk(fs, BTRFS_BLOCK_GROUP_METADATA, 256ull << 20) == 0) b = btrfs_alloc_extent(fs, fs->nodesize, type);
     if (!b) { kprintf("btrfs: out of metadata space\n"); return 0; }
     fs->alloc_hint[1] = b + fs->nodesize;
@@ -725,7 +750,7 @@ static void unrecord_tree_block(struct btrfs_fs *fs, struct pending_block *pb) {
         r = btrfs_search(fs, &fs->extent_tree, &k, &p);
         if (r == 1 && !btrfs_path_normalize(fs, &p)) { struct btrfs_key *fk = btrfs_path_key(&p); r = (fk->objectid == pb->bytenr && fk->type == BTRFS_METADATA_ITEM_KEY) ? 0 : 1; }
     }
-    if (r != 0) { kprintf("btrfs: no extent item for tree block %lx\n", pb->bytenr); return; }
+    if (r != 0 || btrfs_path_size(&p) < sizeof(struct btrfs_extent_item)) { kprintf("btrfs: no extent item for tree block %lx\n", pb->bytenr); return; }
     struct btrfs_extent_item *ei = btrfs_path_data(&p);
     if (ei->refs > 1) { ei->refs--; btrfs_mark_dirty(fs, p.blocks[0]); return; }
     btrfs_delete_item(fs, &p);
@@ -775,7 +800,7 @@ uint64_t btrfs_alloc_data(struct btrfs_fs *fs, uint64_t len) {
 int btrfs_free_data_extent(struct btrfs_fs *fs, uint64_t bytenr, uint64_t len, uint64_t root, uint64_t ino, uint64_t file_off) {
     struct btrfs_key k = { bytenr, BTRFS_EXTENT_ITEM_KEY, len };
     struct btrfs_path p;
-    if (btrfs_search(fs, &fs->extent_tree, &k, &p) != 0) { kprintf("btrfs: data extent %lx+%lx not found\n", bytenr, len); return -EIO; }
+    if (btrfs_search(fs, &fs->extent_tree, &k, &p) != 0 || btrfs_path_size(&p) < sizeof(struct btrfs_extent_item)) { kprintf("btrfs: data extent %lx+%lx not found\n", bytenr, len); return -EIO; }
     struct btrfs_extent_item *ei = btrfs_path_data(&p);
     uint32_t size = btrfs_path_size(&p);
     if (ei->refs <= 1) {
@@ -790,6 +815,7 @@ int btrfs_free_data_extent(struct btrfs_fs *fs, uint64_t bytenr, uint64_t len, u
     while (q < end) {
         uint8_t type = q[0];
         if (type == BTRFS_EXTENT_DATA_REF_KEY) {
+            if (q + 29 > end) break;
             struct btrfs_extent_data_ref *ref = (struct btrfs_extent_data_ref *)(q + 1);
             if (ref->root == root && ref->objectid == ino && ref->offset == file_off) {
                 ei->refs--;
@@ -913,13 +939,16 @@ void btrfs_begin(struct btrfs_fs *fs) { fs->any_dirty = true; fs->dirty_super = 
 
 /* ------------------------------------------------------------ mount */
 static int parse_sys_chunks(struct btrfs_fs *fs) {
+    if (fs->sb.sys_chunk_array_size > sizeof fs->sb.sys_chunk_array) return -EIO;
     uint8_t *p = fs->sb.sys_chunk_array, *end = p + fs->sb.sys_chunk_array_size;
     while (p + sizeof(struct btrfs_key) + sizeof(struct btrfs_chunk) <= end) {
         struct btrfs_key *k = (struct btrfs_key *)p;
         struct btrfs_chunk *c = (struct btrfs_chunk *)(p + sizeof(struct btrfs_key));
         if (k->type != BTRFS_CHUNK_ITEM_KEY) break;
-        add_chunk(fs, k->offset, c);
-        p += sizeof(struct btrfs_key) + sizeof(struct btrfs_chunk) + c->num_stripes * sizeof(struct btrfs_stripe);
+        uint32_t csz = sizeof(struct btrfs_chunk) + c->num_stripes * sizeof(struct btrfs_stripe);
+        if (!c->num_stripes || csz > (uint32_t)(end - (uint8_t *)c)) return -EIO;
+        add_chunk(fs, k->offset, c, csz);
+        p += sizeof(struct btrfs_key) + csz;
     }
     return fs->nchunks ? 0 : -EIO;
 }
@@ -933,7 +962,7 @@ static int load_chunk_tree(struct btrfs_fs *fs) {
     while (!btrfs_path_normalize(fs, &p)) {
         struct btrfs_key *ik = btrfs_path_key(&p);
         if (ik->objectid != BTRFS_FIRST_CHUNK_TREE_OBJECTID || ik->type != BTRFS_CHUNK_ITEM_KEY) { if (btrfs_next_item(fs, &p)) break; continue; }
-        add_chunk(fs, ik->offset, btrfs_path_data(&p));
+        add_chunk(fs, ik->offset, btrfs_path_data(&p), btrfs_path_size(&p));
         if (btrfs_next_item(fs, &p)) break;
     }
     struct tree_block *root = btrfs_read_block(fs, fs->sb.chunk_root);
@@ -947,9 +976,9 @@ struct btrfs_fs *btrfs_open(struct blockdev *dev) {
     if (blockdev_read_bytes(dev, BTRFS_SUPER_OFFSET, &fs->sb, sizeof fs->sb) < 0 || memcmp(fs->sb.magic, BTRFS_MAGIC, 8)) { kfree(fs); return NULL; }
     if (fs->sb.csum_type != 0) { kprintf("btrfs: %s: unsupported checksum type %d\n", dev->name, fs->sb.csum_type); kfree(fs); return NULL; }
     uint32_t want; memcpy(&want, fs->sb.csum, 4);
-    if (want != super_csum(&fs->sb)) kprintf("btrfs: %s: superblock checksum mismatch\n", dev->name);
+    if (want != super_csum(&fs->sb)) { kprintf("btrfs: %s: superblock checksum mismatch\n", dev->name); kfree(fs); return NULL; }
     fs->nodesize = fs->sb.nodesize; fs->sectorsize = fs->sb.sectorsize;
-    if (fs->nodesize < 4096 || fs->nodesize > 65536 || fs->sb.num_devices != 1) { kprintf("btrfs: %s: unsupported layout (nodesize %u, %lu devices)\n", dev->name, fs->nodesize, fs->sb.num_devices); kfree(fs); return NULL; }
+    if (fs->nodesize < 4096 || fs->nodesize > 65536 || (fs->nodesize & (fs->nodesize - 1)) || fs->sectorsize < 512 || (fs->sectorsize & (fs->sectorsize - 1)) || fs->sectorsize > fs->nodesize || fs->sb.num_devices != 1) { kprintf("btrfs: %s: unsupported layout (nodesize %u, %lu devices)\n", dev->name, fs->nodesize, fs->sb.num_devices); kfree(fs); return NULL; }
     fs->transid = fs->sb.generation + 1;
     fs->readonly = (fs->sb.incompat_flags & (BTRFS_FEATURE_INCOMPAT_RAID56 | BTRFS_FEATURE_INCOMPAT_ZONED | BTRFS_FEATURE_INCOMPAT_EXTENT_TREE_V2)) != 0;
     if (parse_sys_chunks(fs) < 0) { kprintf("btrfs: %s: no system chunks\n", dev->name); kfree(fs); return NULL; }

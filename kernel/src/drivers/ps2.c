@@ -31,6 +31,7 @@ static const char keymap_shift[128] = {
 };
 static int kmods;
 static bool e0;
+static int e1;   /* bytes still to swallow after an E1 prefix (Pause: E1 1D 45 E1 9D C5) */
 
 static int special_key(uint8_t sc, bool ext) {
     if (ext) switch (sc) {
@@ -54,10 +55,13 @@ static int special_key(uint8_t sc, bool ext) {
 static void keyboard_irq(struct regs *r, void *ctx) {
     uint8_t sc = inb(0x60);
     lapic_eoi();
+    if (sc == 0xE1) { e1 = 2; e0 = false; return; }
+    if (e1) { e1--; return; }
     if (sc == 0xE0) { e0 = true; return; }
     bool ext = e0; e0 = false;
     bool release = sc & 0x80; sc &= 0x7F;
     int key = special_key(sc, ext);
+    if (ext && !key) return;   /* PrintScreen, its fake shifts, media keys */
     int modbit = 0;
     switch (key) {
         case KEY_LSHIFT: case KEY_RSHIFT: modbit = MOD_SHIFT; break;

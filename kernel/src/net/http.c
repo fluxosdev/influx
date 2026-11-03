@@ -36,7 +36,7 @@ bool url_parse(const char *s, struct url *u) {
     const char *host_end = pc ? pc : hend;
     size_t hl = host_end - p;
     if (hl >= sizeof u->host) return false;
-    for (size_t i = 0; i < hl; i++) u->host[i] = tolower(p[i]);
+    for (size_t i = 0; i < hl; i++) { if ((unsigned char)p[i] <= ' ' || p[i] == 0x7F) return false; u->host[i] = tolower(p[i]); }
     if (!strcmp(u->scheme, "https")) u->port = 443;
     else if (!strcmp(u->scheme, "http")) u->port = 80;
     if (pc && pc + 1 < hend) {
@@ -249,14 +249,26 @@ static int fetch_once(const struct http_request *req, const char *url, const cha
     }
     char hosthdr[300];
     if (u.port != 80) snprintf(hosthdr, sizeof hosthdr, "%s:%u", u.host, u.port); else strlcpy(hosthdr, u.host, sizeof hosthdr);
-    char *head = kmalloc(4096);
-    int hl = snprintf(head, 4096, "%s %s HTTP/1.1\r\nHost: %s\r\nUser-Agent: " HTTP_UA "\r\n"
+    /* control characters, spaces and non-ASCII would break (or inject into) the request line */
+    static const char hex[] = "0123456789ABCDEF";
+    char *epath = kmalloc(3 * sizeof u.path);
+    size_t ep = 0;
+    for (const unsigned char *q = (const unsigned char *)u.path; *q; q++) {
+        if (*q <= ' ' || *q >= 0x7F || *q == '"' || *q == '<' || *q == '>') { epath[ep++] = '%'; epath[ep++] = hex[*q >> 4]; epath[ep++] = hex[*q & 15]; }
+        else epath[ep++] = *q;
+    }
+    epath[ep] = 0;
+    const int HEADSZ = 8192;
+    char *head = kmalloc(HEADSZ);
+    int hl = snprintf(head, HEADSZ, "%s %s HTTP/1.1\r\nHost: %s\r\nUser-Agent: " HTTP_UA "\r\n"
                       "Accept: text/html,application/xhtml+xml,text/plain;q=0.9,image/png,image/jpeg,image/gif,*/*;q=0.5\r\n"
                       "Accept-Encoding: identity\r\nAccept-Language: en\r\nConnection: close\r\n",
-                      method, u.path, hosthdr);
-    if (rbody) hl += snprintf(head + hl, 4096 - hl, "Content-Type: %s\r\nContent-Length: %zu\r\n", req->content_type ? req->content_type : "application/x-www-form-urlencoded", rbody_len);
-    hl += snprintf(head + hl, 4096 - hl, "\r\n");
-    int64_t sent = tcp_send(c, head, MIN(hl, 4095));
+                      method, epath, hosthdr);
+    kfree(epath);
+    hl = MIN(hl, HEADSZ - 1);
+    if (rbody) { hl += snprintf(head + hl, HEADSZ - hl, "Content-Type: %s\r\nContent-Length: %zu\r\n", req->content_type ? req->content_type : "application/x-www-form-urlencoded", rbody_len); hl = MIN(hl, HEADSZ - 1); }
+    hl += snprintf(head + hl, HEADSZ - hl, "\r\n");
+    int64_t sent = tcp_send(c, head, MIN(hl, HEADSZ - 1));
     kfree(head);
     if (sent >= 0 && rbody && rbody_len) sent = tcp_send(c, rbody, rbody_len);
     if (sent < 0) { tcp_abort(c); set_error(resp, "Sending the request failed: %s.", strerr((int)-sent)); return (int)sent; }
@@ -264,7 +276,7 @@ static int fetch_once(const struct http_request *req, const char *url, const cha
     if (req->progress) req->progress(req->progress_ctx, "Waiting", 0, 0);
     struct buf raw = { 0 }, body = { 0 };
     size_t max_body = req->max_body ? req->max_body : 16 * 1024 * 1024;
-    size_t header_end = 0;
+    size_t header_end = 0, wire = 0;
     int64_t content_length = -1;
     bool chunked_enc = false, no_body = false, complete = false;
     struct chunked ch = { 0 };
@@ -279,37 +291,47 @@ static int fetch_once(const struct http_request *req, const char *url, const cha
         }
         if (n == 0) { complete = header_end != 0; if (!complete) { result = -EPROTO; set_error(resp, "The server closed the connection without sending a response."); } break; }
         if (!buf_append(&raw, tmp, n)) { result = -ENOMEM; set_error(resp, "The page is too large."); break; }
-        if (!header_end) {
+        wire += n;
+        while (!header_end && !result) {
             char *e = strstr((char *)raw.d, "\r\n\r\n");
-            if (!e) { if (raw.len > 64 * 1024) { result = -EPROTO; set_error(resp, "The server sent malformed headers."); break; } continue; }
+            if (!e) { if (raw.len > 64 * 1024) { result = -EPROTO; set_error(resp, "The server sent malformed headers."); } break; }
             header_end = (uint8_t *)e - raw.d + 4;
             /* status line */
             char *sp = strchr((char *)raw.d, ' ');
-            if (strncmp((char *)raw.d, "HTTP/", 5) || !sp) { result = -EPROTO; set_error(resp, "The server did not answer with HTTP."); break; }
+            if (strncmp((char *)raw.d, "HTTP/", 5) || !sp || sp > e) { result = -EPROTO; set_error(resp, "The server did not answer with HTTP."); break; }
             resp->status = atoi(sp + 1);
             char *reason = strchr(sp + 1, ' ');
             char *eol = strstr((char *)raw.d, "\r\n");
             if (reason && reason < eol) { size_t rl = MIN((size_t)(eol - reason - 1), sizeof resp->status_text - 1); memcpy(resp->status_text, reason + 1, rl); resp->status_text[rl] = 0; }
             size_t hlen = header_end - (eol + 2 - (char *)raw.d);
+            kfree(resp->headers);
             resp->headers = kmalloc(hlen + 1);
             memcpy(resp->headers, eol + 2, hlen); resp->headers[hlen] = 0;
-            char v[256];
+            char v[sizeof resp->location];
+            content_length = -1; chunked_enc = false; resp->location[0] = 0; resp->content_type[0] = 0;
             if (http_header(resp, "Content-Length", v, sizeof v)) content_length = strtol(v, NULL, 10);
-            if (http_header(resp, "Transfer-Encoding", v, sizeof v) && strstr(v, "chunked")) chunked_enc = true;
+            if (http_header(resp, "Transfer-Encoding", v, sizeof v)) { for (char *q = v; *q; q++) *q = tolower(*q); if (strstr(v, "chunked")) chunked_enc = true; }
             if (http_header(resp, "Content-Type", v, sizeof v)) strlcpy(resp->content_type, v, sizeof resp->content_type);
             if (http_header(resp, "Location", v, sizeof v)) strlcpy(resp->location, v, sizeof resp->location);
-            if (resp->status == 100) {   /* interim response: discard it and keep reading */
-                memmove(raw.d, raw.d + header_end, raw.len - header_end); raw.len -= header_end;
-                header_end = 0; kfree(resp->headers); resp->headers = NULL; resp->location[0] = 0;
+            if (resp->status >= 100 && resp->status < 200 && resp->status != 101) {
+                /* interim response (100 Continue, 103 Early Hints): discard it; the final one may already be buffered */
+                memmove(raw.d, raw.d + header_end, raw.len - header_end + 1); raw.len -= header_end;
+                header_end = 0; resp->status_text[0] = 0; kfree(resp->headers); resp->headers = NULL;
                 continue;
             }
             no_body = !strcmp(method, "HEAD") || resp->status == 204 || resp->status == 304 || (resp->status >= 100 && resp->status < 200);
             ch.pos = header_end;
         }
+        if (result) break;
+        if (!header_end) continue;
         if (no_body) { complete = true; break; }
         if (chunked_enc) {
             chunked_feed(&ch, &raw, &body);
             if (ch.state == 4) { complete = true; break; }
+            /* drop the consumed wire bytes so raw only holds the unparsed tail */
+            memmove(raw.d + header_end, raw.d + ch.pos, raw.len - ch.pos + 1);
+            raw.len -= ch.pos - header_end; ch.pos = header_end;
+            if (raw.len - header_end > 64 * 1024 || wire > 4 * max_body + (1 << 20)) { result = -EPROTO; set_error(resp, "The server sent a malformed chunked response."); break; }
         } else {
             size_t have = raw.len - header_end;
             if (content_length >= 0 && have >= (size_t)content_length) { complete = true; break; }

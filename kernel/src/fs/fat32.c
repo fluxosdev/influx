@@ -24,19 +24,20 @@ struct fat {
     uint32_t spc, reserved, nfats, fat_size, root_cluster, total_sectors, nclusters, data_start;
     uint32_t *fat;             /* cached FAT (first copy) */
     bool fat_dirty;
-    uint32_t next_free;
+    uint32_t next_free, gen;   /* gen: bumped whenever a dirent's cluster/size changes */
     char label[12];
     struct mutex lock;
     struct vnode *root;
 };
-struct fnode { struct vnode vn; struct fat *fs; uint32_t cluster; uint32_t dir_cluster; int dir_index; struct fnode *hnext; bool is_root; };
+struct fnode { struct vnode vn; struct fat *fs; uint32_t cluster; uint32_t dir_cluster; int dir_index; struct fnode *hnext; bool is_root, gone; uint32_t gen; uint8_t sname[11]; };
 static const struct vnode_ops fat_ops;
 
-static int read_sectors(struct fat *f, uint32_t lba, uint32_t n, void *buf) { return blockdev_read(f->dev, lba, n, buf); }
-static int write_sectors(struct fat *f, uint32_t lba, uint32_t n, const void *buf) { return blockdev_write(f->dev, lba, n, buf); }
-static uint32_t cluster_lba(struct fat *f, uint32_t c) { return f->data_start + (c - 2) * f->spc; }
-static uint32_t fat_get(struct fat *f, uint32_t c) { return c < f->nclusters + 2 ? f->fat[c] & FAT_MASK : EOC; }
-static void fat_set(struct fat *f, uint32_t c, uint32_t v) { f->fat[c] = (f->fat[c] & 0xF0000000) | (v & FAT_MASK); f->fat_dirty = true; }
+static int read_sectors(struct fat *f, uint64_t lba, uint32_t n, void *buf) { return blockdev_read(f->dev, lba, n, buf); }
+static int write_sectors(struct fat *f, uint64_t lba, uint32_t n, const void *buf) { return blockdev_write(f->dev, lba, n, buf); }
+#define CLUS_OK(f, c) ((c) >= 2 && (c) < (f)->nclusters + 2)
+static uint64_t cluster_lba(struct fat *f, uint32_t c) { return f->data_start + (uint64_t)(c - 2) * f->spc; }
+static uint32_t fat_get(struct fat *f, uint32_t c) { return CLUS_OK(f, c) ? f->fat[c] & FAT_MASK : EOC; }
+static void fat_set(struct fat *f, uint32_t c, uint32_t v) { if (!CLUS_OK(f, c)) return; f->fat[c] = (f->fat[c] & 0xF0000000) | (v & FAT_MASK); f->fat_dirty = true; }
 static void fat_flush(struct fat *f) {
     if (!f->fat_dirty) return;
     for (uint32_t i = 0; i < f->nfats; i++) write_sectors(f, f->reserved + i * f->fat_size, f->fat_size, f->fat);
@@ -59,7 +60,7 @@ static uint32_t alloc_cluster(struct fat *f, uint32_t prev) {
     }
     return 0;
 }
-static void free_chain(struct fat *f, uint32_t c) { while (c >= 2 && c < EOC) { uint32_t n = fat_get(f, c); fat_set(f, c, 0); c = n; } }
+static void free_chain(struct fat *f, uint32_t c) { while (CLUS_OK(f, c)) { uint32_t n = fat_get(f, c); fat_set(f, c, 0); c = n; } }
 static uint64_t chain_length(struct fat *f, uint32_t c) { uint64_t n = 0; while (c >= 2 && c < EOC && n < f->nclusters) { n++; c = fat_get(f, c); } return n; }
 
 /* ---- names ---- */
@@ -88,19 +89,19 @@ static void name_from_83(const uint8_t *n, char *out) {
 }
 
 /* ---- directory iteration ---- */
-struct dir_iter { struct fat *f; uint32_t cluster; uint32_t sector_in_cluster; int index_in_sector; uint8_t sec[512]; bool loaded; int global_index; char lfn[260]; int lfn_len; uint8_t lfn_sum; bool lfn_valid; };
+struct dir_iter { struct fat *f; uint32_t cluster, nclus; uint32_t sector_in_cluster; int index_in_sector; uint8_t sec[512]; bool loaded; int global_index; char lfn[260]; int lfn_len; uint8_t lfn_sum; bool lfn_valid; };
 static bool dir_iter_init(struct dir_iter *it, struct fat *f, uint32_t cluster) { memset(it, 0, sizeof *it); it->f = f; it->cluster = cluster; it->lfn_len = 0; return true; }
 /* returns pointer to the next raw entry (or NULL at end); fills LFN state */
 static struct dirent83 *dir_iter_next_raw(struct dir_iter *it) {
     for (;;) {
         if (!it->loaded) {
-            if (it->cluster < 2 || it->cluster >= EOC) return NULL;
+            if (!CLUS_OK(it->f, it->cluster) || it->nclus > it->f->nclusters) return NULL;   /* end, bad or cyclic chain */
             if (read_sectors(it->f, cluster_lba(it->f, it->cluster) + it->sector_in_cluster, 1, it->sec) < 0) return NULL;
             it->loaded = true; it->index_in_sector = 0;
         }
         if (it->index_in_sector >= 16) {
             it->loaded = false; it->index_in_sector = 0;
-            if (++it->sector_in_cluster >= it->f->spc) { it->sector_in_cluster = 0; it->cluster = fat_get(it->f, it->cluster); }
+            if (++it->sector_in_cluster >= it->f->spc) { it->sector_in_cluster = 0; it->cluster = fat_get(it->f, it->cluster); it->nclus++; }
             continue;
         }
         struct dirent83 *e = (struct dirent83 *)(it->sec + it->index_in_sector * 32);
@@ -113,9 +114,9 @@ static int dir_iter_next(struct dir_iter *it, struct dirent83 *out, char *name, 
     it->lfn_len = 0; it->lfn_valid = false;
     uint16_t lfn_u[260]; int lfn_total = 0;
     for (;;) {
-        uint32_t cur_cluster = it->cluster; int cur_index = it->sector_in_cluster * 16 + it->index_in_sector;
         struct dirent83 *e = dir_iter_next_raw(it);
         if (!e) return 0;
+        uint32_t cur_cluster = it->cluster; int cur_index = it->sector_in_cluster * 16 + it->index_in_sector - 1;   /* after any cluster advance */
         if (e->name[0] == 0) return 0;
         if (e->name[0] == 0xE5) { lfn_total = 0; continue; }
         if (e->attr == ATTR_LFN) {
@@ -142,7 +143,8 @@ static int dir_iter_next(struct dir_iter *it, struct dirent83 *out, char *name, 
 /* read/write one raw directory entry by (cluster, index within cluster) */
 static int dirent_rw(struct fat *f, uint32_t cluster, int index, struct dirent83 *e, bool write) {
     uint8_t sec[512];
-    uint32_t lba = cluster_lba(f, cluster) + index / 16;
+    if (!CLUS_OK(f, cluster)) return -EIO;
+    uint64_t lba = cluster_lba(f, cluster) + index / 16;
     if (read_sectors(f, lba, 1, sec) < 0) return -EIO;
     if (write) { memcpy(sec + (index % 16) * 32, e, 32); return write_sectors(f, lba, 1, sec); }
     memcpy(e, sec + (index % 16) * 32, 32);
@@ -168,7 +170,7 @@ static struct fnode *make_fnode(struct fat *f, const char *name, struct dirent83
     n->vn.type = (e->attr & ATTR_DIR) ? VN_DIR : VN_FILE;
     n->vn.size = e->size; n->vn.mtime = fat_to_unix(e->mdate, e->mtime); n->vn.mode = (e->attr & ATTR_DIR) ? 0755 : 0644;
     n->cluster = ((uint32_t)e->clus_hi << 16) | e->clus_lo; n->vn.ino = n->cluster;
-    n->dir_cluster = dir_cluster; n->dir_index = dir_index;
+    n->dir_cluster = dir_cluster; n->dir_index = dir_index; n->gen = f->gen; memcpy(n->sname, e->name, 11);
     n->vn.ops = &fat_ops; n->vn.fs = f; n->vn.fs_name = "fat32"; n->vn.refcount = 1;
     return n;
 }
@@ -196,24 +198,38 @@ static int f_readdir(struct vnode *dirv, int index, struct dirent *out) {
     mutex_unlock(&f->lock);
     return r;
 }
-static int64_t f_read(struct vnode *v, uint64_t off, void *buf, size_t n) {
-    struct fnode *fn = (struct fnode *)v; struct fat *f = fn->fs;
+/* another handle may have rewritten (or deleted) the file since this fnode was made: re-read its dirent */
+static void refresh_fnode(struct fat *f, struct fnode *fn) {
+    if (fn->is_root || fn->gone || fn->vn.type != VN_FILE || fn->gen == f->gen) return;
+    struct dirent83 e;
+    if (dirent_rw(f, fn->dir_cluster, fn->dir_index, &e, false) < 0) return;
+    if (memcmp(e.name, fn->sname, 11) || (e.attr & (ATTR_DIR | 0x08)) || e.attr == ATTR_LFN) { fn->gone = true; fn->cluster = 0; fn->vn.size = 0; return; }
+    fn->cluster = ((uint32_t)e.clus_hi << 16) | e.clus_lo; fn->vn.size = e.size; fn->gen = f->gen;
+}
+static int64_t read_locked(struct fat *f, struct fnode *fn, uint64_t off, void *buf, size_t n) {
+    struct vnode *v = &fn->vn;
     if (off >= v->size) return 0;
     if (off + n > v->size) n = v->size - off;
-    mutex_lock(&f->lock);
     uint32_t csize = f->spc * 512;
     uint32_t c = fn->cluster; uint64_t skip = off / csize;
-    while (skip-- && c >= 2 && c < EOC) c = fat_get(f, c);
+    while (skip-- && CLUS_OK(f, c)) c = fat_get(f, c);
     uint8_t *tmp = kmalloc(csize); size_t done = 0; uint32_t in = off % csize;
-    while (done < n && c >= 2 && c < EOC) {
+    while (done < n && CLUS_OK(f, c)) {
         if (read_sectors(f, cluster_lba(f, c), f->spc, tmp) < 0) break;
         size_t take = MIN(n - done, csize - in);
         memcpy((uint8_t *)buf + done, tmp + in, take);
         done += take; in = 0; c = fat_get(f, c);
     }
     kfree(tmp);
-    mutex_unlock(&f->lock);
     return done;
+}
+static int64_t f_read(struct vnode *v, uint64_t off, void *buf, size_t n) {
+    struct fnode *fn = (struct fnode *)v; struct fat *f = fn->fs;
+    mutex_lock(&f->lock);
+    refresh_fnode(f, fn);
+    int64_t r = read_locked(f, fn, off, buf, n);
+    mutex_unlock(&f->lock);
+    return r;
 }
 static int update_dirent(struct fat *f, struct fnode *fn) {
     if (fn->is_root) return 0;
@@ -223,35 +239,41 @@ static int update_dirent(struct fat *f, struct fnode *fn) {
     fat_time(&e.mdate, &e.mtime); e.adate = e.mdate;
     return dirent_rw(f, fn->dir_cluster, fn->dir_index, &e, true);
 }
-/* whole-file rewrite */
+/* whole-file rewrite: the new chain is written and linked from the dirent before the old one is freed */
 static int write_whole(struct fat *f, struct fnode *fn, const uint8_t *data, uint64_t size) {
+    if (fn->gone) return -ENOENT;
     uint32_t csize = f->spc * 512;
-    free_chain(f, fn->cluster); fn->cluster = 0;
-    uint32_t prev = 0, first = 0;
+    uint32_t prev = 0, first = 0, old = fn->cluster; uint64_t old_size = fn->vn.size;
     uint8_t *tmp = kmalloc(csize);
     for (uint64_t off = 0; off < size; off += csize) {
         uint32_t c = alloc_cluster(f, prev);
-        if (!c) { kfree(tmp); fat_flush(f); return -ENOSPC; }
+        if (!c) { kfree(tmp); free_chain(f, first); return -ENOSPC; }
         if (!first) first = c;
         size_t take = MIN((uint64_t)csize, size - off);
         memcpy(tmp, data + off, take); if (take < csize) memset(tmp + take, 0, csize - take);
-        if (write_sectors(f, cluster_lba(f, c), f->spc, tmp) < 0) { kfree(tmp); return -EIO; }
+        if (write_sectors(f, cluster_lba(f, c), f->spc, tmp) < 0) { kfree(tmp); free_chain(f, first); return -EIO; }
         prev = c;
     }
     kfree(tmp);
-    fn->cluster = first; fn->vn.size = size; fn->vn.mtime = time_unix();
     fat_flush(f);
-    return update_dirent(f, fn);
+    fn->cluster = first; fn->vn.size = size; fn->vn.mtime = time_unix();
+    int r = update_dirent(f, fn);
+    if (r < 0) { fn->cluster = old; fn->vn.size = old_size; free_chain(f, first); fat_flush(f); return r; }
+    f->gen++; fn->gen = f->gen;
+    free_chain(f, old);
+    fat_flush(f);
+    return 0;
 }
 static int64_t f_write(struct vnode *v, uint64_t off, const void *buf, size_t n) {
     struct fnode *fn = (struct fnode *)v; struct fat *f = fn->fs;
     if (n == 0) return 0;
-    uint64_t newsize = MAX(v->size, off + n);
-    if (newsize > 64ull << 20) return -ENOSPC;
-    uint8_t *content = kzalloc(newsize);
-    if (v->size) f_read(v, 0, content, v->size);
-    memcpy(content + off, buf, n);
+    if (off > 64ull << 20 || n > (64ull << 20) - off) return -ENOSPC;
     mutex_lock(&f->lock);
+    refresh_fnode(f, fn);
+    uint64_t newsize = MAX(v->size, off + n);
+    uint8_t *content = kzalloc(newsize);
+    if (v->size) read_locked(f, fn, 0, content, v->size);
+    memcpy(content + off, buf, n);
     int r = write_whole(f, fn, content, newsize);
     mutex_unlock(&f->lock);
     kfree(content);
@@ -259,10 +281,12 @@ static int64_t f_write(struct vnode *v, uint64_t off, const void *buf, size_t n)
 }
 static int f_truncate(struct vnode *v, uint64_t size) {
     struct fnode *fn = (struct fnode *)v; struct fat *f = fn->fs;
-    if (size == v->size) return 0;
-    uint8_t *content = kzalloc(size ? size : 1);
-    if (size && v->size) f_read(v, 0, content, MIN(size, v->size));
+    if (size > 64ull << 20) return -ENOSPC;
     mutex_lock(&f->lock);
+    refresh_fnode(f, fn);
+    if (size == v->size) { mutex_unlock(&f->lock); return 0; }
+    uint8_t *content = kzalloc(size ? size : 1);
+    if (size && v->size) read_locked(f, fn, 0, content, MIN(size, v->size));
     int r = write_whole(f, fn, content, size);
     mutex_unlock(&f->lock);
     kfree(content);
@@ -274,7 +298,8 @@ static int dir_find_slots(struct fat *f, uint32_t dir_cluster, int count, uint32
     uint32_t c = dir_cluster, prev = 0;
     int run = 0; uint32_t run_c = 0; int run_i = 0;
     uint8_t sec[512];
-    while (c >= 2 && c < EOC) {
+    for (uint32_t k = 0; CLUS_OK(f, c); k++) {
+        if (k > f->nclusters) return -EIO;   /* cyclic chain */
         for (uint32_t s = 0; s < f->spc; s++) {
             if (read_sectors(f, cluster_lba(f, c) + s, 1, sec) < 0) return -EIO;
             for (int i = 0; i < 16; i++) {
@@ -288,7 +313,8 @@ static int dir_find_slots(struct fat *f, uint32_t dir_cluster, int count, uint32
     /* extend */
     uint32_t nc = alloc_cluster(f, prev);
     if (!nc) return -ENOSPC;
-    uint8_t *z = kzalloc(f->spc * 512); write_sectors(f, cluster_lba(f, nc), f->spc, z); kfree(z);
+    uint8_t *z = kzalloc(f->spc * 512); int r = write_sectors(f, cluster_lba(f, nc), f->spc, z); kfree(z);
+    if (r < 0) { if (prev) fat_set(f, prev, EOC); fat_set(f, nc, 0); return -EIO; }
     if (run) { /* a run may continue into the new cluster only if it was at the end; keep it simple: start fresh */ }
     *out_cluster = nc; *out_index = 0;
     return count <= (int)(f->spc * 16) ? 0 : -ENOSPC;
@@ -375,6 +401,7 @@ static int f_unlink(struct vnode *dirv, const char *name) {
         }
         free_chain(f, ((uint32_t)e.clus_hi << 16) | e.clus_lo);
         fat_flush(f);
+        f->gen++;
         r = 0; break;
     }
     mutex_unlock(&f->lock);
@@ -384,18 +411,24 @@ static int f_sync(struct vnode *v) { struct fnode *n = (struct fnode *)v; mutex_
 static const struct vnode_ops fat_ops = { f_read, f_write, f_truncate, f_lookup, f_readdir, f_create, f_unlink, NULL, f_release, f_sync };
 
 struct vnode *fat32_mount(struct blockdev *d) {
+    if (d->sector_size != 512) return NULL;   /* the driver assumes 512-byte sectors throughout */
     uint8_t *sec = kmalloc(512);
     if (blockdev_read(d, 0, 1, sec) < 0) { kfree(sec); return NULL; }
     struct bpb *b = (struct bpb *)sec;
     if (sec[510] != 0x55 || sec[511] != 0xAA || b->bytes_per_sec != 512 || b->fat16_size != 0 || b->fat_size == 0 || memcmp(b->fstype, "FAT32   ", 8)) { kfree(sec); return NULL; }
+    uint64_t total = b->total32 ? b->total32 : b->total16, data_start = b->reserved + (uint64_t)b->nfats * b->fat_size;
+    uint8_t spc = b->sec_per_clus;
+    if (!spc || (spc & (spc - 1)) || !b->reserved || !b->nfats || b->nfats > 4 || total > d->sectors || data_start >= total) { kprintf("fat32: %s: bad geometry\n", d->name); kfree(sec); return NULL; }
     struct fat *f = kzalloc(sizeof *f);
-    f->dev = d; f->spc = b->sec_per_clus; f->reserved = b->reserved; f->nfats = b->nfats; f->fat_size = b->fat_size; f->root_cluster = b->root_cluster;
-    f->total_sectors = b->total32 ? b->total32 : b->total16;
-    f->data_start = f->reserved + f->nfats * f->fat_size;
-    f->nclusters = (f->total_sectors - f->data_start) / f->spc;
+    f->dev = d; f->spc = spc; f->reserved = b->reserved; f->nfats = b->nfats; f->fat_size = b->fat_size; f->root_cluster = b->root_cluster;
+    f->total_sectors = total;
+    f->data_start = data_start;
+    f->nclusters = MIN((total - data_start) / spc, (uint64_t)f->fat_size * 128 - 2);   /* also bounded by the FAT's capacity */
+    if (f->nclusters > 0x0FFFFFF5) f->nclusters = 0x0FFFFFF5;
     memcpy(f->label, b->label, 11); f->label[11] = 0; for (int i = 10; i >= 0 && f->label[i] == ' '; i--) f->label[i] = 0;
     kfree(sec);
     if ((uint64_t)f->fat_size * 512 > 32ull << 20) { kprintf("fat32: %s: FAT too large to cache\n", d->name); kfree(f); return NULL; }
+    if (!CLUS_OK(f, f->root_cluster)) { kprintf("fat32: %s: bad root cluster\n", d->name); kfree(f); return NULL; }
     f->fat = kmalloc(f->fat_size * 512);
     if (blockdev_read(d, f->reserved, f->fat_size, f->fat) < 0) { kfree(f->fat); kfree(f); return NULL; }
     f->next_free = 2;
@@ -414,6 +447,7 @@ struct vnode *fat32_mount(struct blockdev *d) {
 
 /* ---- formatter ---- */
 int fat32_format(struct blockdev *d, const char *label) {
+    if (d->sector_size != 512) return -EINVAL;
     uint64_t total = d->sectors;
     if (total < 70000) return -ENOSPC;    /* FAT32 needs at least 65525 clusters */
     uint32_t spc = total < (512ull << 11) ? 1 : total < (8ull << 21) ? 8 : 32;

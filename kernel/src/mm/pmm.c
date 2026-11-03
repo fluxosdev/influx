@@ -74,6 +74,26 @@ uint64_t pmm_alloc_pages(size_t count) {
 }
 uint64_t pmm_alloc_page(void) { return pmm_alloc_pages(1); }
 
+/* for DMA by devices that only address 32 bits; 0 when the low 4 GiB is full */
+uint64_t pmm_alloc_pages_low(size_t count) {
+    if (!count) return 0;
+    uint64_t limit = MIN(bitmap_pages, (4ULL << 30) / PAGE_SIZE), run = 0;
+    spin_lock(&lock);
+    for (uint64_t p = 1; p < limit; p++) {
+        if (bm_test(p)) { run = 0; continue; }
+        if (++run == count) {
+            uint64_t first = p + 1 - count;
+            for (uint64_t q = first; q <= p; q++) bm_set(q);
+            free_pages -= count;
+            spin_unlock(&lock);
+            memset(P2V(first * PAGE_SIZE), 0, count * PAGE_SIZE);
+            return first * PAGE_SIZE;
+        }
+    }
+    spin_unlock(&lock);
+    return 0;
+}
+
 void pmm_free_pages(uint64_t phys, size_t count) {
     spin_lock(&lock);
     uint64_t first = phys / PAGE_SIZE;

@@ -5,7 +5,7 @@
 #include "arch.h"
 
 #define MAX_FDS 64
-#define KSTACK_SIZE (64 * 1024)
+#define KSTACK_SIZE (128 * 1024)   /* the shell's command path alone needs about 90 KiB */
 
 enum thread_state { THREAD_READY, THREAD_RUNNING, THREAD_BLOCKED, THREAD_SLEEPING, THREAD_ZOMBIE };
 
@@ -52,7 +52,9 @@ struct process {
     char cwd[256];
     uint64_t brk_start, brk;
     int exit_code;
-    bool exited;
+    bool exited;                  /* every thread gone and resources released: ready to reap */
+    bool reaping;                 /* a process_wait() has claimed it */
+    int nthreads;                 /* threads not yet in thread_exit */
     struct waitq exit_wq;
     uint64_t heap_bytes;          /* kernel heap bytes owned by this process */
     uint64_t start_time;

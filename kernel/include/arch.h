@@ -37,6 +37,7 @@ uint64_t cpu_tsc_hz(void);
 /* ACPI */
 void acpi_init(uint64_t rsdp);
 void *acpi_find_table(const char *sig);
+void *acpi_map_phys(uint64_t phys, size_t len);   /* HHDM pointer, mapping firmware ranges the HHDM lacks */
 struct madt_info {
     uint64_t lapic_addr;
     uint64_t ioapic_addr;

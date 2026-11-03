@@ -1,4 +1,4 @@
-/* OpenGL Demo: a lit, textured cube and a torus rendered through inFlux OpenGL. */
+/* OpenGL Demo: a lit, mipmapped cube (vertex arrays) and a specular torus (display list) rendered through inFlux OpenGL. */
 #include "ui.h"
 #include "gpu.h"
 #include "mm.h"
@@ -11,7 +11,7 @@ static const struct menu_item view_items[] = { MENU("Wireframe", DCMD_WIRE, 'w',
 static const struct menu menus[] = { { "File", file_items, ARRAY_LEN(file_items) }, { "View", view_items, ARRAY_LEN(view_items) } };
 static const struct app_menus demo_menus = { menus, ARRAY_LEN(menus) };
 
-struct demo { struct window *w; GLcontext *gl; GLuint tex; float angle; bool wire, light, texture, spin, cull; int frames; uint64_t fps_t; int fps; int drag_x, drag_y; bool dragging; float rot_x, rot_y; };
+struct demo { struct window *w; GLcontext *gl; GLuint tex, torus; float angle; bool wire, light, texture, spin, cull; int frames; uint64_t fps_t; int fps; int drag_x, drag_y; bool dragging; float rot_x, rot_y; };
 
 static void make_texture(struct demo *d) {
     const int N = 64; GLubyte *px = kmalloc(N * N * 3);
@@ -22,25 +22,33 @@ static void make_texture(struct demo *d) {
         if (((x & 7) == 0) || ((y & 7) == 0)) { p[0] = p[0] * 3 / 4; p[1] = p[1] * 3 / 4; p[2] = p[2] * 3 / 4; }
     }
     glGenTextures(1, &d->tex); glBindTexture(GL_TEXTURE_2D, d->tex);
-    glTexImage2D(GL_TEXTURE_2D, 0, GL_RGB, N, N, 0, GL_RGB, GL_UNSIGNED_BYTE, px);
+    gluBuild2DMipmaps(GL_TEXTURE_2D, GL_RGB, N, N, GL_RGB, GL_UNSIGNED_BYTE, px);
+    glTexParameteri(GL_TEXTURE_2D, GL_TEXTURE_MIN_FILTER, GL_LINEAR_MIPMAP_LINEAR);
     glTexParameteri(GL_TEXTURE_2D, GL_TEXTURE_MAG_FILTER, GL_LINEAR);
     kfree(px);
 }
 
-static void draw_cube(void) {
+/* the cube as vertex arrays: 6 faces x 4 corners of position, normal, colour, texcoord */
+static float cube_v[24][3], cube_n[24][3], cube_c[24][3], cube_t[24][2];
+static void build_cube(void) {
     static const float n[6][3] = { { 0, 0, 1 }, { 0, 0, -1 }, { 1, 0, 0 }, { -1, 0, 0 }, { 0, 1, 0 }, { 0, -1, 0 } };
     static const float v[6][4][3] = {
         { { -1, -1, 1 }, { 1, -1, 1 }, { 1, 1, 1 }, { -1, 1, 1 } }, { { 1, -1, -1 }, { -1, -1, -1 }, { -1, 1, -1 }, { 1, 1, -1 } },
         { { 1, -1, 1 }, { 1, -1, -1 }, { 1, 1, -1 }, { 1, 1, 1 } }, { { -1, -1, -1 }, { -1, -1, 1 }, { -1, 1, 1 }, { -1, 1, -1 } },
         { { -1, 1, 1 }, { 1, 1, 1 }, { 1, 1, -1 }, { -1, 1, -1 } }, { { -1, -1, -1 }, { 1, -1, -1 }, { 1, -1, 1 }, { -1, -1, 1 } } };
     static const float col[6][3] = { { 1, 0.3f, 0.3f }, { 0.3f, 1, 0.3f }, { 0.3f, 0.5f, 1 }, { 1, 0.9f, 0.3f }, { 1, 0.5f, 1 }, { 0.4f, 1, 1 } };
-    glBegin(GL_QUADS);
-    for (int f = 0; f < 6; f++) {
-        glNormal3fv(n[f]); glColor3fv(col[f]);
-        glTexCoord2f(0, 0); glVertex3fv(v[f][0]); glTexCoord2f(1, 0); glVertex3fv(v[f][1]);
-        glTexCoord2f(1, 1); glVertex3fv(v[f][2]); glTexCoord2f(0, 1); glVertex3fv(v[f][3]);
+    static const float tc[4][2] = { { 0, 0 }, { 1, 0 }, { 1, 1 }, { 0, 1 } };
+    for (int f = 0; f < 6; f++) for (int k = 0; k < 4; k++) {
+        int i = f * 4 + k;
+        memcpy(cube_v[i], v[f][k], sizeof cube_v[i]); memcpy(cube_n[i], n[f], sizeof cube_n[i]);
+        memcpy(cube_c[i], col[f], sizeof cube_c[i]); memcpy(cube_t[i], tc[k], sizeof cube_t[i]);
     }
-    glEnd();
+}
+static void draw_cube(void) {
+    glEnableClientState(GL_VERTEX_ARRAY); glEnableClientState(GL_NORMAL_ARRAY); glEnableClientState(GL_COLOR_ARRAY); glEnableClientState(GL_TEXTURE_COORD_ARRAY);
+    glVertexPointer(3, GL_FLOAT, 0, cube_v); glNormalPointer(GL_FLOAT, 0, cube_n); glColorPointer(3, GL_FLOAT, 0, cube_c); glTexCoordPointer(2, GL_FLOAT, 0, cube_t);
+    glDrawArrays(GL_QUADS, 0, 24);
+    glDisableClientState(GL_VERTEX_ARRAY); glDisableClientState(GL_NORMAL_ARRAY); glDisableClientState(GL_COLOR_ARRAY); glDisableClientState(GL_TEXTURE_COORD_ARRAY);
 }
 static void draw_torus(float R, float r, int nu, int nv) {
     for (int i = 0; i < nu; i++) {
@@ -61,7 +69,13 @@ static void draw_torus(float R, float r, int nu, int nv) {
     }
 }
 
+static void recreate(struct demo *d, int w, int h);
+
 static void render(struct demo *d) {
+    struct canvas *c = window_begin_draw(d->w);
+    int cw = c->w, ch = c->h;
+    mutex_unlock(&d->w->lock);
+    if (cw != glxGetWidth(d->gl) || ch != glxGetHeight(d->gl)) recreate(d, cw, ch);
     int W = glxGetWidth(d->gl), H = glxGetHeight(d->gl);
     glxMakeCurrent(d->gl);
     glViewport(0, 0, W, H);
@@ -71,7 +85,12 @@ static void render(struct demo *d) {
     glEnable(GL_DEPTH_TEST);
     if (d->cull) glEnable(GL_CULL_FACE); else glDisable(GL_CULL_FACE);
     glPolygonMode(GL_FRONT_AND_BACK, d->wire ? GL_LINE : GL_FILL);
-    if (d->light) { glEnable(GL_LIGHTING); glEnable(GL_LIGHT0); float pos[4] = { 2, 4, 6, 0 }, dif[4] = { 1, 1, 1, 1 }, amb[4] = { 0.25f, 0.25f, 0.3f, 1 }; glLightfv(GL_LIGHT0, GL_POSITION, pos); glLightfv(GL_LIGHT0, GL_DIFFUSE, dif); glLightModelfv(GL_LIGHT_MODEL_AMBIENT, amb); }
+    if (d->light) {
+        glEnable(GL_LIGHTING); glEnable(GL_LIGHT0); glEnable(GL_COLOR_MATERIAL);   /* glColor drives ambient and diffuse */
+        float pos[4] = { 2, 4, 6, 0 }, dif[4] = { 1, 1, 1, 1 }, amb[4] = { 0.25f, 0.25f, 0.3f, 1 }, spec[4] = { 0.6f, 0.6f, 0.6f, 1 };
+        glLightfv(GL_LIGHT0, GL_POSITION, pos); glLightfv(GL_LIGHT0, GL_DIFFUSE, dif); glLightModelfv(GL_LIGHT_MODEL_AMBIENT, amb);
+        glMaterialfv(GL_FRONT_AND_BACK, GL_SPECULAR, spec); glMaterialf(GL_FRONT_AND_BACK, GL_SHININESS, 32);
+    }
     else glDisable(GL_LIGHTING);
     /* floor grid */
     glDisable(GL_TEXTURE_2D); glPushMatrix(); glTranslatef(0, -1.6f, 0); glColor3f(0.3f, 0.3f, 0.36f);
@@ -84,16 +103,20 @@ static void render(struct demo *d) {
     glDisable(GL_TEXTURE_2D);
     /* torus */
     glPushMatrix(); glTranslatef(1.9f, 0.2f, 0); glRotatef(d->rot_x + d->angle * 1.3f, 1, 0.3f, 0); glRotatef(d->rot_y, 0, 1, 0);
-    draw_torus(1.0f, 0.42f, 28, 16); glPopMatrix();
+    glCallList(d->torus); glPopMatrix();
     /* present into the window with a HUD */
-    struct canvas *c = window_begin_draw(d->w);
-    memcpy(c->px, glxGetPixels(d->gl), (size_t)W * H * 4);
+    c = window_begin_draw(d->w);
+    {
+        int cw2 = MIN(W, c->w), ch2 = MIN(H, c->h);
+        uint32_t *src = glxGetPixels(d->gl);
+        for (int y = 0; y < ch2; y++) memcpy(c->px + (size_t)y * c->stride, src + (size_t)y * W, (size_t)cw2 * 4);
+    }
     char hud[160];
     snprintf(hud, sizeof hud, "%s  ·  %d fps  ·  %dx%d", glGetString(GL_RENDERER), d->fps, W, H);
     gfx_fill_rounded_rect(c, 8, 8, font_text_width(font_ui_small, hud) + 16, 20, 5, RGBA(0, 0, 0, 0x80));
     font_draw(c, font_ui_small, 16, 11, RGB(230, 230, 235), hud);
     const char *hint = "Drag to rotate · Space pauses · View menu toggles wireframe, lighting, texture";
-    font_draw(c, font_ui_small, 16, H - 20, RGBA(255, 255, 255, 0x90), hint);
+    font_draw(c, font_ui_small, 16, c->h - 20, RGBA(255, 255, 255, 0x90), hint);
     window_end_draw(d->w, NULL);
     d->frames++;
     if (system_ticks - d->fps_t >= 1000) { d->fps = d->frames; d->frames = 0; d->fps_t = system_ticks; }
@@ -104,11 +127,15 @@ static void recreate(struct demo *d, int w, int h) {
     d->gl = glxCreateContext(w, h);
     glxMakeCurrent(d->gl);
     make_texture(d);
+    /* the torus geometry never changes: compile it once per context */
+    d->torus = glGenLists(1);
+    glNewList(d->torus, GL_COMPILE); draw_torus(1.0f, 0.42f, 28, 16); glEndList();
 }
 
 void gldemo_main(void *arg) {
     struct demo *d = kzalloc(sizeof *d);
     d->light = d->texture = d->spin = d->cull = true;
+    build_cube();
     struct gpu_device *g = gpu_primary();
     char rn[128]; snprintf(rn, sizeof rn, "inFlux Software Rasterizer (%s)", g ? g->name : "framebuffer");
     glxSetRendererName(rn);

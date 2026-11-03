@@ -6,8 +6,9 @@ static struct vnode *root_vnode;
 static struct mutex vfs_mutex = MUTEX_INIT;
 
 struct mount { char path[PATH_MAX]; struct vnode *mountpoint; struct vnode *root; };
-static struct mount mounts[16];
+static struct mount mounts[VFS_MAX_MOUNTS];
 static int nmounts;
+static struct mutex mount_lock = MUTEX_INIT;   /* mounts[] / nmounts (USB hotplug vs. iteration) */
 
 void vfs_init(void) {
     root_vnode = tmpfs_create_root("tmpfs");
@@ -88,10 +89,12 @@ struct vnode *vfs_lookup_rel(const char *cwd, const char *path) {
 struct vnode *vfs_lookup(const char *path) { return vfs_lookup_rel("/", path); }
 
 int vfs_mount(const char *path, struct vnode *fsroot) {
+    if (nmounts >= VFS_MAX_MOUNTS) return -ENOSPC;
     struct vnode *mp = vfs_lookup(path);
     if (!mp) { vfs_mkdir(path); mp = vfs_lookup(path); }
     if (!mp || mp->type != VN_DIR) { vnode_unref(mp); return -ENOTDIR; }
-    if (nmounts >= 16) { vnode_unref(mp); return -ENOSPC; }
+    mutex_lock(&mount_lock);
+    if (nmounts >= VFS_MAX_MOUNTS) { mutex_unlock(&mount_lock); vnode_unref(mp); return -ENOSPC; }
     mp->mount_root = fsroot;
     vnode_ref(fsroot);
     fsroot->parent = mp->parent;
@@ -99,11 +102,13 @@ int vfs_mount(const char *path, struct vnode *fsroot) {
     mounts[nmounts].mountpoint = mp;
     mounts[nmounts].root = fsroot;
     nmounts++;
+    mutex_unlock(&mount_lock);
     kprintf("vfs: mounted %s on %s\n", fsroot->fs_name ? fsroot->fs_name : "?", path);
     return 0;
 }
 int vfs_unmount(const char *path) {
     char norm[PATH_MAX]; vfs_normalize("/", path, norm, sizeof norm);
+    mutex_lock(&mount_lock);
     for (int i = 0; i < nmounts; i++) {
         if (!strcmp(mounts[i].path, norm)) {
             if (mounts[i].root->ops->sync) mounts[i].root->ops->sync(mounts[i].root);
@@ -112,16 +117,22 @@ int vfs_unmount(const char *path) {
             vnode_unref(mounts[i].mountpoint);
             for (int j = i; j < nmounts - 1; j++) mounts[j] = mounts[j + 1];
             nmounts--;
+            mutex_unlock(&mount_lock);
             return 0;
         }
     }
+    mutex_unlock(&mount_lock);
     return -ENOENT;
 }
 int vfs_mount_count(void) { return nmounts; }
+static bool is_mount_root(struct vnode *v) { mutex_lock(&mount_lock); bool r = false; for (int i = 0; i < nmounts; i++) if (mounts[i].root == v) r = true; mutex_unlock(&mount_lock); return r; }
+/* may return NULL if the table shrank since vfs_mount_count(); fs roots are never freed */
 struct vnode *vfs_mount_at(int i, char *path, size_t n) {
-    if (i < 0 || i >= nmounts) return NULL;
-    if (path) strlcpy(path, mounts[i].path, n);
-    return mounts[i].root;
+    mutex_lock(&mount_lock);
+    struct vnode *r = NULL;
+    if (i >= 0 && i < nmounts) { if (path) strlcpy(path, mounts[i].path, n); r = mounts[i].root; }
+    mutex_unlock(&mount_lock);
+    return r;
 }
 
 int vfs_open_rel(const char *cwd, const char *path, int flags, struct file **out) {
@@ -231,7 +242,7 @@ int vfs_unlink(const char *path) {
     struct vnode *v = walk(norm, &parent, last);
     if (!v) { if (parent) vnode_unref(parent); mutex_unlock(&vfs_mutex); return -ENOENT; }
     int r = 0;
-    if (v->mount_root) r = -EACCES;
+    if (v->mount_root || is_mount_root(v)) r = -EBUSY;   /* walk() already stepped into the mounted fs */
     else if (v->type == VN_DIR) { struct dirent d; if (v->ops->readdir && v->ops->readdir(v, 0, &d) == 0) r = -ENOTEMPTY; }
     vnode_unref(v);
     if (r == 0) {
@@ -249,6 +260,7 @@ int vfs_read_file(const char *path, void **data, size_t *size) {
     struct file *f; int r = vfs_open(path, O_RDONLY, &f);
     if (r < 0) return r;
     size_t sz = f->vn->size;
+    if (sz >= pmm_free_bytes() / 2) { vfs_close(f); return -ENOMEM; }   /* kmalloc panics rather than fail */
     char *buf = kmalloc(sz + 1);
     size_t got = 0;
     while (got < sz) { int64_t n = vfs_read(f, buf + got, sz - got); if (n <= 0) break; got += n; }
@@ -269,21 +281,42 @@ int vfs_write_file(const char *path, const void *data, size_t size) {
 
 /* rename = copy + unlink (works across filesystems; directories only when empty) */
 int vfs_rename(const char *oldp, const char *newp) {
-    struct stat st; if (vfs_stat(oldp, &st) < 0) return -ENOENT;
-    if (st.type == VN_DIR) {
-        int r = vfs_mkdir(newp); if (r < 0) return r;
-        return vfs_unlink(oldp);
+    char a[PATH_MAX], b[PATH_MAX]; vfs_normalize("/", oldp, a, sizeof a); vfs_normalize("/", newp, b, sizeof b);
+    struct vnode *va = vfs_lookup(a); if (!va) return -ENOENT;
+    if (!strcmp(a, b)) { vnode_unref(va); return 0; }
+    /* the same file under another name (FAT is case-insensitive): copying onto itself would lose it */
+    struct vnode *vb = vfs_lookup(b);
+    bool same = vb && (vb == va || (va->fs && va->fs == vb->fs && va->fs_name && !strcmp(va->fs_name, "fat32") && !strcasecmp(a, b)));
+    int type = va->type; struct dirent de;
+    bool nonempty = type == VN_DIR && (va->ops->readdir && va->ops->readdir(va, 0, &de) == 0), busy = is_mount_root(va);
+    vnode_unref(va); vnode_unref(vb);
+    if (busy) return -EBUSY;
+    if (nonempty) return -ENOTEMPTY;   /* no recursive move: refuse instead of leaving a half-copied tree */
+    if (type == VN_DIR) {
+        if (same) return -EEXIST;
+        int r = vfs_mkdir(b); if (r < 0) return r;
+        r = vfs_unlink(a);
+        if (r < 0) vfs_unlink(b);
+        return r;
     }
     void *data; size_t sz;
-    int r = vfs_read_file(oldp, &data, &sz); if (r < 0) return r;
-    r = vfs_write_file(newp, data, sz);
+    int r = vfs_read_file(a, &data, &sz); if (r < 0) return r;
+    if (same) {   /* case-only change: the data is held in memory across the unlink, restored on failure */
+        r = vfs_unlink(a);
+        if (r == 0 && (r = vfs_write_file(b, data, sz)) < 0) vfs_write_file(a, data, sz);
+        kfree(data);
+        return r;
+    }
+    r = vfs_write_file(b, data, sz);
     kfree(data);
     if (r < 0) return r;
-    return vfs_unlink(oldp);
+    return vfs_unlink(a);
 }
 
 int vfs_sync(void) {
+    mutex_lock(&mount_lock);
     for (int i = 0; i < nmounts; i++) if (mounts[i].root->ops->sync) mounts[i].root->ops->sync(mounts[i].root);
+    mutex_unlock(&mount_lock);
     return 0;
 }
 

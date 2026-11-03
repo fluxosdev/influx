@@ -38,6 +38,7 @@ void gpu_init(void) {
 int gpu_list_modes(struct display_mode *out, int max) {
     static const struct display_mode common[] = { { 800, 600 }, { 1024, 768 }, { 1280, 720 }, { 1280, 800 }, { 1366, 768 }, { 1440, 900 }, { 1600, 900 }, { 1680, 1050 }, { 1920, 1080 }, { 1920, 1200 }, { 2560, 1440 } };
     struct gpu_device *g = gpu_primary();
+    if (g && g->list_modes) return g->list_modes(g, out, max);
     int n = 0;
     for (size_t i = 0; i < ARRAY_LEN(common) && n < max; i++) {
         if (g && g->modeset && (uint64_t)common[i].w * common[i].h * 4 > g->vram_bytes) continue;

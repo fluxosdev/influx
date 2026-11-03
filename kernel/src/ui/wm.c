@@ -226,6 +226,7 @@ void window_destroy(struct window *w) {
             if (!(t->flags & WIN_MINIMIZED)) set_focus_locked(t);
         }
         damage_add(rect_make(0, 0, scr_w, MENUBAR_H));
+        if (open_menu >= 0) { damage_add(rect_make(menu_popup.x - 30, menu_popup.y - 10, menu_popup.w + 60, menu_popup.h + 50)); open_menu = -1; menu_hover = -1; }
     }
     if (drag_win == w) drag_win = NULL;
     if (resize_win == w) resize_win = NULL;
@@ -291,14 +292,13 @@ static void raise_locked(struct window *w) {
     list_add_tail(&w->link, &windows);
     damage_add(win_shadow_rect(w));
 }
-void window_focus(struct window *w) {
-    mutex_lock(&wm_lock);
+static void focus_locked(struct window *w) {
     w->flags &= ~WIN_MINIMIZED;
     if (!(w->flags & WIN_VISIBLE)) { w->flags |= WIN_VISIBLE; list_add_tail(&w->link, &windows); }
     raise_locked(w);
     set_focus_locked(w);
-    mutex_unlock(&wm_lock);
 }
+void window_focus(struct window *w) { mutex_lock(&wm_lock); focus_locked(w); mutex_unlock(&wm_lock); }
 void window_minimize(struct window *w) {
     mutex_lock(&wm_lock);
     w->flags |= WIN_MINIMIZED;
@@ -309,6 +309,7 @@ void window_minimize(struct window *w) {
         list_for_each_entry(t, &windows, link) if (!(t->flags & WIN_MINIMIZED)) focused = t;   /* topmost visible */
         if (focused) { struct event e = { .type = EV_FOCUS }; window_post_event(focused, &e); damage_add(win_shadow_rect(focused)); }
         damage_add(rect_make(0, 0, scr_w, MENUBAR_H));
+        if (open_menu >= 0) { damage_add(rect_make(menu_popup.x - 30, menu_popup.y - 10, menu_popup.w + 60, menu_popup.h + 50)); open_menu = -1; menu_hover = -1; }
     }
     mutex_unlock(&wm_lock);
 }
@@ -356,11 +357,15 @@ bool window_wait_event(struct window *w, struct event *ev, int timeout_ms) {
 
 struct window *window_find(int id) { struct window *w; list_for_each_entry(w, &windows, link) if (w->id == id) return w; return NULL; }
 int window_list(struct window **out, int max) { int n = 0; struct window *w; mutex_lock(&wm_lock); list_for_each_entry(w, &windows, link) if (n < max) out[n++] = w; mutex_unlock(&wm_lock); return n; }
-struct window *window_top_of_process(struct process *p) {
+static struct window *top_of_process_locked(struct process *p) {
     struct window *w, *best = NULL;
     list_for_each_entry(w, &windows, link) if (w->owner == p) best = w;
     return best;
 }
+struct window *window_top_of_process(struct process *p) { mutex_lock(&wm_lock); struct window *w = top_of_process_locked(p); mutex_unlock(&wm_lock); return w; }
+/* look up and act on a process's top window under wm_lock, so it can't be destroyed in between */
+bool window_focus_process(struct process *p) { mutex_lock(&wm_lock); struct window *w = top_of_process_locked(p); if (w) focus_locked(w); mutex_unlock(&wm_lock); return w != NULL; }
+bool window_post_process(struct process *p, const struct event *ev) { mutex_lock(&wm_lock); struct window *w = top_of_process_locked(p); if (w) window_post_event(w, ev); mutex_unlock(&wm_lock); return w != NULL; }
 
 void clipboard_set(const char *text, size_t n) {
     mutex_lock(&wm_lock);
@@ -740,7 +745,7 @@ static void toggle_zoom(struct window *w) {
 }
 
 static void handle_menu_command(int cmd) {
-    if (cmd == CMD_ABOUT || cmd == CMD_SETTINGS || cmd == CMD_TASKMAN || cmd == CMD_RESTART || cmd == CMD_SHUTDOWN) { wm_system_command(cmd); return; }
+    if (cmd == CMD_ABOUT || cmd == CMD_SETTINGS || cmd == CMD_TASKMAN || cmd == CMD_RESTART || cmd == CMD_SHUTDOWN) { mutex_unlock(&wm_lock); wm_system_command(cmd); mutex_lock(&wm_lock); return; }
     if (!focused) return;
     if (cmd == CMD_CLOSE) { struct event e = { .type = EV_CLOSE }; window_post_event(focused, &e); return; }
     if (cmd == CMD_MINIMIZE) { struct window *f = focused; mutex_unlock(&wm_lock); window_minimize(f); mutex_lock(&wm_lock); return; }
@@ -756,7 +761,7 @@ static void on_mouse_button(const struct input_event *in) {
         if (open_menu != -1) {
             int item = menu_item_at(x, y);
             int title = menu_title_at(x, y);
-            if (item >= 0) { const struct menu *m = open_menu_def(); int cmd = m->items[item].cmd; close_menu(); handle_menu_command(cmd); }
+            if (item >= 0) { const struct menu *m = open_menu_def(); int cmd = m ? m->items[item].cmd : 0; close_menu(); if (m) handle_menu_command(cmd); }
             else if (title != -1 && title != open_menu) open_menu_idx(title);
             else close_menu();
             return;
@@ -823,8 +828,13 @@ static void on_mouse_button(const struct input_event *in) {
 
 static void on_mouse_move(const struct input_event *in) {
     struct rect old = cursor_rect();
-    mouse_x = CLAMP(mouse_x + in->dx, 0, scr_w - 1);
-    mouse_y = CLAMP(mouse_y + in->dy, 0, scr_h - 1);
+    if (in->abs) {
+        mouse_x = CLAMP((int)((int64_t)in->x * (scr_w - 1) / 65535), 0, scr_w - 1);
+        mouse_y = CLAMP((int)((int64_t)in->y * (scr_h - 1) / 65535), 0, scr_h - 1);
+    } else {
+        mouse_x = CLAMP(mouse_x + in->dx, 0, scr_w - 1);
+        mouse_y = CLAMP(mouse_y + in->dy, 0, scr_h - 1);
+    }
     if (hw_cursor) { struct gpu_device *g = gpu_primary(); g->move_cursor(g, mouse_x - 1, mouse_y - 1, true); }
     else { damage_add(old); damage_add(cursor_rect()); }
     int x = mouse_x, y = mouse_y;
@@ -903,6 +913,7 @@ static void on_key(const struct input_event *in) {
         if (open_menu != -1) {
             if (in->key == KEY_ESC) { close_menu(); return; }
             const struct menu *m = open_menu_def();
+            if (!m) { close_menu(); return; }
             if (in->key == KEY_DOWN || in->key == KEY_UP) {
                 int dir = in->key == KEY_DOWN ? 1 : -1, i = menu_hover;
                 for (int k = 0; k < m->count; k++) { i = (i + dir + m->count) % m->count; if (!m->items[i].separator && !m->items[i].disabled) break; }
@@ -926,8 +937,8 @@ static void on_key(const struct input_event *in) {
         if (cmd && k == 'w' && focused) { struct event e = { .type = EV_CLOSE }; window_post_event(focused, &e); return; }
         if (cmd && k == 'm' && focused && (focused->flags & WIN_MINIMIZABLE)) { struct window *f = focused; mutex_unlock(&wm_lock); window_minimize(f); mutex_lock(&wm_lock); return; }
         if (cmd && k == KEY_TAB) { cycle_windows(); return; }
-        if (cmd && k == ',') { wm_system_command(CMD_SETTINGS); return; }
-        if ((in->mods & MOD_CTRL) && (in->mods & MOD_ALT) && k == KEY_DELETE) { wm_system_command(CMD_TASKMAN); return; }
+        if (cmd && k == ',') { mutex_unlock(&wm_lock); wm_system_command(CMD_SETTINGS); mutex_lock(&wm_lock); return; }
+        if ((in->mods & MOD_CTRL) && (in->mods & MOD_ALT) && k == KEY_DELETE) { mutex_unlock(&wm_lock); wm_system_command(CMD_TASKMAN); mutex_lock(&wm_lock); return; }
         int mc;
         if (cmd && focused && menu_shortcut(focused->menus, in->key, in->mods, &mc, ctrl_alias)) { handle_menu_command(mc); return; }
     }

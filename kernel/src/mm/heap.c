@@ -21,8 +21,10 @@ void heap_init(void) {}
 
 static void account(int pid, int64_t delta) {
     if (pid <= 0) return;
+    uint64_t f = irq_save();   /* single CPU: nothing can free p until irqs come back */
     struct process *p = process_find(pid);
     if (p) p->heap_bytes += delta;
+    irq_restore(f);
 }
 
 static void refill(int b) {

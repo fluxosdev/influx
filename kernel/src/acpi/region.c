@@ -52,40 +52,54 @@ static uint64_t pci_cfg_read(uint8_t bus, uint8_t dev, uint8_t fn, uint16_t off,
     return v;
 }
 static void pci_cfg_write(uint8_t bus, uint8_t dev, uint8_t fn, uint16_t off, int width, uint64_t v) {
-    if (off >= 256) return;
-    if (width == 32 && !(off & 3)) { pci_write32(bus, dev, fn, off, v); return; }
-    for (int done = 0; done < width; done += 8, off++) {
-        uint32_t cur = pci_read32(bus, dev, fn, off & ~3), sh = (off & 3) * 8;
-        cur = (cur & ~(0xFFu << sh)) | (((v >> done) & 0xFF) << sh);
-        pci_write32(bus, dev, fn, off & ~3, cur);
+    for (int done = 0; done < width && off < 256; ) {   /* no dword read-modify-write: RW1C neighbours would be cleared */
+        if (!(off & 3) && width - done >= 32) { pci_write32(bus, dev, fn, off, v >> done); done += 32; off += 4; }
+        else if (!(off & 1) && width - done >= 16) { pci_write16(bus, dev, fn, off, v >> done); done += 16; off += 2; }
+        else { pci_write8(bus, dev, fn, off, v >> done); done += 8; off++; }
     }
 }
 
-/* PCI_Config regions address the device that contains them: _ADR gives
- * device/function, the root bridge's _BBN the bus, and every PCI-PCI bridge
- * on the way down moves to its secondary bus. */
+/* PCI_Config regions address the device that contains them (as ACPICA
+ * does): the nearest enclosing Device with an _ADR gives device/function,
+ * the root bridge's _BBN the bus, and every PCI-PCI bridge on the way down
+ * moves to its secondary bus. */
+static bool pci_root(struct aml_node *d) { return ns_hid_matches(d, "PNP0A03") || ns_hid_matches(d, "PNP0A08") || ns_child(d, "_BBN"); }
 static void pci_resolve(struct aml_obj *rgn) {
     if (rgn->region.pci_resolved) return;
     rgn->region.pci_resolved = true;
-    struct aml_node *chain[16]; int n = 0;
-    for (struct aml_node *d = rgn->region.node ? rgn->region.node->parent : NULL; d && d != aml_root && n < 16; d = d->parent) {
-        chain[n++] = d;
-        if (ns_hid_matches(d, "PNP0A03") || ns_hid_matches(d, "PNP0A08") || ns_child(d, "_BBN")) break;
+    struct aml_node *dev = NULL, *root = NULL, *chain[16]; int n = 0;
+    for (struct aml_node *d = rgn->region.node ? rgn->region.node->parent : NULL; d && d != aml_root; d = d->parent) {
+        if (!d->obj || d->obj->type != AML_DEVICE) continue;   /* methods, processors, ... */
+        bool is_root = pci_root(d);
+        if (!dev) { if (is_root || ns_child(d, "_ADR")) dev = d; }
+        else if (!is_root && n < 16 && ns_child(d, "_ADR")) chain[n++] = d;
+        if (is_root) { root = d; break; }
     }
     uint64_t bus = 0, adr = 0;
-    if (n && ns_child(chain[n - 1], "_BBN")) aml_eval_int(chain[n - 1], "_BBN", &bus);
-    for (int i = n - 2; i >= 1; i--) {   /* bridges between the root and the device */
-        if (aml_eval_int(chain[i], "_ADR", &adr) < 0) continue;
-        if (((pci_read32(bus, adr >> 16, adr & 7, 0x0C) >> 16) & 0x7F) != 1) continue;   /* not a PCI-PCI bridge */
-        uint8_t sec = (pci_read32(bus, adr >> 16, adr & 7, 0x18) >> 8) & 0xFF;
-        if (sec && sec != 0xFF) bus = sec;
+    if (root && ns_child(root, "_BBN")) aml_eval_int(root, "_BBN", &bus);
+    for (int i = n - 1; i >= 0; i--) {   /* devices between the root and the region's device, top down */
+        if (aml_eval_int(chain[i], "_ADR", &adr) < 0) break;
+        uint8_t sl = (adr >> 16) & 0x1F, f = adr & 7;
+        if ((pci_read32(bus, sl, f, 0) & 0xFFFF) == 0xFFFF) break;
+        uint8_t ht = (pci_read32(bus, sl, f, 0x0C) >> 16) & 0x7F;
+        if (ht != 1 && ht != 2) break;   /* not a PCI-PCI / CardBus bridge: nothing below it is on PCI */
+        uint8_t sec = (pci_read32(bus, sl, f, 0x18) >> 8) & 0xFF;
+        if (!sec || sec == 0xFF) break;
+        bus = sec;
     }
     adr = 0;
-    if (n) aml_eval_int(chain[0], "_ADR", &adr);
+    if (dev && ns_child(dev, "_ADR")) aml_eval_int(dev, "_ADR", &adr);
     rgn->region.bus = bus; rgn->region.dev = (adr >> 16) & 0x1F; rgn->region.fn = adr & 7;
 }
 
-static bool cmos_ok(uint64_t off) { return off < 128; }
+/* CMOS bank 0 at 0x70/0x71 (bit 7 of 0x70 is NMI disable: keep it), bank 1 at 0x72/0x73 */
+static uint64_t cmos_rw(uint64_t a, bool write, uint8_t v) {
+    if (a >= 256) return 0;
+    if (a < 128) outb(0x70, (inb(0x70) & 0x80) | a); else outb(0x72, a);
+    uint16_t data = a < 128 ? 0x71 : 0x73;
+    if (write) { outb(data, v); return 0; }
+    return inb(data);
+}
 
 static void unsupported(struct aml_obj *rgn) {
     static uint32_t warned;
@@ -105,7 +119,7 @@ uint64_t region_read(struct aml_obj *rgn, uint64_t off, int width) {
     case SPACE_IO: return io_read(a, width);
     case SPACE_PCI: pci_resolve(rgn); return pci_cfg_read(rgn->region.bus, rgn->region.dev, rgn->region.fn, a, width);
     case SPACE_EC: { uint64_t v = 0; for (int i = 0; i < width / 8; i++) v |= (uint64_t)ec_read(a + i) << (8 * i); return v; }
-    case SPACE_CMOS: if (cmos_ok(off)) { outb(0x70, off); return inb(0x71); } return 0;
+    case SPACE_CMOS: { uint64_t v = 0; for (int i = 0; i < width / 8; i++) v |= cmos_rw(a + i, false, 0) << (8 * i); return v; }
     default: unsupported(rgn); return 0;
     }
 }
@@ -117,7 +131,7 @@ void region_write(struct aml_obj *rgn, uint64_t off, int width, uint64_t v) {
     case SPACE_IO: io_write(a, width, v); break;
     case SPACE_PCI: pci_resolve(rgn); pci_cfg_write(rgn->region.bus, rgn->region.dev, rgn->region.fn, a, width, v); break;
     case SPACE_EC: for (int i = 0; i < width / 8; i++) ec_write(a + i, v >> (8 * i)); break;
-    case SPACE_CMOS: if (cmos_ok(off)) { outb(0x70, off); outb(0x71, v); } break;
+    case SPACE_CMOS: for (int i = 0; i < width / 8; i++) cmos_rw(a + i, true, v >> (8 * i)); break;
     default: unsupported(rgn); break;
     }
 }
@@ -217,7 +231,7 @@ static void field_xfer(struct aml_obj *f, uint8_t *data, bool write) {
 }
 
 static struct aml_obj *bits_to_obj(const uint8_t *data, uint64_t len) {
-    if (len > 64) return obj_buf(data, (len + 7) / 8);
+    if (len > (aml_int64 ? 64u : 32u)) return obj_buf(data, (len + 7) / 8);   /* wider than an Integer */
     uint64_t v = 0;
     for (uint64_t i = 0; i < (len + 7) / 8; i++) v |= (uint64_t)data[i] << (8 * i);
     return obj_int(v);
@@ -231,9 +245,15 @@ static uint8_t *obj_to_bits(struct aml_obj *v, uint64_t len) {
     return data;
 }
 
+/* LockRule = Lock: hold the global lock across the access (on a timeout, go ahead as before) */
+#define GL_FIELD_TIMEOUT_MS 1000
+static bool field_lock(struct aml_obj *f) { return (f->field.flags & 0x10) && acpi_gl_acquire(GL_FIELD_TIMEOUT_MS); }
+
 struct aml_obj *field_read(struct aml_obj *f) {
     uint8_t *data = kzalloc((f->field.bit_len + 7) / 8 + 8);
+    bool lk = field_lock(f);
     field_xfer(f, data, false);
+    if (lk) acpi_gl_release();
     struct aml_obj *r = bits_to_obj(data, f->field.bit_len);
     kfree(data);
     return r;
@@ -241,7 +261,9 @@ struct aml_obj *field_read(struct aml_obj *f) {
 
 void field_write(struct aml_obj *f, struct aml_obj *v) {
     uint8_t *data = obj_to_bits(v, f->field.bit_len);
+    bool lk = field_lock(f);
     field_xfer(f, data, true);
+    if (lk) acpi_gl_release();
     kfree(data);
 }
 

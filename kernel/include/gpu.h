@@ -1,6 +1,9 @@
 #pragma once
 #include "kernel.h"
 
+/* display modes offered by Settings */
+struct display_mode { int w, h; };
+
 /* A display adapter known to the kernel. The software device is always
  * present; a hardware driver can add page flipping and a hardware cursor. */
 struct gpu_device {
@@ -18,6 +21,7 @@ struct gpu_device {
     bool hw_cursor, page_flip, accelerated, modeset;
     uint64_t fb_phys; int fb_pitch, fb_width, fb_height;   /* current scanout after set_mode */
     bool (*set_mode)(struct gpu_device *g, int w, int h);
+    int (*list_modes)(struct gpu_device *g, struct display_mode *out, int max);   /* optional: the monitor's modes */
     /* hardware cursor (64x64 ARGB, straight alpha) */
     bool (*set_cursor)(struct gpu_device *g, const uint32_t *argb, int w, int h, int hot_x, int hot_y);
     void (*move_cursor)(struct gpu_device *g, int x, int y, bool visible);
@@ -35,6 +39,4 @@ struct gpu_device *gpu_primary(void);      /* the device driving the framebuffer
 void radeon_init(void);
 void bochs_init(void);
 
-/* display modes offered by Settings */
-struct display_mode { int w, h; };
 int gpu_list_modes(struct display_mode *out, int max);

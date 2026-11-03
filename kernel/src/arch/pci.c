@@ -1,26 +1,22 @@
 #include "arch.h"
-#include "acpi.h"
+#include "acpi_internal.h"
 #include "io.h"
 #include "string.h"
 
 static struct pci_device devices[64];
 static int ndev;
 
-uint32_t pci_read32(uint8_t bus, uint8_t slot, uint8_t func, uint8_t off) {
+static inline void cfg_addr(uint8_t bus, uint8_t slot, uint8_t func, uint8_t off) {
     outl(0xCF8, 0x80000000u | ((uint32_t)bus << 16) | ((uint32_t)slot << 11) | ((uint32_t)func << 8) | (off & 0xFC));
-    return inl(0xCFC);
 }
-void pci_write32(uint8_t bus, uint8_t slot, uint8_t func, uint8_t off, uint32_t v) {
-    outl(0xCF8, 0x80000000u | ((uint32_t)bus << 16) | ((uint32_t)slot << 11) | ((uint32_t)func << 8) | (off & 0xFC));
-    outl(0xCFC, v);
-}
-uint16_t pci_read16(uint8_t bus, uint8_t slot, uint8_t func, uint8_t off) { return (pci_read32(bus, slot, func, off) >> ((off & 2) * 8)) & 0xFFFF; }
-void pci_write16(uint8_t bus, uint8_t slot, uint8_t func, uint8_t off, uint16_t v) {
-    uint32_t cur = pci_read32(bus, slot, func, off);
-    uint32_t shift = (off & 2) * 8;
-    cur = (cur & ~(0xFFFFu << shift)) | ((uint32_t)v << shift);
-    pci_write32(bus, slot, func, off, cur);
-}
+uint32_t pci_read32(uint8_t bus, uint8_t slot, uint8_t func, uint8_t off) { cfg_addr(bus, slot, func, off); return inl(0xCFC); }
+void pci_write32(uint8_t bus, uint8_t slot, uint8_t func, uint8_t off, uint32_t v) { cfg_addr(bus, slot, func, off); outl(0xCFC, v); }
+/* narrow writes go out narrow: a read-modify-write of the dword would write
+ * back (and so clear) RW1C bits next to the target, e.g. Status after Command */
+uint16_t pci_read16(uint8_t bus, uint8_t slot, uint8_t func, uint8_t off) { cfg_addr(bus, slot, func, off); return inw(0xCFC + (off & 2)); }
+void pci_write16(uint8_t bus, uint8_t slot, uint8_t func, uint8_t off, uint16_t v) { cfg_addr(bus, slot, func, off); outw(0xCFC + (off & 2), v); }
+uint8_t pci_read8(uint8_t bus, uint8_t slot, uint8_t func, uint8_t off) { cfg_addr(bus, slot, func, off); return inb(0xCFC + (off & 3)); }
+void pci_write8(uint8_t bus, uint8_t slot, uint8_t func, uint8_t off, uint8_t v) { cfg_addr(bus, slot, func, off); outb(0xCFC + (off & 3), v); }
 
 static void probe(uint8_t bus, uint8_t slot, uint8_t func) {
     uint32_t id = pci_read32(bus, slot, func, 0);
@@ -85,9 +81,10 @@ uint8_t pci_find_cap(struct pci_device *d, uint8_t id) {
     return 0;
 }
 
-/* INTx lines can be shared, so every installed handler goes through a
- * dispatcher that calls all handlers on the vector and then sends the EOI. */
-struct pci_irq { uint32_t gsi; bool msi; int vector, n; irq_handler_t h[4]; void *ctx[4]; };
+/* INTx lines can be shared (with each other and with the ACPI SCI), so every
+ * installed handler goes through a dispatcher that calls all handlers on the
+ * vector and then sends the EOI. */
+struct pci_irq { uint32_t gsi; bool msi; int vector, n; irq_handler_t h[8]; void *ctx[8]; };
 static struct pci_irq pirqs[16];
 static int npirqs;
 
@@ -105,6 +102,21 @@ static struct pci_irq *pirq_new(void) {
     irq_register(pi->vector, pci_irq_dispatch, pi);
     return pi;
 }
+
+/* add a handler to a GSI's dispatcher, routing the GSI on first use */
+static const char *gsi_attach(uint32_t gsi, bool level, bool active_low, irq_handler_t h, void *ctx) {
+    struct pci_irq *pi = NULL;
+    for (int i = 0; i < npirqs; i++) if (!pirqs[i].msi && pirqs[i].gsi == gsi) pi = &pirqs[i];
+    if (pi && pi->n >= (int)ARRAY_LEN(pi->h)) return "too many handlers on the GSI";
+    bool fresh = !pi;
+    if (fresh) { if (!(pi = pirq_new())) return "no free vector"; pi->gsi = gsi; }
+    uint64_t fl = irq_save();
+    pi->h[pi->n] = h; pi->ctx[pi->n] = ctx; pi->n++;
+    irq_restore(fl);
+    if (fresh && !ioapic_route_gsi(gsi, pi->vector, level, active_low)) { pi->n = 0; pi->gsi = ~0u; return "GSI outside the I/O APICs"; }
+    return NULL;
+}
+bool pci_irq_share_gsi(uint32_t gsi, bool level, bool active_low, irq_handler_t h, void *ctx) { return !gsi_attach(gsi, level, active_low, h, ctx); }
 
 bool pci_irq_install(struct pci_device *d, irq_handler_t h, void *ctx, bool allow_msi, char *how, size_t how_len) {
     uint8_t msi = allow_msi ? pci_find_cap(d, 0x05) : 0;
@@ -125,16 +137,8 @@ bool pci_irq_install(struct pci_device *d, irq_handler_t h, void *ctx, bool allo
     struct acpi_irq_route rt;
     if (!pin) { snprintf(how, how_len, "no interrupt pin"); return false; }
     if (!acpi_pci_route(d->bus, d->slot, d->func, pin, &rt)) { snprintf(how, how_len, "INT%c not routed by ACPI", 'A' + pin - 1); return false; }
-    struct pci_irq *pi = NULL;
-    for (int i = 0; i < npirqs; i++) if (!pirqs[i].msi && pirqs[i].gsi == rt.gsi && pirqs[i].n < 4) pi = &pirqs[i];
-    if (!pi) {
-        if (!(pi = pirq_new())) { snprintf(how, how_len, "no free vector"); return false; }
-        pi->gsi = rt.gsi;
-        if (!ioapic_route_gsi(rt.gsi, pi->vector, rt.level, rt.active_low)) { snprintf(how, how_len, "GSI %u outside the I/O APIC", rt.gsi); return false; }
-    }
-    uint64_t fl = irq_save();
-    pi->h[pi->n] = h; pi->ctx[pi->n] = ctx; pi->n++;
-    irq_restore(fl);
+    const char *err = gsi_attach(rt.gsi, rt.level, rt.active_low, h, ctx);
+    if (err) { snprintf(how, how_len, "GSI %u: %s", rt.gsi, err); return false; }
     snprintf(how, how_len, "INT%c, GSI %u (%s, active %s)", 'A' + pin - 1, rt.gsi, rt.level ? "level" : "edge", rt.active_low ? "low" : "high");
     return true;
 }

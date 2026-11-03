@@ -77,7 +77,7 @@ static bool parse_irq(struct aml_obj *buf, uint32_t *irq, bool *level, bool *low
         }
         uint8_t type = (tag >> 3) & 0xF, len = tag & 7;
         if (type == 0xF) break;
-        if (type == 0x4 && len >= 2 && i + 2 < buf->buf.len) {   /* IRQ */
+        if (type == 0x4 && len >= 2 && i + 1 + len <= buf->buf.len) {   /* IRQ */
             uint16_t mask = b[1] | b[2] << 8;
             uint8_t info = len >= 3 ? b[3] : 0x01;   /* no info byte: edge, active high */
             *level = !(info & 1); *low = info & 8;
@@ -90,12 +90,40 @@ static bool parse_irq(struct aml_obj *buf, uint32_t *irq, bool *level, bool *low
     return false;
 }
 
-/* a disabled link: pick its first possible interrupt and program it with _SRS */
+/* how much an IRQ should be avoided for a link: legacy ISA devices own some,
+ * the SCI is shareable but busy, and every link already moved there counts */
+static uint8_t link_users[256];
+static int irq_penalty(uint32_t irq) {
+    static const uint16_t isa = 1u << 0 | 1u << 1 | 1u << 2 | 1u << 3 | 1u << 4 | 1u << 6 | 1u << 8 | 1u << 12 | 1u << 13 | 1u << 14 | 1u << 15;
+    struct acpi_fadt *f = acpi_fadt();
+    int p = irq < 256 ? link_users[irq] * 10 : 0;
+    if (irq < 16 && (isa & (1u << irq))) p += 1000;
+    if (f && irq == f->sci_int) p += 100;
+    return p;
+}
+
+/* a disabled link: pick the least used of its possible interrupts and program it with _SRS */
 static bool link_enable(struct aml_node *link) {
     struct aml_obj *prs;
     if (!ns_child(link, "_PRS") || !ns_child(link, "_SRS") || aml_eval_path(link, "_PRS", NULL, 0, &prs) < 0) return false;
-    uint32_t irq; bool level, low; size_t off;
-    bool ok = prs->type == AML_BUFFER && parse_irq(prs, &irq, &level, &low, &off) && irq;
+    uint32_t irq = 0; bool level, low; size_t off;
+    bool ok = prs->type == AML_BUFFER && parse_irq(prs, &irq, &level, &low, &off);
+    if (ok) {
+        uint8_t *d = prs->buf.b + off;
+        bool ext = d[0] & 0x80;
+        int best = 1 << 30; irq = 0;
+        if (ext) {
+            size_t dl = d[1] | d[2] << 8;
+            for (size_t k = 0; k < d[4] && 9 + 4 * k <= 3 + dl; k++) {
+                uint32_t g = d[5 + 4 * k] | d[6 + 4 * k] << 8 | d[7 + 4 * k] << 16 | (uint32_t)d[8 + 4 * k] << 24;
+                if (g && irq_penalty(g) < best) { best = irq_penalty(g); irq = g; }
+            }
+        } else {
+            uint16_t mask = d[1] | d[2] << 8;
+            for (uint32_t q = 1; q < 16; q++) if ((mask & (1u << q)) && irq_penalty(q) < best) { best = irq_penalty(q); irq = q; }
+        }
+        ok = irq != 0;
+    }
     if (ok) {
         uint8_t *d = prs->buf.b + off;
         bool ext = d[0] & 0x80;
@@ -106,6 +134,7 @@ static bool link_enable(struct aml_node *link) {
         else { srs->buf.b[1] = (1u << irq) & 0xFF; srs->buf.b[2] = (1u << irq) >> 8; }
         srs->buf.b[dlen] = 0x79;
         ok = aml_eval_path(link, "_SRS", &srs, 1, NULL) == 0;
+        if (ok && irq < 256) link_users[irq]++;
         obj_put(srs);
     }
     obj_put(prs);

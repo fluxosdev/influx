@@ -92,6 +92,7 @@ int vfs_read_file(const char *path, void **data, size_t *size);   /* kmalloc'd, 
 int vfs_write_file(const char *path, const void *data, size_t size);
 const char *vfs_basename(const char *path);
 void vfs_dirname(const char *path, char *out, size_t n);
+#define VFS_MAX_MOUNTS 16
 int vfs_mount_count(void);
 struct vnode *vfs_mount_at(int i, char *path, size_t n);
 
@@ -112,6 +113,7 @@ struct vnode *devfs_add(const char *name, int type, const struct vnode_ops *ops,
 #define ENOTDIR  20
 #define EISDIR   21
 #define EINVAL   22
+#define EFBIG    27
 #define ENOSPC   28
 #define EROFS    30
 #define ENOTEMPTY 39

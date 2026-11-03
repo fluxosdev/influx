@@ -28,6 +28,8 @@ struct input_event {
     int button;       /* button that changed */
     bool pressed;
     int scroll;       /* +1 up, -1 down */
+    bool abs;         /* mouse move from an absolute pointer (USB tablet): */
+    int x, y;         /* position as 0..65535 across the screen, dx/dy unused */
 };
 
 void input_init(void);

@@ -26,6 +26,7 @@ int isqrt64(uint64_t v) {
 }
 
 struct canvas *canvas_create(int w, int h) {
+    w = w < 0 ? 0 : MIN(w, 16384); h = h < 0 ? 0 : MIN(h, 16384);   /* callers don't check for NULL: clamp */
     struct canvas *c = kzalloc(sizeof *c);
     c->px = kzalloc((size_t)w * h * 4);
     c->w = w; c->h = h; c->stride = w; c->owns_px = true;

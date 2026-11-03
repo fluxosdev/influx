@@ -162,22 +162,13 @@ $(ISO): $(KERNEL) $(INITRD) limine.conf $(BUILD)/limine
 	    $(BUILD)/iso -o $@ 2>/dev/null
 	$(BUILD)/limine bios-install $@ 2>/dev/null
 
-# ---- test disks (btrfs on SATA, btrfs on NVMe) ----
-DISK_SATA := $(BUILD)/sata.img
-DISK_NVME := $(BUILD)/nvme.img
-
+# ---- install target disk ----
 DISK_INSTALL := $(BUILD)/install.img
 
-disk: $(DISK_SATA) $(DISK_NVME) $(DISK_INSTALL)
+disk: $(DISK_INSTALL)
 
 $(DISK_INSTALL):
 	truncate -s 1G $@
-
-$(DISK_SATA): tools/mkdisk.sh
-	tools/mkdisk.sh $@ "inFlux SATA" 256
-
-$(DISK_NVME): tools/mkdisk.sh
-	tools/mkdisk.sh $@ "inFlux NVMe" 256
 
 QEMU      := qemu-system-x86_64
 # inFlux requires AVX, which TCG's default CPU model lacks; 'max' has AVX and AVX2
@@ -188,16 +179,18 @@ QEMU_NET  := -netdev user,id=net0 -device ne2k_pci,netdev=net0
 # override with e.g. QEMU_AUDIODEV=pipewire, or QEMU_AUDIO= for no sound card
 QEMU_AUDIODEV ?= pa
 QEMU_AUDIO ?= -audiodev $(QEMU_AUDIODEV),id=snd0 -device intel-hda -device hda-duplex,audiodev=snd0
+# xHCI with a USB tablet: an absolute pointer, so the window needs no mouse grab.
+# Plug in a USB stick image with e.g. make run USB_STICK=stick.img, or set QEMU_USB=
+# for no USB at all
+QEMU_USB ?= -device qemu-xhci,id=xhci -device usb-tablet,bus=xhci.0 \
+            $(if $(USB_STICK),-drive id=stick,file=$(USB_STICK),format=raw,if=none -device usb-storage,bus=xhci.0,drive=stick)
 # the live CD gets bootindex=0 so it boots ahead of an installed system on install.img
 QEMU_ARGS := -M q35 -m 2G -serial stdio \
              -drive id=cd0,file=$(ISO),format=raw,media=cdrom,readonly=on,if=none \
              -device ide-cd,drive=cd0,bus=ide.2,bootindex=0 \
-             -drive id=sata0,file=$(DISK_SATA),format=raw,if=none \
-             -device ahci,id=ahci -device ide-hd,drive=sata0,bus=ahci.0 \
-             -drive id=nvme0,file=$(DISK_NVME),format=raw,if=none \
-             -device nvme,serial=INFLUX01,drive=nvme0 \
-             -drive id=inst,file=$(DISK_INSTALL),format=raw,if=none -device ide-hd,drive=inst,bus=ahci.1,bootindex=1 \
-             $(QEMU_NET) $(QEMU_AUDIO) -vga std -display gtk,zoom-to-fit=on
+             -device ahci,id=ahci \
+             -drive id=inst,file=$(DISK_INSTALL),format=raw,if=none -device ide-hd,drive=inst,bus=ahci.0,bootindex=1 \
+             $(QEMU_NET) $(QEMU_AUDIO) $(QEMU_USB) -vga std -display gtk,zoom-to-fit=on
 
 run: $(ISO) disk
 	$(QEMU) $(QEMU_CPU) $(QEMU_ARGS)
@@ -207,13 +200,13 @@ run-kvm: $(ISO) disk
 
 # boot an installed system (after using the installer on build/install.img)
 run-installed: $(DISK_INSTALL)
-	$(QEMU) $(QEMU_CPU) -M q35 -m 2G -serial stdio $(QEMU_NET) $(QEMU_AUDIO) -vga std -display gtk,zoom-to-fit=on -drive file=$(DISK_INSTALL),format=raw,if=none,id=d -device ahci,id=ahci -device ide-hd,drive=d,bus=ahci.0
+	$(QEMU) $(QEMU_CPU) -M q35 -m 2G -serial stdio $(QEMU_NET) $(QEMU_AUDIO) $(QEMU_USB) -vga std -display gtk,zoom-to-fit=on -drive file=$(DISK_INSTALL),format=raw,if=none,id=d -device ahci,id=ahci -device ide-hd,drive=d,bus=ahci.0
 
 OVMF_CODE ?= /usr/share/OVMF/OVMF_CODE_4M.fd
 OVMF_VARS ?= /usr/share/OVMF/OVMF_VARS_4M.fd
 run-installed-uefi: $(DISK_INSTALL)
 	cp -n $(OVMF_VARS) $(BUILD)/ovmf_vars.fd || true
-	$(QEMU) $(QEMU_CPU) -M q35 -m 2G -serial stdio $(QEMU_NET) $(QEMU_AUDIO) -vga std -display gtk,zoom-to-fit=on \
+	$(QEMU) $(QEMU_CPU) -M q35 -m 2G -serial stdio $(QEMU_NET) $(QEMU_AUDIO) $(QEMU_USB) -vga std -display gtk,zoom-to-fit=on \
 	    -drive if=pflash,format=raw,readonly=on,file=$(OVMF_CODE) -drive if=pflash,format=raw,file=$(BUILD)/ovmf_vars.fd \
 	    -drive file=$(DISK_INSTALL),format=raw,if=none,id=d -device ahci,id=ahci -device ide-hd,drive=d,bus=ahci.0
 

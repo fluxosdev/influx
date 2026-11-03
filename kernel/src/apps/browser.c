@@ -21,6 +21,7 @@
 #define HOME_URL "about:home"
 #define SEARCH_URL "http://wiby.me/?q="
 #define MAX_IMAGES 80
+#define IMAGE_PX_BUDGET (64u << 20)   /* decoded pixels kept per page */
 
 enum { JOB_PAGE, JOB_IMAGES };
 
@@ -39,6 +40,7 @@ struct job {
     /* image results */
     char **urls; int nurls;
     struct canvas **imgs; bool *finished, *applied;
+    size_t px_left;                 /* remaining decoded-pixel budget */
 };
 
 struct browser {
@@ -129,14 +131,15 @@ static void html_escape(const char *in, char *out, size_t outsz) {
 }
 
 static struct html_doc *error_page(const char *url, const char *title, const char *message, bool offer_proxy) {
-    char *html = kmalloc(8192), eurl[2200], emsg[600], proxy[2400] = "";
+    char *html = kmalloc(8192), eurl[2200], emsg[600], proxy[4800] = "";
     html_escape(url, eurl, sizeof eurl);
     html_escape(message, emsg, sizeof emsg);
     if (offer_proxy) {
-        char enc[2048]; url_encode_component(url, enc, sizeof enc);
+        char enc[2048], ehost[2200]; url_encode_component(url, enc, sizeof enc);
+        html_escape(strstr(url, "://") ? strstr(url, "://") + 3 : url, ehost, sizeof ehost);
         snprintf(proxy, sizeof proxy, "<p>Many sites only answer over HTTPS. A text-only proxy such as "
                  "<a href=\"http://frogfind.com/read.php?a=%s\">FrogFind</a> can fetch the page for you, "
-                 "or try the plain <a href=\"http://%s\">http://</a> address.</p>", enc, strstr(url, "://") ? strstr(url, "://") + 3 : url);
+                 "or try the plain <a href=\"http://%s\">http://</a> address.</p>", enc, ehost);
     }
     snprintf(html, 8192,
              "<html><head><title>%s</title></head><body bgcolor=\"#F5F5F7\"><br><br>"
@@ -307,6 +310,10 @@ static void image_worker(void *arg) {
             if (http_request(&req, &r) == 0 && r.status == 200 && r.body_len) img = image_decode(r.body, r.body_len);
             http_response_free(&r);
         }
+        if (img) {
+            size_t px = (size_t)img->w * img->h;
+            if (px > j->px_left) { canvas_destroy(img); img = NULL; } else j->px_left -= px;
+        }
         mutex_lock(&b->lock);
         j->imgs[i] = img; j->finished[i] = true;
         j->done = i + 1;
@@ -335,6 +342,9 @@ static void start_images(struct browser *b) {
     n = MIN(n, MAX_IMAGES);
     struct job *j = kzalloc(sizeof *j);
     j->kind = JOB_IMAGES; j->b = b; j->gen = b->gen; j->refs = 2;
+    size_t used = 0;
+    for (struct html_image *im = b->doc->images; im; im = im->next) if (im->img) used += (size_t)im->img->w * im->img->h;
+    j->px_left = used < IMAGE_PX_BUDGET ? IMAGE_PX_BUDGET - used : 0;
     j->urls = kcalloc(n, sizeof(char *)); j->imgs = kcalloc(n, sizeof(struct canvas *));
     j->finished = kcalloc(n, sizeof(bool)); j->applied = kcalloc(n, sizeof(bool));
     for (struct html_image *im = b->doc->images; im && j->nurls < n; im = im->next) if (!im->img && !im->failed) j->urls[j->nurls++] = kstrdup(im->url);

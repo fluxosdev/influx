@@ -17,7 +17,7 @@
 #include "mm.h"
 #include "string.h"
 
-#define MAX_DEPTH       128       /* nested expressions + method calls; keeps the 64 KiB kernel stack safe */
+#define MAX_DEPTH       128       /* nested expressions + terms + method calls, across re-entrant evaluations */
 #define LOOP_TIMEOUT_MS 10000     /* a While that polls hardware forever gets abandoned */
 
 enum { ST_OK, ST_BREAK, ST_CONTINUE, ST_RETURN, ST_ERROR };
@@ -27,21 +27,26 @@ struct frame {
     struct aml_obj *ret;
     struct aml_node *method;
     struct aml_node *dyn;         /* named objects created by this invocation */
+    int gl_held;                  /* Acquire(\_GL) not yet released */
+    struct frame *up;             /* the caller's frame */
 };
 struct state {
     const uint8_t *p, *end;       /* position, end of the method body / table */
     struct aml_node *scope;
     struct frame *f;              /* NULL while loading a table */
-    int status, depth;
+    int status;
 };
 struct name { bool root; int up, nseg; const uint8_t *segs; };
 
 int aml_errors;
 static const char *load_what;
-static const void *loaded[32];
-static int nloaded;
+static struct { const uint8_t *copy; size_t len; } *loaded;   /* loaded tables, for duplicate detection */
+static int nloaded, loaded_cap;
+static int depth;                 /* interpreter nesting; shared by re-entrant evaluations (under the lock) */
+static struct aml_node *gl_node;  /* \_GL */
 
 static struct aml_obj *eval(struct state *s);
+static struct aml_obj *eval2(struct state *s);
 static void exec_list(struct state *s, const uint8_t *end);
 static void store(struct state *s, struct aml_obj *target, struct aml_obj *val);
 
@@ -246,14 +251,14 @@ static struct aml_obj *parse_supername(struct state *s, bool allow_missing) {
     }
     if (op == 0x83) {   /* DerefOf as a target: the object the reference points at */
         s->p++;
-        struct aml_obj *o = eval(s);
+        struct aml_obj *o = eval2(s);
         if (o->type == AML_REFERENCE) return o;
         if (o->type == AML_STRING) { struct aml_node *n = ns_lookup_search(s->scope, o->str.s); obj_put(o); if (n) return obj_ref_named(n); }
         else obj_put(o);
         fail(s, "DerefOf target is not a reference");
         return new_ref(REF_NULL);
     }
-    struct aml_obj *o = eval(s);   /* Index(), RefOf() */
+    struct aml_obj *o = eval2(s);   /* Index(), RefOf() */
     if (o->type == AML_REFERENCE) return o;
     obj_put(o);
     fail(s, "invalid target");
@@ -313,7 +318,57 @@ static void store_named(struct state *s, struct aml_node *node, struct aml_obj *
     obj_put(v);
 }
 
+/* References to a frame's Locals/Args or to the named objects the invocation
+ * created die with the frame. A value leaving the frame takes the referenced
+ * value instead: on Return (references into this frame), and on a store
+ * anywhere but this frame's own slots (references into any running frame). */
+static bool in_frame(struct frame *f, struct aml_obj *r) {
+    if (r->ref.kind == REF_LOCAL || r->ref.kind == REF_ARG) return (void *)r->ref.slot >= (void *)f && (void *)r->ref.slot < (void *)(f + 1);
+    if (r->ref.kind != REF_NAMED) return false;
+    struct aml_node *n = ns_resolve_alias(r->ref.node);
+    for (struct aml_node *d = f->dyn; d; d = d->dyn_next) if (d == n) return true;
+    return false;
+}
+static bool frame_ref(struct frame *f, bool up, struct aml_obj *o, int lvl) {
+    if (o->type == AML_PACKAGE) {
+        for (size_t i = 0; lvl < 8 && i < o->pkg.n; i++) if (frame_ref(f, up, o->pkg.e[i], lvl + 1)) return true;
+        return false;
+    }
+    if (o->type != AML_REFERENCE) return false;
+    for (; f; f = up ? f->up : NULL) if (in_frame(f, o)) return true;
+    return false;
+}
+static struct aml_obj *detach(struct state *s, struct aml_obj *o, bool up, int lvl) {
+    if (!s->f || lvl >= 8 || !frame_ref(s->f, up, o, 0)) return obj_get(o);
+    if (o->type == AML_PACKAGE) {
+        struct aml_obj *p = obj_pkg(o->pkg.n);
+        for (size_t i = 0; i < o->pkg.n; i++) { obj_put(p->pkg.e[i]); p->pkg.e[i] = detach(s, o->pkg.e[i], up, lvl + 1); }
+        return p;
+    }
+    struct aml_obj *v = aml_value_of(o);
+    if (v->type == AML_REFERENCE && frame_ref(s->f, up, v, 0)) {
+        obj_put(v);
+        fail(s, "a reference to a method-local object outlives the method");
+        return obj_new(AML_UNINIT);
+    }
+    struct aml_obj *r = detach(s, v, up, lvl + 1);
+    obj_put(v);
+    return r;
+}
+
+static void store_raw(struct state *s, struct aml_obj *t, struct aml_obj *val);
 static void store(struct state *s, struct aml_obj *t, struct aml_obj *val) {
+    if (s->status == ST_ERROR) return;
+    bool own_slot = s->f && (t->ref.kind == REF_LOCAL || t->ref.kind == REF_ARG) && in_frame(s->f, t);
+    if ((own_slot && !(t->ref.kind == REF_ARG && *t->ref.slot && (*t->ref.slot)->type == AML_REFERENCE)) || t->ref.kind == REF_NULL || t->ref.kind == REF_DEBUG) {
+        store_raw(s, t, val);
+        return;
+    }
+    struct aml_obj *d = detach(s, val, true, 0);
+    store_raw(s, t, d);
+    obj_put(d);
+}
+static void store_raw(struct state *s, struct aml_obj *t, struct aml_obj *val) {
     if (s->status == ST_ERROR) return;
     switch (t->ref.kind) {
     case REF_NULL: return;
@@ -351,18 +406,21 @@ static struct aml_obj *invoke(struct state *caller, struct aml_node *mnode, stru
         for (int i = 0; i < argc; i++) obj_put(vals[i]);
         return r ? r : obj_int(0);
     }
-    if (caller->depth >= MAX_DEPTH) { fail(caller, "method calls nested too deeply"); return obj_int(0); }
+    if (depth >= MAX_DEPTH) { fail(caller, "method calls nested too deeply"); return obj_int(0); }
+    depth++;
     struct frame *f = kzalloc(sizeof *f);
-    f->method = mnode;
+    f->method = mnode; f->up = caller->f;
     for (int i = 0; i < argc && i < 7; i++) f->args[i] = obj_get(args[i]);
-    struct state st = { .p = m->method.code, .end = m->method.code + m->method.len, .scope = mnode, .f = f, .depth = caller->depth + 1 };
+    struct state st = { .p = m->method.code, .end = m->method.code + m->method.len, .scope = mnode, .f = f };
     exec_list(&st, st.end);
     struct aml_obj *r = f->ret ? f->ret : obj_int(0);
     if (st.status == ST_ERROR) caller->status = ST_ERROR;   /* already reported */
+    while (f->gl_held > 0) { f->gl_held--; acpi_gl_release(); }   /* as ACPICA: a method's mutexes go when it ends */
     while (f->dyn) { struct aml_node *n = f->dyn; f->dyn = n->dyn_next; ns_remove(n); }
     for (int i = 0; i < 7; i++) obj_put(f->args[i]);
     for (int i = 0; i < 8; i++) obj_put(f->locals[i]);
     kfree(f);
+    depth--;
     return r;
 }
 
@@ -416,7 +474,7 @@ static struct aml_obj *parse_package(struct state *s, bool var) {
             if (node && node_has_value(node->obj) && node->obj->type != AML_FIELD && node->obj->type != AML_BUFFER_FIELD) e = obj_copy(node->obj);
             else if (node) e = obj_ref_named(node);
             else { char b[64]; name_str(&nm, b, sizeof b); e = obj_new(AML_NAMEREF); e->nameref.path = kstrdup(b); e->nameref.scope = s->scope; }
-        } else e = eval(s);
+        } else e = eval2(s);
         if (i < n) { obj_put(pkg->pkg.e[i]); pkg->pkg.e[i] = e; } else obj_put(e);
     }
     s->p = end;
@@ -425,10 +483,10 @@ static struct aml_obj *parse_package(struct state *s, bool var) {
 
 /* ---- operators ---- */
 static struct aml_obj *op_store(struct state *s, bool copy_object) {
-    struct aml_obj *v = eval(s);
+    struct aml_obj *v = eval2(s);
     struct aml_obj *t = parse_supername(s, false);
     if (s->status == ST_OK) {
-        if (copy_object && t->ref.kind == REF_NAMED) store_named(s, t->ref.node, v, true);
+        if (copy_object && t->ref.kind == REF_NAMED) { struct aml_obj *d = detach(s, v, true, 0); store_named(s, t->ref.node, d, true); obj_put(d); }
         else store(s, t, v);
     }
     obj_put(t);
@@ -725,13 +783,26 @@ static struct aml_obj *op_loadtable(struct state *s) {
     return obj_int(ok ? aml_ones() : 0);
 }
 
+#define GL_MAX_WAIT_MS 2000
+static bool is_gl(struct aml_obj *m) { return m->type == AML_REFERENCE && m->ref.kind == REF_NAMED && gl_node && ns_resolve_alias(m->ref.node) == gl_node; }
+
 static struct aml_obj *eval_ext(struct state *s) {
     uint8_t op = u8(s);
     switch (op) {
     case 0x30: return obj_int(2);                          /* Revision */
-    case 0x33: return obj_int(acpi_timer_100ns());         /* Timer */
+    case 0x33: return obj_int(aml_trunc(acpi_timer_100ns()));   /* Timer */
     case 0x12: return op_condrefof(s);
-    case 0x23: { struct aml_obj *m = parse_supername(s, false); uN(s, 2); obj_put(m); return obj_int(0); }   /* Acquire: never times out */
+    case 0x23: {   /* Acquire: one interpreter thread, so only \_GL (shared with the firmware) is real */
+        struct aml_obj *m = parse_supername(s, false);
+        uint32_t timeout = uN(s, 2);
+        bool ok = true;
+        if (s->status == ST_OK && is_gl(m)) {
+            ok = acpi_gl_acquire(timeout == 0xFFFF ? GL_MAX_WAIT_MS : MIN(timeout, (uint32_t)GL_MAX_WAIT_MS));
+            if (ok && s->f) s->f->gl_held++;
+        }
+        obj_put(m);
+        return obj_int(ok ? 0 : aml_ones());
+    }
     case 0x25: { struct aml_obj *e = parse_supername(s, false); eval_int(s); obj_put(e); return obj_int(0); }   /* Wait */
     case 0x28: case 0x29: return op_bcd(s, op == 0x29);
     case 0x1F: return op_loadtable(s);
@@ -799,17 +870,23 @@ static struct aml_obj *eval_op(struct state *s) {
 
 static struct aml_obj *eval(struct state *s) {
     if (s->status != ST_OK) return obj_int(0);
-    if (++s->depth > MAX_DEPTH) { fail(s, "expression nested too deeply"); s->depth--; return obj_int(0); }
+    if (depth >= MAX_DEPTH) { fail(s, "expression nested too deeply"); return obj_int(0); }
+    depth++;
     struct aml_obj *r = eval_op(s);
-    s->depth--;
+    depth--;
     return r ? r : obj_int(0);
 }
+/* eval() from a caller with a large frame of its own: counts as two levels, so
+ * MAX_DEPTH bounds the stack (about 200 bytes a level) whatever the nesting */
+static struct aml_obj *eval2(struct state *s) { depth++; struct aml_obj *r = eval(s); depth--; return r; }
 
 /* ---- definitions ---- */
 static void run_block(struct state *s, struct aml_node *scope, const uint8_t *end) {
     struct aml_node *saved = s->scope;
     s->scope = scope;
+    depth++;   /* def_device's frame plus exec_term's: two levels */
     exec_list(s, end);
+    depth--;
     s->scope = saved;
     if (s->status == ST_ERROR && !s->f) s->status = ST_OK;   /* table load: carry on after the block */
     if (s->status == ST_OK) s->p = end;
@@ -1050,14 +1127,33 @@ static void exec_ext(struct state *s) {
     case 0x85: s->p += 2; def_device(s, AML_THERMAL); return;
     case 0x21: { s->p += 2; uint64_t us = eval_int(s); acpi_stall_us(MIN(us, 1000u)); return; }   /* Stall */
     case 0x22: { s->p += 2; uint64_t ms = eval_int(s); if (s->status == ST_OK) thread_sleep_ms(MIN(ms, 5000u)); return; }   /* Sleep */
-    case 0x24: case 0x26: case 0x27: case 0x2A: { s->p += 2; obj_put(parse_supername(s, false)); return; }   /* Signal, Reset, Release, Unload */
+    case 0x27: {   /* Release */
+        s->p += 2;
+        struct aml_obj *m = parse_supername(s, false);
+        if (s->status == ST_OK && is_gl(m) && (!s->f || s->f->gl_held > 0)) { if (s->f) s->f->gl_held--; acpi_gl_release(); }
+        obj_put(m);
+        return;
+    }
+    case 0x24: case 0x26: case 0x2A: { s->p += 2; obj_put(parse_supername(s, false)); return; }   /* Signal, Reset, Unload */
     case 0x32: { s->p += 2; uint8_t type = u8(s); uint32_t code = uN(s, 4); uint64_t arg = eval_int(s); kprintf("acpi: firmware Fatal(%u, 0x%x, 0x%lx)\n", type, code, arg); return; }
     }
     obj_put(eval(s));
 }
 
+/* the object a Notify target designates: ArgX/LocalX holding a reference resolve through it */
+static struct aml_node *ref_node(struct aml_obj *t) {
+    for (int k = 0; t && t->type == AML_REFERENCE && k < 8; k++) {
+        if (t->ref.kind == REF_NAMED) return ns_resolve_alias(t->ref.node);
+        if (t->ref.kind == REF_LOCAL || t->ref.kind == REF_ARG) t = *t->ref.slot;
+        else if (t->ref.kind == REF_INDEX && t->ref.target->type == AML_PACKAGE && t->ref.index < t->ref.target->pkg.n) t = t->ref.target->pkg.e[t->ref.index];
+        else return NULL;
+    }
+    return NULL;
+}
+
 static void exec_term(struct state *s) {
-    if (++s->depth > MAX_DEPTH) { fail(s, "terms nested too deeply"); s->depth--; return; }
+    if (depth >= MAX_DEPTH) { fail(s, "terms nested too deeply"); return; }
+    depth++;
     uint8_t op = *s->p;
     switch (op) {
     case 0x08: s->p++; def_name(s); break;
@@ -1074,7 +1170,10 @@ static void exec_term(struct state *s) {
         s->p++;
         struct aml_obj *v = eval(s);
         if (s->status != ST_OK) { obj_put(v); break; }
-        if (s->f) { obj_put(s->f->ret); s->f->ret = v; } else obj_put(v);
+        struct aml_obj *d = detach(s, v, false, 0);
+        obj_put(v);
+        if (s->status != ST_OK) { obj_put(d); break; }
+        if (s->f) { obj_put(s->f->ret); s->f->ret = d; } else obj_put(d);
         s->status = ST_RETURN;
         break;
     }
@@ -1084,27 +1183,40 @@ static void exec_term(struct state *s) {
         s->p++;
         struct aml_obj *t = parse_supername(s, false);
         uint64_t v = eval_int(s);
-        if (s->status == ST_OK && t->ref.kind == REF_NAMED) acpi_notify(t->ref.node, v);
+        struct aml_node *n = s->status == ST_OK ? ref_node(t) : NULL;
+        if (n) acpi_notify(n, v);
         obj_put(t);
         break;
     }
     case 0x5B: exec_ext(s); break;
     default: obj_put(eval(s)); break;
     }
-    s->depth--;
+    depth--;
 }
 
+/* the term list of a block: s->end is narrowed to the block, so lookahead
+ * (an If checking for its Else) cannot run into the enclosing block */
 static void exec_list(struct state *s, const uint8_t *end) {
+    const uint8_t *saved = s->end;
+    if (end < s->end) s->end = end;
     while (s->p < end && s->status == ST_OK) exec_term(s);
+    s->end = saved;
 }
 
 /* ---- entry points ---- */
 int aml_load_table(const void *table, size_t len, const char *what) {
+    if (len < 36 || len > ACPI_MAX_TABLE || *(const uint32_t *)((const uint8_t *)table + 4) != len) { kprintf("acpi: %s: bad table length %lu\n", what, len); return -EINVAL; }
     aml_lock();
-    for (int i = 0; i < nloaded; i++) if (loaded[i] == table) { aml_unlock(); return 0; }
-    if (nloaded < (int)ARRAY_LEN(loaded)) loaded[nloaded++] = table;
+    /* the same table again (as ACPICA: same length and contents) is a no-op */
+    for (int i = 0; i < nloaded; i++) if (loaded[i].len == len && !memcmp(loaded[i].copy, table, len)) { aml_unlock(); return 0; }
+    if (nloaded == loaded_cap) {
+        int cap = loaded_cap ? loaded_cap * 2 : 16;
+        void *n = krealloc(loaded, cap * sizeof *loaded);
+        if (n) { loaded = n; loaded_cap = cap; }
+    }
     uint8_t *copy = kmalloc(len);   /* methods point into it: kept forever */
     memcpy(copy, table, len);
+    if (nloaded < loaded_cap) { loaded[nloaded].copy = copy; loaded[nloaded].len = len; nloaded++; }
     const char *saved = load_what;
     load_what = what;
     int before = aml_errors;
@@ -1177,7 +1289,8 @@ void aml_init(void) {
     ns_init();
     static const char *const scopes[] = { "_GPE", "_PR_", "_SB_", "_SI_", "_TZ_" };
     for (size_t i = 0; i < ARRAY_LEN(scopes); i++) ns_add(aml_root, scopes[i])->obj = obj_new(AML_DEVICE);
-    ns_add(aml_root, "_GL_")->obj = obj_new(AML_MUTEX);
+    gl_node = ns_add(aml_root, "_GL_");
+    gl_node->obj = obj_new(AML_MUTEX);
     ns_add(aml_root, "_OS_")->obj = obj_str("Microsoft Windows NT", 20);
     ns_add(aml_root, "_REV")->obj = obj_int(2);
     struct aml_obj *osi = obj_new(AML_METHOD);

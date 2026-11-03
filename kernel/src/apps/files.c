@@ -313,17 +313,19 @@ static void open_entry(struct files *f, int i) {
 
 static int copy_tree(const char *src, const char *dst) {
     struct stat st; if (vfs_stat(src, &st) < 0) return -1;
+    size_t sl = strlen(src);
+    if (!strcmp(src, "/") || (!strncmp(dst, src, sl) && (dst[sl] == 0 || dst[sl] == '/'))) return -1;   /* into itself */
     if (st.type == VN_DIR) {
-        vfs_mkdir(dst);
+        int r = vfs_mkdir(dst); if (r < 0 && r != -EEXIST) return -1;
         struct vnode *d = vfs_lookup(src); if (!d) return -1;
         struct dirent de;
         for (int i = 0; vfs_readdir(d, i, &de) == 0; i++) {
             char a[PATH_MAX], b[PATH_MAX];
             snprintf(a, sizeof a, "%s/%s", src, de.name); snprintf(b, sizeof b, "%s/%s", dst, de.name);
-            copy_tree(a, b);
+            if (copy_tree(a, b) < 0) r = -1;
         }
         vnode_unref(d);
-        return 0;
+        return r < 0 ? -1 : 0;
     }
     void *data; size_t sz;
     if (vfs_read_file(src, &data, &sz) < 0) return -1;
@@ -361,6 +363,7 @@ static void trash_selected(struct files *f) {
         else {
             char dst[PATH_MAX]; unique_dest("/home/flux/.Trash", f->entries[i].name, dst, sizeof dst);
             if (copy_tree(p, dst) == 0) remove_tree(p);
+            else dialog_message("Files", "The item could not be moved to the Trash.");
         }
     }
     load_dir(f);
@@ -389,7 +392,7 @@ static void rename_selected(struct files *f) {
     char a[PATH_MAX], b[PATH_MAX]; full_path(f, f->entries[i].name, a, sizeof a); full_path(f, name, b, sizeof b);
     struct stat st;
     if (vfs_stat(b, &st) == 0) { dialog_message("Files", "An item with that name already exists."); return; }
-    if (f->entries[i].type == VN_DIR) { if (copy_tree(a, b) == 0) remove_tree(a); }
+    if (f->entries[i].type == VN_DIR) { if (copy_tree(a, b) == 0) remove_tree(a); else dialog_message("Files", "The folder could not be renamed."); }
     else vfs_rename(a, b);
     load_dir(f);
     for (int k = 0; k < f->nentries; k++) if (!strcmp(f->entries[k].name, name)) select_only(f, k);
@@ -417,10 +420,10 @@ static void duplicate_selected(struct files *f) {
     load_dir(f);
 }
 static void paste(struct files *f) {
-    if (!f->clip_path[0]) { char *s = clipboard_get(); if (s) { struct stat st; if (s[0] == '/' && vfs_stat(s, &st) == 0) strlcpy(f->clip_path, s, PATH_MAX); kfree(s); } }
+    if (!f->clip_path[0]) { char *s = clipboard_get(); if (s) { struct stat st; if (s[0] == '/' && vfs_stat(s, &st) == 0) vfs_normalize("/", s, f->clip_path, PATH_MAX); kfree(s); } }
     if (!f->clip_path[0]) return;
     char dst[PATH_MAX]; unique_dest(f->path, vfs_basename(f->clip_path), dst, sizeof dst);
-    copy_tree(f->clip_path, dst);
+    if (copy_tree(f->clip_path, dst) < 0) dialog_message("Files", "The item could not be copied here.");
     load_dir(f);
 }
 static void empty_trash(struct files *f) {

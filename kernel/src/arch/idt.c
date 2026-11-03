@@ -33,6 +33,9 @@ void idt_init(void) {
     memset(idt, 0, sizeof idt);
     for (int i = 0; i < 256; i++) idt_set_gate(i, isr_table[i], 0, 0);
     idt_set_gate(3, isr_table[3], 0, 3);   /* int3 usable from user mode */
+    idt_set_gate(8, isr_table[8], 1, 0);   /* IST stacks set up in gdt_init */
+    idt_set_gate(2, isr_table[2], 2, 0);
+    idt_set_gate(18, isr_table[18], 3, 0);
     idtr.limit = sizeof idt - 1;
     idtr.base = (uint64_t)idt;
     __asm__ volatile("lidt %0" :: "m"(idtr));
@@ -57,7 +60,9 @@ static void dump_regs(struct regs *r) {
 
 void isr_dispatch(struct regs *r) {
     if (r->int_no < 32) {
-        if (r->cs & 3) {
+        /* NMI, #DF and #MC run on IST stacks, which must never be left via schedule() */
+        if (r->int_no == 2 && (r->cs & 3)) { kprintf("NMI in user mode at rip=%lx\n", r->rip); return; }
+        if ((r->cs & 3) && r->int_no != 8 && r->int_no != 18) {
             /* fault in user mode: kill the offending process */
             struct thread *t = current_thread;
             kprintf("[proc %d '%s'] %s at rip=%lx cr2=%lx err=%lx -> killed\n",

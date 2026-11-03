@@ -70,11 +70,11 @@ static void put_char(struct term *t, uint32_t cp) {
 static void erase_display(struct term *t, int mode) {
     if (mode == 2 || mode == 3) { for (int y = 0; y < t->rows; y++) clear_cells(t, row(t, y), t->cols); if (mode == 3) t->sb_lines = 0; return; }
     if (mode == 0) { clear_cells(t, &row(t, t->cy)[t->cx], t->cols - t->cx); for (int y = t->cy + 1; y < t->rows; y++) clear_cells(t, row(t, y), t->cols); }
-    else { for (int y = 0; y < t->cy; y++) clear_cells(t, row(t, y), t->cols); clear_cells(t, row(t, t->cy), t->cx + 1); }
+    else { for (int y = 0; y < t->cy; y++) clear_cells(t, row(t, y), t->cols); clear_cells(t, row(t, t->cy), MIN(t->cx + 1, t->cols)); }
 }
 static void erase_line(struct term *t, int mode) {
     if (mode == 0) clear_cells(t, &row(t, t->cy)[t->cx], t->cols - t->cx);
-    else if (mode == 1) clear_cells(t, row(t, t->cy), t->cx + 1);
+    else if (mode == 1) clear_cells(t, row(t, t->cy), MIN(t->cx + 1, t->cols));
     else clear_cells(t, row(t, t->cy), t->cols);
 }
 static void sgr(struct term *t) {
@@ -112,12 +112,12 @@ static void csi(struct term *t, char final) {
     case 'X': clear_cells(t, &row(t, t->cy)[t->cx], MIN(n, t->cols - t->cx)); break;
     case 'P': { struct cell *r = row(t, t->cy); int k = MIN(n, t->cols - t->cx); memmove(r + t->cx, r + t->cx + k, (t->cols - t->cx - k) * sizeof(struct cell)); clear_cells(t, r + t->cols - k, k); break; }
     case '@': { struct cell *r = row(t, t->cy); int k = MIN(n, t->cols - t->cx); memmove(r + t->cx + k, r + t->cx, (t->cols - t->cx - k) * sizeof(struct cell)); clear_cells(t, r + t->cx, k); break; }
-    case 'L': for (int i = 0; i < n; i++) { memmove(row(t, t->cy + 1), row(t, t->cy), (t->rows - t->cy - 1) * t->cols * sizeof(struct cell)); clear_cells(t, row(t, t->cy), t->cols); } break;
-    case 'M': for (int i = 0; i < n; i++) { memmove(row(t, t->cy), row(t, t->cy + 1), (t->rows - t->cy - 1) * t->cols * sizeof(struct cell)); clear_cells(t, row(t, t->rows - 1), t->cols); } break;
-    case 'S': for (int i = 0; i < n; i++) scroll_up(t); break;
+    case 'L': n = MIN(n, t->rows - t->cy); for (int i = 0; i < n; i++) { memmove(row(t, t->cy + 1), row(t, t->cy), (t->rows - t->cy - 1) * t->cols * sizeof(struct cell)); clear_cells(t, row(t, t->cy), t->cols); } break;
+    case 'M': n = MIN(n, t->rows - t->cy); for (int i = 0; i < n; i++) { memmove(row(t, t->cy), row(t, t->cy + 1), (t->rows - t->cy - 1) * t->cols * sizeof(struct cell)); clear_cells(t, row(t, t->rows - 1), t->cols); } break;
+    case 'S': n = MIN(n, t->rows); for (int i = 0; i < n; i++) scroll_up(t); break;
     case 'm': sgr(t); break;
     case 's': t->saved_x = t->cx; t->saved_y = t->cy; break;
-    case 'u': t->cx = t->saved_x; t->cy = t->saved_y; break;
+    case 'u': t->cx = MIN(t->saved_x, t->cols - 1); t->cy = MIN(t->saved_y, t->rows - 1); break;
     case 'h': if (t->priv_mode && p0 == 25) t->cursor_visible = true; break;
     case 'l': if (t->priv_mode && p0 == 25) t->cursor_visible = false; break;
     case 'd': t->cy = CLAMP(n - 1, 0, t->rows - 1); break;
@@ -144,10 +144,10 @@ static void term_putc(struct term *t, unsigned char c) {
         if (c == '[') { t->state = 2; t->nparams = 0; t->params[0] = 0; t->priv_mode = false; }
         else if (c == ']') { t->state = 3; t->osc_len = 0; }
         else if (c == '(' || c == ')') t->state = 4;
-        else { if (c == 'c') { erase_display(t, 2); t->cx = t->cy = 0; t->fg = t->def_fg; t->bg = t->def_bg; t->attr = 0; } else if (c == '7') { t->saved_x = t->cx; t->saved_y = t->cy; } else if (c == '8') { t->cx = t->saved_x; t->cy = t->saved_y; } else if (c == 'M') { if (t->cy == 0) { memmove(row(t, 1), row(t, 0), (t->rows - 1) * t->cols * sizeof(struct cell)); clear_cells(t, row(t, 0), t->cols); } else t->cy--; } t->state = 0; }
+        else { if (c == 'c') { erase_display(t, 2); t->cx = t->cy = 0; t->fg = t->def_fg; t->bg = t->def_bg; t->attr = 0; } else if (c == '7') { t->saved_x = t->cx; t->saved_y = t->cy; } else if (c == '8') { t->cx = MIN(t->saved_x, t->cols - 1); t->cy = MIN(t->saved_y, t->rows - 1); } else if (c == 'M') { if (t->cy == 0) { memmove(row(t, 1), row(t, 0), (t->rows - 1) * t->cols * sizeof(struct cell)); clear_cells(t, row(t, 0), t->cols); } else t->cy--; } t->state = 0; }
         break;
     case 2:   /* CSI */
-        if (c >= '0' && c <= '9') { if (t->nparams == 0) t->nparams = 1; t->params[t->nparams - 1] = t->params[t->nparams - 1] * 10 + (c - '0'); }
+        if (c >= '0' && c <= '9') { if (t->nparams == 0) t->nparams = 1; t->params[t->nparams - 1] = MIN(9999, t->params[t->nparams - 1] * 10 + (c - '0')); }
         else if (c == ';') { if (t->nparams == 0) t->nparams = 1; if (t->nparams < 16) { t->params[t->nparams++] = 0; } }
         else if (c == '?') t->priv_mode = true;
         else if (c >= 0x40 && c <= 0x7E) { csi(t, c); t->state = 0; }
@@ -267,6 +267,7 @@ void shell_main(void *arg);
 struct shell_start { struct tty *tty; char *cwd; char *cmd; };
 
 static void term_interrupt(void *priv) { UNUSED(priv); }
+static bool shell_alive(struct term *t) { uint64_t f = irq_save(); struct process *p = process_find(t->shell_pid); bool a = p && !p->exited; irq_restore(f); return a; }
 
 void terminal_main(void *arg) {
     struct term *t = kzalloc(sizeof *t);
@@ -308,8 +309,7 @@ void terminal_main(void *arg) {
             break;
         case EV_USER: break;
         case EV_TIMER: {
-            struct process *sp = process_find(t->shell_pid);
-            if (!sp || sp->exited) { quit = true; break; }
+            if (!shell_alive(t)) { quit = true; break; }
             char title[96]; snprintf(title, sizeof title, "%s — %dx%d", t->title[0] ? t->title : "zsh", t->cols, t->rows);
             if (strcmp(title, t->w->title)) window_set_title(t->w, title);
             break; }
@@ -322,11 +322,10 @@ void terminal_main(void *arg) {
     }
     /* tear down: kill the shell and its foreground job */
     if (t->tty->fg_pid > 0) process_kill(t->tty->fg_pid, 9);
-    struct process *shp = process_find(t->shell_pid);
-    if (shp && !shp->exited) process_kill(t->shell_pid, 9);
+    if (shell_alive(t)) process_kill(t->shell_pid, 9);
     tty_destroy(t->tty);
     window_destroy(t->w);
-    for (int i = 0; i < 50 && (shp = process_find(t->shell_pid)) && !shp->exited; i++) thread_sleep_ms(10);
-    if ((shp = process_find(t->shell_pid))) process_wait(t->shell_pid, NULL);
+    for (int i = 0; i < 50 && shell_alive(t); i++) thread_sleep_ms(10);
+    process_wait(t->shell_pid, NULL);   /* -1 if already gone */
     kfree(t->grid); kfree(t->sb); kfree(t);
 }

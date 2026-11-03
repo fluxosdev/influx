@@ -21,9 +21,8 @@ struct prdt_entry { uint32_t dba, dbau, res0; uint32_t dbc : 22, res1 : 9, i : 1
 struct cmd_table { uint8_t cfis[64], acmd[16], res[48]; struct prdt_entry prdt[16]; } PACKED;
 struct fis_h2d { uint8_t type, pmport : 4, res0 : 3, c : 1, command, featurel, lba0, lba1, lba2, device, lba3, lba4, lba5, featureh, countl, counth, icc, control, res1[4]; } PACKED;
 
-struct ahci_port { volatile struct hba_port *regs; struct cmd_header *clb; struct cmd_table *ctb; uint8_t *fb; int index; };
+struct ahci_port { volatile struct hba_port *regs; struct cmd_header *clb; struct cmd_table *ctb; uint8_t *fb; int index; bool failed; };
 static volatile struct hba_mem *hba;
-static int ndisks;
 
 #define PORT_CMD_ST  (1 << 0)
 #define PORT_CMD_FRE (1 << 4)
@@ -40,15 +39,33 @@ static void port_stop(volatile struct hba_port *p) {
     for (int i = 0; i < 100000 && (p->cmd & (PORT_CMD_FR | PORT_CMD_CR)); i++) pause();
 }
 static void port_start(volatile struct hba_port *p) {
-    while (p->cmd & PORT_CMD_CR) pause();
+    for (int i = 0; i < 1000000 && (p->cmd & PORT_CMD_CR); i++) pause();
     p->cmd |= PORT_CMD_FRE;
     p->cmd |= PORT_CMD_ST;
 }
 
+/* After a timeout or task file error the command is still outstanding (PxCI set) and could DMA into a
+ * buffer the caller frees: stop the port (clearing ST makes the HBA drop it), COMRESET if the device is
+ * still busy, then restart. If the port cannot be stopped or the link does not return, give up on it. */
+static void port_recover(struct ahci_port *ap) {
+    volatile struct hba_port *p = ap->regs;
+    p->cmd &= ~PORT_CMD_ST;
+    for (int i = 0; i < 500 && (p->cmd & PORT_CMD_CR); i++) thread_sleep_ms(1);
+    if (p->cmd & PORT_CMD_CR) { ap->failed = true; kprintf("ahci: port %d: cannot stop command engine, port disabled\n", ap->index); return; }
+    if (p->tfd & 0x88) {
+        p->sctl = (p->sctl & ~0xFu) | 1; thread_sleep_ms(2); p->sctl &= ~0xFu;
+        for (int i = 0; i < 1000 && ((p->ssts & 0xF) != 3 || (p->tfd & 0x88)); i++) thread_sleep_ms(1);
+    }
+    p->serr = 0xFFFFFFFF; p->is = 0xFFFFFFFF;
+    if ((p->ssts & 0xF) != 3 || (p->tfd & 0x88)) { ap->failed = true; kprintf("ahci: port %d: device did not recover, port disabled\n", ap->index); return; }
+    p->cmd |= PORT_CMD_FRE | PORT_CMD_ST;
+}
+
 static int ahci_cmd(struct ahci_port *ap, uint8_t cmd, uint64_t lba, uint16_t count, void *buf, size_t bytes, bool write) {
     volatile struct hba_port *p = ap->regs;
+    if (ap->failed) return -EIO;
     for (int i = 0; i < 1000000 && (p->tfd & 0x88); i++) pause();   /* BSY | DRQ */
-    if (p->tfd & 0x88) return -EIO;
+    if (p->tfd & 0x88) { port_recover(ap); if (ap->failed) return -EIO; }
     struct cmd_header *h = &ap->clb[0];
     h->cfl = sizeof(struct fis_h2d) / 4; h->w = write ? 1 : 0; h->p = 0; h->c = 1;
     struct cmd_table *t = ap->ctb;
@@ -73,11 +90,14 @@ static int ahci_cmd(struct ahci_port *ap, uint8_t cmd, uint64_t lba, uint16_t co
     p->ci = 1;
     for (int i = 0; i < 5000000; i++) {
         if (!(p->ci & 1)) break;
-        if (p->is & (1u << 30)) return -EIO;   /* task file error */
+        if (p->is & (1u << 30)) break;   /* task file error */
         if (i > 1000) thread_yield(); else pause();
     }
-    if (p->ci & 1) return -EIO;
-    if (p->is & (1u << 30)) return -EIO;
+    if ((p->ci & 1) || (p->is & (1u << 30))) {
+        kprintf("ahci: port %d: command %02x %s, resetting port\n", ap->index, cmd, (p->is & (1u << 30)) ? "failed" : "timed out");
+        port_recover(ap);
+        return -EIO;
+    }
     return 0;
 }
 
@@ -126,7 +146,7 @@ static void init_port(int i) {
     uint16_t *id = kmalloc(512);
     if (ahci_cmd(ap, ATA_IDENTIFY, 0, 0, id, 512, false) < 0) { kprintf("ahci: port %d: identify failed\n", i); kfree(id); return; }
     struct blockdev *d = kzalloc(sizeof *d);
-    snprintf(d->name, sizeof d->name, "sd%c", 'a' + ndisks++);
+    blockdev_alloc_name("sd", d->name, sizeof d->name);
     ata_string(id + 27, 20, d->model);
     uint64_t sectors = *(uint64_t *)(id + 100);
     if (!sectors) sectors = *(uint32_t *)(id + 60);

@@ -8,12 +8,13 @@
 #define CACHE_BUCKETS 256
 #define CACHE_MAX 384
 #define MAX_PENDING 128
+#define BTRFS_MAX_LEVEL 8
 struct pending_block { uint64_t bytenr; int level; uint64_t owner; bool free; };
 
 struct chunk_map { uint64_t logical, length, type; int nstripes; uint64_t stripe_dev[4], stripe_phys[4]; };
 struct tree_block { uint64_t logical; uint8_t *data; bool dirty, pinned; uint64_t lru; struct tree_block *hnext; };
 struct btrfs_tree { uint64_t objectid, bytenr; int level; uint64_t generation; };
-struct btrfs_path { struct btrfs_tree *tree; struct tree_block *blocks[8]; int slots[8]; int top; };
+struct btrfs_path { struct btrfs_tree *tree; struct tree_block *blocks[BTRFS_MAX_LEVEL]; int slots[BTRFS_MAX_LEVEL]; int top; };
 
 struct btrfs_fs {
     struct blockdev *dev;
@@ -22,6 +23,7 @@ struct btrfs_fs {
     struct chunk_map chunks[MAX_CHUNKS]; int nchunks;
     uint8_t chunk_tree_uuid[16];
     struct tree_block *cache[CACHE_BUCKETS]; int ncached; uint64_t lru_clock;
+    uint64_t op_start;            /* lru_clock at the start of the current operation: blocks used since may sit in live paths */
     struct btrfs_tree root_tree, extent_tree, csum_tree, fs_tree, bg_tree, fst, chunk_tree, dev_tree;
     bool in_chunk_alloc;
     bool fst_ok;
@@ -72,6 +74,7 @@ int btrfs_csum_insert(struct btrfs_fs *fs, uint64_t bytenr, const void *data, ui
 int btrfs_csum_remove(struct btrfs_fs *fs, uint64_t bytenr, uint64_t len);
 int btrfs_commit(struct btrfs_fs *fs);
 void btrfs_begin(struct btrfs_fs *fs);
+void btrfs_op_begin(struct btrfs_fs *fs);   /* call with fs->lock held, before any tree access of a new operation */
 void btrfs_flush_pending(struct btrfs_fs *fs);
 int btrfs_alloc_chunk(struct btrfs_fs *fs, uint64_t type, uint64_t want);
 int btrfs_mkfs(struct blockdev *d, const char *label);

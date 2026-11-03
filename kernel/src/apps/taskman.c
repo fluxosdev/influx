@@ -45,6 +45,7 @@ static int cmp_rows(const struct prow *a, const struct prow *b, int col) {
 
 static void refresh(struct tm_app *t) {
     sched_sample_cpu();
+    uint64_t irqf = irq_save();   /* the reaper can't free a process while we copy it (single CPU) */
     struct process *list[64]; int n = process_list(list, 64);
     t->nrows = 0; t->total_threads = 0;
     for (int i = 0; i < n; i++) {
@@ -57,6 +58,7 @@ static void refresh(struct tm_app *t) {
         if (p->pid == 1) r->cpu = 0;   /* kernel: idle thread would dominate */
         t->total_threads += r->threads;
     }
+    irq_restore(irqf);
     for (int i = 1; i < t->nrows; i++) { struct prow k = t->rows[i]; int j = i - 1; while (j >= 0) { int c = cmp_rows(&t->rows[j], &k, t->sort_col); if (t->sort_desc) c = -c; if (c <= 0) break; t->rows[j + 1] = t->rows[j]; j--; } t->rows[j + 1] = k; }
     t->cpu_hist[t->hist_pos] = 100 - sched_idle_percent();
     t->hist_pos = (t->hist_pos + 1) % HIST;
@@ -163,17 +165,19 @@ static void force_quit(struct tm_app *t) {
     if (t->selected_pid <= 1) return;
     struct prow *r = NULL; for (int i = 0; i < t->nrows; i++) if (t->rows[i].pid == t->selected_pid) r = &t->rows[i];
     if (!r) return;
-    if (r->pid == current_thread->proc->pid) { if (dialog_confirm("Task Manager", "Quit Task Manager?", "Quit", false)) process_exit(0); return; }
+    if (r->pid == current_thread->proc->pid) { if (dialog_confirm("Task Manager", "Quit Task Manager?", "Quit", false)) { struct event e = { .type = EV_CLOSE }; window_post_event(t->w, &e); } return; }
     char msg[160]; snprintf(msg, sizeof msg, "Do you want to force “%s” (PID %d) to quit?\nYou will lose any unsaved changes.", r->name, r->pid);
     if (dialog_confirm("Force Quit", msg, "Force Quit", true)) process_kill(r->pid, 9);
 }
 static void process_info(struct tm_app *t) {
     struct prow *r = NULL; for (int i = 0; i < t->nrows; i++) if (t->rows[i].pid == t->selected_pid) r = &t->rows[i];
     if (!r) return;
+    uint64_t irqf = irq_save();
     struct process *p = process_find(r->pid);
     char mem[32]; format_mem(r->mem, mem, sizeof mem);
     char msg[400]; int o = snprintf(msg, sizeof msg, "%s\n\nPID: %d\nType: %s\nThreads: %d\nMemory: %s\nCPU: %d%%", r->name, r->pid, r->user ? "User process" : "Kernel process", r->threads, mem, r->cpu);
-    if (p) { struct thread *th; list_for_each_entry(th, &p->threads, proc_link) if (o < (int)sizeof msg - 40) o += snprintf(msg + o, sizeof msg - o, "\n  thread %d “%s”: %lu ms", th->tid, th->name, th->cpu_ticks); if (p->is_user == false && p->cwd[0]) o += snprintf(msg + o, sizeof msg - o, "\nWorking directory: %s", p->cwd); }
+    if (p) { struct thread *th; list_for_each_entry(th, &p->threads, proc_link) if (o < (int)sizeof msg - 40) o += snprintf(msg + o, sizeof msg - o, "\n  thread %d “%s”: %lu ms", th->tid, th->name, th->cpu_ticks); if (p->is_user == false && p->cwd[0] && o < (int)sizeof msg) o += snprintf(msg + o, sizeof msg - o, "\nWorking directory: %s", p->cwd); }
+    irq_restore(irqf);
     dialog_message("Process Info", msg);
 }
 

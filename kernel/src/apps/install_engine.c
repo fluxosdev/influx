@@ -115,8 +115,9 @@ int install_run(struct blockdev *disk, install_progress_fn progress, void *ctx) 
     if (!disk || disk->parent) return -EINVAL;
     char msg[160];
     #define STEP(pct, ...) do { snprintf(msg, sizeof msg, __VA_ARGS__); kprintf("install: %s\n", msg); if (progress) progress(ctx, pct, msg); } while (0)
+    if (disk->sector_size != 512) { STEP(100, "%s has %u-byte sectors; only 512-byte sector disks are supported", disk->name, disk->sector_size); return -EINVAL; }
     /* never install onto a disk that is currently mounted */
-    for (int i = 0; i < blockdev_count(); i++) { struct blockdev *b = blockdev_at(i); if ((b == disk || b->parent == disk) && b->fs_type) { for (int m = 0; m < vfs_mount_count(); m++) { char mp[PATH_MAX]; struct vnode *r = vfs_mount_at(m, mp, sizeof mp); if (r->priv == b) { STEP(0, "%s is mounted at %s; unmounting", b->name, mp); vfs_unmount(mp); } } } }
+    for (int i = 0; i < blockdev_count(); i++) { struct blockdev *b = blockdev_at(i); if (b && (b == disk || b->parent == disk) && b->fs_type) { for (int m = 0; m < vfs_mount_count(); m++) { char mp[PATH_MAX]; struct vnode *r = vfs_mount_at(m, mp, sizeof mp); if (r && r->priv == b) { STEP(0, "%s is mounted at %s; unmounting", b->name, mp); vfs_unmount(mp); } } } }
     STEP(2, "Writing GPT partition table to %s", disk->name);
     int r = write_gpt(disk, progress, ctx);
     if (r < 0) { STEP(100, "Partitioning failed (%d)", r); return r; }
@@ -134,7 +135,8 @@ int install_run(struct blockdev *disk, install_progress_fn progress, void *ctx) 
     /* boot files */
     struct vnode *esp_root = fat32_mount(esp);
     if (!esp_root) { STEP(100, "Cannot mount the new EFI partition"); return -EIO; }
-    vfs_mkdir("/mnt"); vfs_mount("/mnt/.install-esp", esp_root);
+    vfs_mkdir("/mnt");
+    if ((r = vfs_mount("/mnt/.install-esp", esp_root)) < 0) { STEP(100, "Cannot mount the new EFI partition (%d)", r); return r; }
     STEP(28, "Copying bootloader");
     vfs_mkdir("/mnt/.install-esp/EFI"); vfs_mkdir("/mnt/.install-esp/EFI/BOOT"); vfs_mkdir("/mnt/.install-esp/boot");
     r = copy_file("/boot/limine/BOOTX64.EFI", "/mnt/.install-esp/EFI/BOOT/BOOTX64.EFI");
@@ -153,7 +155,7 @@ int install_run(struct blockdev *disk, install_progress_fn progress, void *ctx) 
     /* root volume contents */
     struct vnode *root_vn = btrfs_mount(rootp);
     if (!root_vn) { STEP(100, "Cannot mount the new root volume"); return -EIO; }
-    vfs_mount("/mnt/.install-root", root_vn);
+    if ((r = vfs_mount("/mnt/.install-root", root_vn)) < 0) { STEP(100, "Cannot mount the new root volume (%d)", r); return r; }
     STEP(74, "Creating home directory");
     r = vfs_write_file("/mnt/.install-root/.influx_root", "inFlux root volume\n", 19);
     if (r == 0) r = copy_tree("/home/flux", "/mnt/.install-root/flux");
@@ -171,7 +173,7 @@ int install_run(struct blockdev *disk, install_progress_fn progress, void *ctx) 
 int display_persist_resolution(int w, int h) {
     for (int i = 0; i < vfs_mount_count(); i++) {
         char mp[PATH_MAX]; struct vnode *root = vfs_mount_at(i, mp, sizeof mp);
-        if (!root->fs_name || strcmp(root->fs_name, "fat32")) continue;
+        if (!root || !root->fs_name || strcmp(root->fs_name, "fat32")) continue;
         char path[PATH_MAX]; snprintf(path, sizeof path, "%s/limine.conf", mp);
         void *data; size_t sz;
         if (vfs_read_file(path, &data, &sz) < 0) continue;

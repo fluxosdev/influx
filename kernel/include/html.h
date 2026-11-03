@@ -43,6 +43,7 @@ struct html_image {
     struct canvas *scaled;         /* cached copy at the size it was last painted */
     bool failed;
     struct html_image *next;
+    struct html_image *hnext;      /* parser's URL hash chain */
 };
 
 enum { FF_TEXT, FF_PASSWORD, FF_SUBMIT, FF_RESET, FF_BUTTON, FF_CHECKBOX, FF_RADIO, FF_HIDDEN, FF_SELECT, FF_TEXTAREA, FF_IMAGE };

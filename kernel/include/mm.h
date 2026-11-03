@@ -5,6 +5,7 @@
 void pmm_init(void);
 uint64_t pmm_alloc_pages(size_t count);     /* physical address, contiguous, zeroed */
 uint64_t pmm_alloc_page(void);
+uint64_t pmm_alloc_pages_low(size_t count); /* below 4 GiB, zeroed; 0 if none */
 void pmm_free_pages(uint64_t phys, size_t count);
 void pmm_free_page(uint64_t phys);
 uint64_t pmm_total_bytes(void);

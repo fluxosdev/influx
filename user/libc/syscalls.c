@@ -44,8 +44,10 @@ int pipe(int fds[2]) { return (int)ret(syscall1(SYS_PIPE, (long)fds)); }
 int dup2(int o, int n) { return (int)ret(syscall2(SYS_DUP2, o, n)); }
 int ioctl(int fd, int cmd, void *arg) { return (int)ret(syscall3(SYS_IOCTL, fd, cmd, (long)arg)); }
 int isatty(int fd) { int wh[2]; return syscall3(SYS_IOCTL, fd, 2, (long)wh) == 0; }
-int win_create(int w, int h, const char *title) { return (int)ret(syscall3(SYS_WIN_CREATE, w, h, (long)title)); }
-int win_present(int id, const uint32_t *px) { return (int)ret(syscall2(SYS_WIN_PRESENT, id, (long)px)); }
-int win_event(int id, struct win_event *ev, int timeout_ms) { return (int)syscall3(SYS_WIN_EVENT, id, (long)ev, timeout_ms); }
+/* the buffer size the app presents: the creation size until it sees a resize event */
+static int win_wh[8][2];
+int win_create(int w, int h, const char *title) { int r = (int)ret(syscall3(SYS_WIN_CREATE, w, h, (long)title)); if (r >= 0 && r < 8) { win_wh[r][0] = w; win_wh[r][1] = h; } return r; }
+int win_present(int id, const uint32_t *px) { int ok = id >= 0 && id < 8; return (int)ret(syscall4(SYS_WIN_PRESENT, id, (long)px, ok ? win_wh[id][0] : 0, ok ? win_wh[id][1] : 0)); }
+int win_event(int id, struct win_event *ev, int timeout_ms) { int r = (int)syscall3(SYS_WIN_EVENT, id, (long)ev, timeout_ms); if (r == 1 && ev->type == WEV_RESIZE && id >= 0 && id < 8 && ev->w > 0 && ev->h > 0) { win_wh[id][0] = ev->w; win_wh[id][1] = ev->h; } return r; }
 int win_destroy(int id) { return (int)ret(syscall1(SYS_WIN_DESTROY, id)); }
 int win_set_title(int id, const char *t) { return (int)ret(syscall2(SYS_WIN_TITLE, id, (long)t)); }

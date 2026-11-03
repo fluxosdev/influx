@@ -114,6 +114,8 @@ const char *ec_describe(void);
 
 /* pm.c */
 void acpi_notify(struct aml_node *n, uint64_t value);
+bool acpi_gl_acquire(uint32_t timeout_ms);   /* FACS global lock, nests; true if held (or there is none) */
+void acpi_gl_release(void);
 uint64_t acpi_timer_100ns(void);
 void acpi_stall_us(uint64_t us);
 
@@ -146,6 +148,16 @@ struct acpi_fadt {
 #define FADT_HW_REDUCED    (1u << 20)
 
 /* arch/acpi.c */
+#define ACPI_MAX_TABLE (16u << 20)     /* sanity bound on a table's length */
+#define MAX_IOAPICS 8
+struct ioapic_info { uint64_t addr; uint32_t gsi_base; };
+extern struct ioapic_info ioapics[MAX_IOAPICS];   /* from the MADT; madt.ioapic_* is the first */
+extern int nioapics;
 struct acpi_fadt *acpi_fadt(void);
 void *acpi_table_at(int i, char sig[4]);       /* i-th table in the RSDT/XSDT, NULL past the end */
 void *acpi_map_phys(uint64_t phys, size_t len);
+
+/* arch/pci.c (not in arch.h) */
+uint8_t pci_read8(uint8_t bus, uint8_t slot, uint8_t func, uint8_t off);
+void pci_write8(uint8_t bus, uint8_t slot, uint8_t func, uint8_t off, uint8_t v);
+bool pci_irq_share_gsi(uint32_t gsi, bool level, bool active_low, irq_handler_t h, void *ctx);   /* the SCI joins the INTx dispatchers */

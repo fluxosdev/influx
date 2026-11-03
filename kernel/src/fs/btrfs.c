@@ -5,6 +5,7 @@
 
 #define EXTENT_MAX (1024 * 1024)
 #define MAX_INLINE 2048
+#define WBUF_MAX (256ull << 20)   /* files are buffered whole in memory while written */
 int btrfs_flush_dirty_files(struct btrfs_fs *fs, bool only_old);
 void btrfs_register_flusher(struct btrfs_fs *fs);
 
@@ -69,6 +70,7 @@ static int dir_lookup(struct btrfs_fs *fs, uint64_t dir, const char *name, uint6
     while (d + sizeof(struct btrfs_dir_item) <= end) {
         struct btrfs_dir_item *di = (struct btrfs_dir_item *)d;
         const char *n = (const char *)(di + 1);
+        if ((uint8_t *)n + di->name_len + di->data_len > end) return -EIO;
         if (di->name_len == nl && !memcmp(n, name, nl)) {
             if (di->location.type != BTRFS_INODE_ITEM_KEY) return -ENOENT;   /* subvolume references are not supported */
             *ino = di->location.objectid; if (ftype) *ftype = di->type; return 0;
@@ -80,7 +82,7 @@ static int dir_lookup(struct btrfs_fs *fs, uint64_t dir, const char *name, uint6
 
 static struct vnode *b_lookup(struct vnode *dirv, const char *name) {
     struct bnode *dir = (struct bnode *)dirv; struct btrfs_fs *fs = dir->fs;
-    mutex_lock(&fs->lock);
+    mutex_lock(&fs->lock); btrfs_op_begin(fs);
     uint64_t ino; struct bnode *b = NULL;
     if (dir_lookup(fs, dir->ino, name, &ino, NULL) == 0) b = get_bnode(fs, ino, name);
     mutex_unlock(&fs->lock);
@@ -89,7 +91,7 @@ static struct vnode *b_lookup(struct vnode *dirv, const char *name) {
 
 static int b_readdir(struct vnode *dirv, int index, struct dirent *out) {
     struct bnode *dir = (struct bnode *)dirv; struct btrfs_fs *fs = dir->fs;
-    mutex_lock(&fs->lock);
+    mutex_lock(&fs->lock); btrfs_op_begin(fs);
     struct btrfs_key k = { dir->ino, BTRFS_DIR_INDEX_KEY, 0 };
     struct btrfs_path p;
     int r = btrfs_search(fs, &fs->fs_tree, &k, &p);
@@ -99,7 +101,7 @@ static int b_readdir(struct vnode *dirv, int index, struct dirent *out) {
         struct btrfs_key *ik = btrfs_path_key(&p);
         if (ik->objectid != dir->ino || ik->type != BTRFS_DIR_INDEX_KEY) break;
         struct btrfs_dir_item *di = btrfs_path_data(&p);
-        if (di->location.type == BTRFS_INODE_ITEM_KEY) {
+        if (btrfs_path_size(&p) >= sizeof *di && sizeof *di + di->name_len <= btrfs_path_size(&p) && di->location.type == BTRFS_INODE_ITEM_KEY) {
             if (i == index) {
                 size_t nl = MIN(di->name_len, NAME_MAX);
                 memcpy(out->name, di + 1, nl); out->name[nl] = 0;
@@ -140,6 +142,8 @@ static int64_t read_data(struct btrfs_fs *fs, uint64_t ino, uint64_t off, void *
             size_t z = MIN(n - done, estart - pos);
             memset(out + done, 0, z); done += z; continue;
         }
+        uint32_t isz = btrfs_path_size(&p);
+        if (isz < BTRFS_FILE_EXTENT_INLINE_DATA_START || (fe->type != 0 && isz < sizeof *fe)) return -EIO;
         if (fe->compression || fe->encryption) return -EIO;
         uint64_t elen;
         if (fe->type == 0) {
@@ -171,6 +175,7 @@ static int load_wbuf(struct btrfs_fs *fs, struct bnode *b) {
     struct btrfs_inode_item ii;
     int r = read_inode(fs, b->ino, &ii, NULL);
     if (r < 0) return r;
+    if (ii.size > WBUF_MAX) return -EFBIG;
     b->wcap = MAX(ii.size + 4096, 16384);
     b->wbuf = kmalloc(b->wcap);
     b->wsize = ii.size;
@@ -180,6 +185,7 @@ static int load_wbuf(struct btrfs_fs *fs, struct bnode *b) {
 static int flush_inode(struct btrfs_fs *fs, struct bnode *b) {
     if (!b->wdirty) return 0;
     int r = rewrite_file(fs, b, b->wbuf, b->wsize);
+    if (r < 0) return r;   /* keep the buffer: the old contents are intact on disk and the next flush retries */
     b->wdirty = false;
     kfree(b->wbuf); b->wbuf = NULL; b->wcap = 0;
     return r;
@@ -190,11 +196,11 @@ static int flush_all(struct btrfs_fs *fs, bool only_old) {
         if (b->wdirty && (!only_old || system_ticks - b->wdirty_since > 2000)) { int e = flush_inode(fs, b); if (e < 0) r = e; }
     return r;
 }
-int btrfs_flush_dirty_files(struct btrfs_fs *fs, bool only_old) { mutex_lock(&fs->lock); int r = flush_all(fs, only_old); mutex_unlock(&fs->lock); return r; }
+int btrfs_flush_dirty_files(struct btrfs_fs *fs, bool only_old) { mutex_lock(&fs->lock); btrfs_op_begin(fs); int r = flush_all(fs, only_old); mutex_unlock(&fs->lock); return r; }
 
 static int64_t b_read(struct vnode *v, uint64_t off, void *buf, size_t n) {
     struct bnode *b = (struct bnode *)v; struct btrfs_fs *fs = b->fs;
-    mutex_lock(&fs->lock);
+    mutex_lock(&fs->lock); btrfs_op_begin(fs);
     if (b->wbuf) {
         if (off >= b->wsize) { mutex_unlock(&fs->lock); return 0; }
         if (off + n > b->wsize) n = b->wsize - off;
@@ -223,7 +229,7 @@ static int remove_extents(struct btrfs_fs *fs, uint64_t ino) {
         if (btrfs_path_normalize(fs, &p)) return 0;
         struct btrfs_key *ik = btrfs_path_key(&p);
         if (ik->objectid != ino || ik->type != BTRFS_EXTENT_DATA_KEY) return 0;
-        struct btrfs_file_extent_item fe; memcpy(&fe, btrfs_path_data(&p), MIN(sizeof fe, btrfs_path_size(&p)));
+        struct btrfs_file_extent_item fe = { 0 }; memcpy(&fe, btrfs_path_data(&p), MIN(sizeof fe, btrfs_path_size(&p)));
         uint64_t file_off = ik->offset;
         btrfs_delete_item(fs, &p);
         if (fe.type != 0 && fe.disk_bytenr) btrfs_free_data_extent(fs, fe.disk_bytenr, fe.disk_num_bytes, fs->fs_tree.objectid, ino, file_off - fe.offset);
@@ -231,44 +237,57 @@ static int remove_extents(struct btrfs_fs *fs, uint64_t ino) {
     return 0;
 }
 
+/* replace the inode's data. Regular extents are written and recorded before the old ones are
+ * dropped, so ENOSPC/EIO leaves the old contents in place. */
 static int write_content(struct btrfs_fs *fs, uint64_t ino, const uint8_t *data, uint64_t size, bool nodatasum, uint64_t *nbytes_out) {
-    uint64_t nbytes = 0;
-    if (size == 0) { *nbytes_out = 0; return 0; }
+    uint64_t nbytes = 0, root = fs->fs_tree.objectid;
+    *nbytes_out = 0;
+    if (size == 0) return remove_extents(fs, ino);
     if (size <= MAX_INLINE && size < fs->sectorsize) {
+        int r = remove_extents(fs, ino);
+        if (r < 0) return r;
         uint8_t *item = kmalloc(BTRFS_FILE_EXTENT_INLINE_DATA_START + size);
         struct btrfs_file_extent_item *fe = (struct btrfs_file_extent_item *)item;
         memset(fe, 0, BTRFS_FILE_EXTENT_INLINE_DATA_START);
         fe->generation = fs->transid; fe->ram_bytes = size; fe->type = 0;
         memcpy(item + BTRFS_FILE_EXTENT_INLINE_DATA_START, data, size);
         struct btrfs_key k = { ino, BTRFS_EXTENT_DATA_KEY, 0 };
-        int r = btrfs_insert_item(fs, &fs->fs_tree, &k, item, BTRFS_FILE_EXTENT_INLINE_DATA_START + size, NULL);
+        r = btrfs_insert_item(fs, &fs->fs_tree, &k, item, BTRFS_FILE_EXTENT_INLINE_DATA_START + size, NULL);
         kfree(item);
         if (r < 0) return r;
         *nbytes_out = size;
         return 0;
     }
+    #define PIECE_ALEN(i) ALIGN_UP(MIN(size - (i) * EXTENT_MAX, (uint64_t)EXTENT_MAX), fs->sectorsize)
+    uint64_t npieces = (size + EXTENT_MAX - 1) / EXTENT_MAX, i, done = 0;
+    uint64_t *ext = kmalloc(npieces * sizeof *ext);
     uint8_t *tmp = kmalloc(EXTENT_MAX);
-    for (uint64_t off = 0; off < size; ) {
-        uint64_t len = MIN(size - off, (uint64_t)EXTENT_MAX);
-        uint64_t alen = ALIGN_UP(len, fs->sectorsize);
+    int r = 0;
+    for (i = 0; i < npieces; i++) {   /* 1: allocate, write and record the new extents */
+        uint64_t off = i * EXTENT_MAX, len = MIN(size - off, (uint64_t)EXTENT_MAX), alen = PIECE_ALEN(i);
         uint64_t bytenr = btrfs_alloc_data(fs, alen);
-        if (!bytenr) { kfree(tmp); return -ENOSPC; }
+        if (!bytenr) { r = -ENOSPC; break; }
         memcpy(tmp, data + off, len); if (alen > len) memset(tmp + len, 0, alen - len);
-        int r = btrfs_write_logical(fs, bytenr, tmp, alen);
-        if (r < 0) { kfree(tmp); return r; }
-        struct btrfs_file_extent_item fe = { 0 };
-        fe.generation = fs->transid; fe.ram_bytes = alen; fe.type = 1; fe.disk_bytenr = bytenr; fe.disk_num_bytes = alen; fe.offset = 0; fe.num_bytes = alen;
-        struct btrfs_key k = { ino, BTRFS_EXTENT_DATA_KEY, off };
-        r = btrfs_insert_item(fs, &fs->fs_tree, &k, &fe, sizeof fe, NULL);
-        if (r < 0) { kfree(tmp); return r; }
-        r = btrfs_record_data_extent(fs, bytenr, alen, fs->fs_tree.objectid, ino, off);
-        if (r < 0) { kfree(tmp); return r; }
-        if (!nodatasum) { r = btrfs_csum_insert(fs, bytenr, tmp, alen); if (r < 0) { kfree(tmp); return r; } }
-        nbytes += alen; off += len;
+        if ((r = btrfs_write_logical(fs, bytenr, tmp, alen)) < 0) break;
+        if ((r = btrfs_record_data_extent(fs, bytenr, alen, root, ino, off)) < 0) break;
+        ext[i] = bytenr;
+        if (!nodatasum && (r = btrfs_csum_insert(fs, bytenr, tmp, alen)) < 0) { i++; break; }
     }
     kfree(tmp);
+    if (r == 0) r = remove_extents(fs, ino);   /* 2: drop the old ones */
+    if (r == 0) for (; done < npieces; done++) {   /* 3: point the file at the new ones */
+        uint64_t alen = PIECE_ALEN(done);
+        struct btrfs_file_extent_item fe = { 0 };
+        fe.generation = fs->transid; fe.ram_bytes = alen; fe.type = 1; fe.disk_bytenr = ext[done]; fe.disk_num_bytes = alen; fe.offset = 0; fe.num_bytes = alen;
+        struct btrfs_key k = { ino, BTRFS_EXTENT_DATA_KEY, done * EXTENT_MAX };
+        if ((r = btrfs_insert_item(fs, &fs->fs_tree, &k, &fe, sizeof fe, NULL)) < 0) break;
+        nbytes += alen;
+    }
+    if (r < 0) for (uint64_t j = done; j < i; j++) btrfs_free_data_extent(fs, ext[j], PIECE_ALEN(j), root, ino, j * EXTENT_MAX);
+    #undef PIECE_ALEN
+    kfree(ext);
     *nbytes_out = nbytes;
-    return 0;
+    return r;
 }
 
 /* rewrite the whole file with new content (simple and always consistent) */
@@ -277,8 +296,6 @@ static int rewrite_file(struct btrfs_fs *fs, struct bnode *b, const uint8_t *con
     int r = read_inode(fs, b->ino, &ii, NULL);
     if (r < 0) return r;
     btrfs_begin(fs);
-    r = remove_extents(fs, b->ino);
-    if (r < 0) return r;
     uint64_t nbytes = 0;
     r = write_content(fs, b->ino, content, size, (ii.flags & BTRFS_INODE_NODATASUM) != 0, &nbytes);
     if (r < 0) return r;
@@ -295,11 +312,11 @@ static int64_t b_write(struct vnode *v, uint64_t off, const void *buf, size_t n)
     struct bnode *b = (struct bnode *)v; struct btrfs_fs *fs = b->fs;
     if (fs->readonly) return -EROFS;
     if (n == 0) return 0;
-    mutex_lock(&fs->lock);
+    if (off > WBUF_MAX || n > WBUF_MAX - off) return -EFBIG;
+    mutex_lock(&fs->lock); btrfs_op_begin(fs);
     int r = load_wbuf(fs, b);
     if (r < 0) { mutex_unlock(&fs->lock); return r; }
     uint64_t newsize = MAX(b->wsize, off + n);
-    if (newsize > 256ULL * 1024 * 1024) { mutex_unlock(&fs->lock); return -ENOSPC; }
     if (newsize > b->wcap) { uint64_t nc = b->wcap * 2; while (nc < newsize) nc *= 2; b->wbuf = krealloc(b->wbuf, nc); b->wcap = nc; }
     if (off > b->wsize) memset(b->wbuf + b->wsize, 0, off - b->wsize);
     memcpy(b->wbuf + off, buf, n);
@@ -313,7 +330,8 @@ static int64_t b_write(struct vnode *v, uint64_t off, const void *buf, size_t n)
 static int b_truncate(struct vnode *v, uint64_t size) {
     struct bnode *b = (struct bnode *)v; struct btrfs_fs *fs = b->fs;
     if (fs->readonly) return -EROFS;
-    mutex_lock(&fs->lock);
+    if (size > WBUF_MAX) return -EFBIG;
+    mutex_lock(&fs->lock); btrfs_op_begin(fs);
     int r = load_wbuf(fs, b);
     if (r < 0) { mutex_unlock(&fs->lock); return r; }
     if (size > b->wcap) { b->wbuf = krealloc(b->wbuf, size + 4096); b->wcap = size + 4096; }
@@ -376,7 +394,7 @@ static struct vnode *b_create(struct vnode *dirv, const char *name, int type) {
     if (fs->readonly) return NULL;
     size_t nl = strlen(name);
     if (nl == 0 || nl > 255) return NULL;
-    mutex_lock(&fs->lock);
+    mutex_lock(&fs->lock); btrfs_op_begin(fs);
     flush_all(fs, false);
     uint64_t existing;
     if (dir_lookup(fs, dir->ino, name, &existing, NULL) == 0) { mutex_unlock(&fs->lock); return NULL; }
@@ -414,6 +432,7 @@ static int remove_dir_item_entry(struct btrfs_fs *fs, uint64_t dir, const char *
     while (pos + sizeof(struct btrfs_dir_item) <= size) {
         struct btrfs_dir_item *di = (struct btrfs_dir_item *)(d + pos);
         uint32_t esz = sizeof *di + di->name_len + di->data_len;
+        if (pos + esz > size) return -EIO;
         if (di->name_len == nl && !memcmp(di + 1, name, nl)) {
             if (esz >= size) return btrfs_delete_item(fs, &p);
             memmove(d + pos, d + pos + esz, size - pos - esz);
@@ -428,7 +447,7 @@ static int remove_dir_item_entry(struct btrfs_fs *fs, uint64_t dir, const char *
 static int b_unlink(struct vnode *dirv, const char *name) {
     struct bnode *dir = (struct bnode *)dirv; struct btrfs_fs *fs = dir->fs;
     if (fs->readonly) return -EROFS;
-    mutex_lock(&fs->lock);
+    mutex_lock(&fs->lock); btrfs_op_begin(fs);
     flush_all(fs, false);
     uint64_t ino; uint8_t ftype;
     int r = dir_lookup(fs, dir->ino, name, &ino, &ftype);
@@ -443,6 +462,7 @@ static int b_unlink(struct vnode *dirv, const char *name) {
         size_t nl = strlen(name);
         while (d + sizeof(struct btrfs_inode_ref) <= end) {
             struct btrfs_inode_ref *ir = (struct btrfs_inode_ref *)d;
+            if (d + sizeof *ir + ir->name_len > end) break;
             if (ir->name_len == nl && !memcmp(ir + 1, name, nl)) { index = ir->index; have_index = true; break; }
             d += sizeof *ir + ir->name_len;
         }
@@ -461,7 +481,7 @@ static int b_unlink(struct vnode *dirv, const char *name) {
             struct btrfs_key *ik = btrfs_path_key(&p);
             if (ik->objectid != dir->ino || ik->type != BTRFS_DIR_INDEX_KEY) break;
             struct btrfs_dir_item *di = btrfs_path_data(&p);
-            if (di->name_len == strlen(name) && !memcmp(di + 1, name, di->name_len)) { index = ik->offset; have_index = true; break; }
+            if (btrfs_path_size(&p) >= sizeof *di + strlen(name) && di->name_len == strlen(name) && !memcmp(di + 1, name, di->name_len)) { index = ik->offset; have_index = true; break; }
             if (btrfs_next_item(fs, &p)) break;
         }
     }
@@ -492,7 +512,7 @@ static int b_unlink(struct vnode *dirv, const char *name) {
 
 static int b_sync(struct vnode *v) {
     struct bnode *b = (struct bnode *)v; struct btrfs_fs *fs = b->fs;
-    mutex_lock(&fs->lock);
+    mutex_lock(&fs->lock); btrfs_op_begin(fs);
     int r = flush_inode(fs, b);
     if (v == fs->root_vn) { int e = flush_all(fs, false); if (e < 0) r = e; }
     int c = btrfs_commit(fs); if (c < 0) r = c;

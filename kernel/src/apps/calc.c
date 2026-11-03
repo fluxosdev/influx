@@ -9,7 +9,7 @@ typedef __int128 dec_t;
 struct calc {
     struct window *w;
     char entry[32]; bool entering; bool has_dot;
-    dec_t acc; int op; bool have_acc; bool error;
+    dec_t acc; int op; bool have_acc; bool error, overflow;
     dec_t last_operand; int last_op;
     int pressed; int hover;
 };
@@ -43,30 +43,36 @@ static void dec_format(dec_t v, char *out, size_t n) {
     if (fl) { out[p++] = '.'; for (int i = 0; i < fl && p < n - 1; i++) out[p++] = fbuf[i]; }
     out[p] = 0;
 }
-static dec_t dec_parse(const char *s) {
+#define DEC_MAX ((dec_t)10000000000000LL * 1000000000000LL * SCALE)   /* 1e25 integer part: well inside int128 */
+static dec_t dec_parse(const char *s, bool *ovf) {
     bool neg = *s == '-'; if (neg) s++;
-    dec_t ip = 0; while (isdigit(*s)) ip = ip * 10 + (*s++ - '0');
+    dec_t ip = 0; while (isdigit(*s)) { ip = ip * 10 + (*s++ - '0'); if (ip > DEC_MAX / SCALE) { if (ovf) *ovf = true; return 0; } }
     dec_t fp = 0, scale = SCALE;
     if (*s == '.') { s++; while (isdigit(*s) && scale > 1) { scale /= 10; fp += (*s++ - '0') * scale; } }
     dec_t v = ip * SCALE + fp;
     return neg ? -v : v;
 }
 static dec_t apply(struct calc *c, dec_t a, int op, dec_t b) {
+    dec_t r;
     switch (op) {
-    case '+': return a + b;
-    case '-': return a - b;
-    case '*': return a * b / SCALE;
-    case '/': if (b == 0) { c->error = true; return 0; } return a * SCALE / b;
+    case '+': r = a + b; break;
+    case '-': r = a - b; break;
+    case '*': if (__builtin_mul_overflow(a, b, &r)) goto ovf; r /= SCALE; break;
+    case '/': if (b == 0) { c->error = true; return 0; } if (__builtin_mul_overflow(a, (dec_t)SCALE, &r)) goto ovf; r /= b; break;
+    default: return b;
     }
-    return b;
+    if (r > DEC_MAX || r < -DEC_MAX) goto ovf;
+    return r;
+ovf:
+    c->error = c->overflow = true; return 0;
 }
-static dec_t current_value(struct calc *c) { return c->entering ? dec_parse(c->entry) : c->acc; }
+static dec_t current_value(struct calc *c) { return c->entering ? dec_parse(c->entry, NULL) : c->acc; }
 
 static void draw(struct calc *c) {
     struct canvas *cv = window_begin_draw(c->w);
     gfx_fill(cv, RGB(0x1C, 0x1C, 0x1E));
     char disp[48];
-    if (c->error) strcpy(disp, "Error");
+    if (c->error) strcpy(disp, c->overflow ? "Overflow" : "Error");
     else if (c->entering) strcpy(disp, c->entry);
     else dec_format(c->acc, disp, sizeof disp);
     struct font *f = font_ui_huge;
@@ -109,7 +115,7 @@ static void press_key(struct calc *c, const char *k) {
         c->entry[l] = k[0]; c->entry[l + 1] = 0;
         return;
     }
-    if (!strcmp(k, "AC")) { c->entering = false; c->have_acc = false; c->acc = 0; c->op = 0; c->error = false; c->entry[0] = 0; return; }
+    if (!strcmp(k, "AC")) { c->entering = false; c->have_acc = false; c->acc = 0; c->op = 0; c->error = c->overflow = false; c->entry[0] = 0; return; }
     if (!strcmp(k, "±")) {
         if (c->entering) { if (c->entry[0] == '-') memmove(c->entry, c->entry + 1, strlen(c->entry)); else { memmove(c->entry + 1, c->entry, strlen(c->entry) + 1); c->entry[0] = '-'; } }
         else c->acc = -c->acc;
@@ -126,7 +132,7 @@ static void press_key(struct calc *c, const char *k) {
     }
     if (!strcmp(k, "=")) {
         if (c->op) {
-            dec_t v = c->entering ? dec_parse(c->entry) : c->last_operand;
+            dec_t v = c->entering ? dec_parse(c->entry, NULL) : c->last_operand;
             if (c->entering) { c->last_operand = v; c->last_op = c->op; }
             c->acc = apply(c, c->acc, c->op, v);
             c->op = 0;
@@ -176,7 +182,7 @@ void calc_main(void *arg) {
         } else if (ev.type == EV_MENU) {
             if (ev.cmd == CMD_CLEAR) press_key(&c, "AC");
             else if (ev.cmd == CMD_COPY) { char d[48]; dec_format(current_value(&c), d, sizeof d); clipboard_set(d, strlen(d)); }
-            else if (ev.cmd == CMD_PASTE) { char *s = clipboard_get(); if (s) { c.acc = dec_parse(s); c.entering = false; c.have_acc = true; kfree(s); } }
+            else if (ev.cmd == CMD_PASTE) { char *s = clipboard_get(); if (s) { bool ovf = false; c.acc = dec_parse(s, &ovf); c.entering = false; c.have_acc = true; if (ovf) c.error = c.overflow = true; kfree(s); } }
             draw(&c);
         }
     }

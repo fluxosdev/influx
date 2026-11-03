@@ -55,7 +55,11 @@ static void play_thread(void *arg) {
         if (got <= 0) break;
         got -= got % fb;
         if (!got) break;
-        audio_stream_write(s, buf, got / fb, &p->stop_req);
+        if (audio_stream_write(s, buf, got / fb, &p->stop_req) < 0) {   /* USB device unplugged: keep the position */
+            strlcpy(p->error, "The audio device was disconnected.", sizeof p->error);
+            p->stop_req = true;
+            break;
+        }
         off += got;
         p->pos = base + audio_stream_position(s);
     }

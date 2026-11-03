@@ -2,7 +2,7 @@
 #include "kernel.h"
 
 /*
- * Sound output. A hardware driver (drivers/hda.c) registers an audio_device
+ * Sound output. A hardware driver (drivers/hda.c, usb/uac.c) registers an audio_device
  * that plays interleaved signed 16-bit stereo frames at a rate it supports.
  * The audio core (drivers/audio.c) sits in front of it: one client stream at
  * a time, conversion from any PCM layout and rate, the master volume, the
@@ -23,9 +23,10 @@ struct audio_device {
     void *priv;
     uint32_t rate;            /* current hardware rate */
 };
-void audio_register(struct audio_device *d);
+void audio_register(struct audio_device *d);     /* becomes the output device */
+void audio_unregister(struct audio_device *d);   /* hot unplug */
 void audio_init(void);        /* probes the drivers, creates /dev/audio */
-struct audio_device *audio_device(void);   /* NULL without sound hardware */
+struct audio_device *audio_device(void);   /* the newest device, NULL without sound hardware */
 
 /* master volume, 0..100 */
 void audio_set_volume(int percent);

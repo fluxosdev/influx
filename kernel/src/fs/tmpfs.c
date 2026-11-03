@@ -10,6 +10,19 @@ struct tnode {
     uint8_t *data; size_t cap;
 };
 static uint64_t next_ino = 1;
+#define TMPFS_FILE_MAX (256ull << 20)
+/* kmalloc panics on OOM: refuse growth past the per-file cap or half of free memory */
+static int grow(struct tnode *t, uint64_t need) {
+    if (need <= t->cap) return 0;
+    if (need > TMPFS_FILE_MAX) return -EFBIG;
+    uint64_t nc = t->cap ? t->cap : 256;
+    while (nc < need) nc *= 2;
+    nc = MIN(nc, TMPFS_FILE_MAX);
+    if (nc - t->cap >= pmm_free_bytes() / 2) return -ENOSPC;
+    t->data = krealloc(t->data, nc);
+    t->cap = nc;
+    return 0;
+}
 static const struct vnode_ops tmpfs_ops;
 
 static struct tnode *tn_new(struct tnode *parent, const char *name, int type) {
@@ -34,12 +47,8 @@ static int64_t t_read(struct vnode *v, uint64_t off, void *buf, size_t n) {
 }
 static int64_t t_write(struct vnode *v, uint64_t off, const void *buf, size_t n) {
     struct tnode *t = (struct tnode *)v;
-    if (off + n > t->cap) {
-        size_t nc = t->cap ? t->cap : 256;
-        while (nc < off + n) nc *= 2;
-        t->data = krealloc(t->data, nc);
-        t->cap = nc;
-    }
+    if (off > TMPFS_FILE_MAX || n > TMPFS_FILE_MAX - off) return -EFBIG;
+    int r = grow(t, off + n); if (r < 0) return r;
     if (off > v->size) memset(t->data + v->size, 0, off - v->size);
     memcpy(t->data + off, buf, n);
     if (off + n > v->size) v->size = off + n;
@@ -48,7 +57,7 @@ static int64_t t_write(struct vnode *v, uint64_t off, const void *buf, size_t n)
 }
 static int t_truncate(struct vnode *v, uint64_t size) {
     struct tnode *t = (struct tnode *)v;
-    if (size > t->cap) { t->data = krealloc(t->data, size); t->cap = size; }
+    int r = grow(t, size); if (r < 0) return r;
     if (size > v->size) memset(t->data + v->size, 0, size - v->size);
     v->size = size; v->mtime = time_unix();
     return 0;

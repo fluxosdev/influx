@@ -77,7 +77,7 @@ static void progress(void *ctx, int pct, const char *m) {
 
 static void refresh_disks(struct inst *s) {
     s->ndisks = 0;
-    for (int i = 0; i < blockdev_count() && s->ndisks < 16; i++) { struct blockdev *b = blockdev_at(i); if (!b->parent) s->disks[s->ndisks++] = b; }
+    for (int i = 0; i < blockdev_count() && s->ndisks < 16; i++) { struct blockdev *b = blockdev_at(i); if (b && !b->parent) s->disks[s->ndisks++] = b; }
     if (s->selected >= s->ndisks) s->selected = s->ndisks ? 0 : -1;
 }
 

@@ -12,6 +12,7 @@ struct tss {
 
 static uint64_t gdt[7];
 static struct tss tss ALIGNED(16);
+static uint8_t ist_stacks[3][16384] ALIGNED(16);   /* IST1-3: #DF, NMI, #MC get a known-good stack */
 static struct { uint16_t limit; uint64_t base; } PACKED gdtr;
 
 static uint64_t make_desc(uint8_t access, uint8_t flags) {
@@ -28,6 +29,7 @@ void gdt_init(void) {
     /* TSS descriptor (16 bytes) at 0x28 */
     memset(&tss, 0, sizeof tss);
     tss.iopb = sizeof tss;
+    for (int i = 0; i < 3; i++) tss.ist[i] = (uint64_t)(ist_stacks[i] + sizeof ist_stacks[i]);
     uint64_t base = (uint64_t)&tss, limit = sizeof tss - 1;
     gdt[5] = (limit & 0xFFFF) | ((base & 0xFFFFFF) << 16) | (0x89ULL << 40) |
              (((limit >> 16) & 0xF) << 48) | (((base >> 24) & 0xFF) << 56);

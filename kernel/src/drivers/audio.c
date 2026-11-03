@@ -1,5 +1,6 @@
 /*
- * Audio core: one client stream at a time on the first registered device,
+ * Audio core: one client stream at a time on the most recently registered
+ * device (a USB headset plugged in takes over from the built-in card),
  * converted to the device's 16-bit stereo frames (any integer width, float,
  * up to 8 channels) and resampled by linear interpolation when the hardware
  * cannot run at the source rate. The master volume is applied here.
@@ -33,8 +34,30 @@ static int volume = 70;
 static struct mutex open_lock = MUTEX_INIT;
 static struct audio_stream *active;
 
-void audio_register(struct audio_device *d) { if (ndevs < (int)ARRAY_LEN(devs)) devs[ndevs++] = d; }
-struct audio_device *audio_device(void) { return ndevs ? devs[0] : NULL; }
+static spinlock_t devs_lock = SPINLOCK_INIT;
+static bool dev_node;
+static const struct vnode_ops dev_ops;
+
+void audio_register(struct audio_device *d) {
+    spin_lock(&devs_lock);
+    if (ndevs < (int)ARRAY_LEN(devs)) devs[ndevs++] = d;
+    spin_unlock(&devs_lock);
+    if (!dev_node) { dev_node = true; devfs_add("audio", VN_DEV, &dev_ops, NULL, 0); }
+    kprintf("audio: %s, %s\n", d->name, d->detail);
+}
+/* a stream still open on the device keeps its pointer; the driver fails its writes */
+void audio_unregister(struct audio_device *d) {
+    spin_lock(&devs_lock);
+    for (int i = 0; i < ndevs; i++) if (devs[i] == d) { for (int j = i; j < ndevs - 1; j++) devs[j] = devs[j + 1]; ndevs--; break; }
+    spin_unlock(&devs_lock);
+    kprintf("audio: %s removed\n", d->name);
+}
+struct audio_device *audio_device(void) {
+    spin_lock(&devs_lock);
+    struct audio_device *d = ndevs ? devs[ndevs - 1] : NULL;
+    spin_unlock(&devs_lock);
+    return d;
+}
 void audio_set_volume(int percent) { volume = CLAMP(percent, 0, 100); }
 int audio_volume(void) { return volume; }
 
@@ -69,9 +92,10 @@ struct audio_stream *audio_open(uint32_t rate, int channels, int bits, bool is_f
     s->dev = d;
     s->in_rate = rate; s->channels = channels; s->bits = bits; s->is_float = is_float;
     s->frame_bytes = channels * bits / 8;
-    /* the hardware rate: the source's when supported, otherwise resample to 48 kHz */
+    /* the hardware rate: the source's when supported, otherwise resample to 48 kHz or whatever the device runs at */
     if (d->ops->set_rate(d->priv, rate) == 0) s->out_rate = rate;
-    else { d->ops->set_rate(d->priv, 48000); s->out_rate = 48000; }
+    else if (d->ops->set_rate(d->priv, 48000) == 0) s->out_rate = 48000;
+    else s->out_rate = d->rate;
     s->step = ((uint64_t)s->in_rate << 32) / s->out_rate;
     s->in = kmalloc(CHUNK * 4);
     s->out_cap = (uint64_t)CHUNK * s->out_rate / s->in_rate + 4;
@@ -114,7 +138,8 @@ int64_t audio_stream_write(struct audio_stream *s, const void *data, size_t fram
         if (s->out) { outn = resample(s, s->in, n); out = s->out; }
         for (size_t i = 0; i < outn * 2; i++) out[i] = (int16_t)((out[i] * gain) >> 15);
         int64_t w = s->dev->ops->write(s->dev->priv, out, outn, cancel);
-        if (w > 0) s->out_frames += w;
+        if (w < 0) return done ? (int64_t)done : w;   /* the device went away */
+        s->out_frames += w;
         done += n;
         if (w < (int64_t)outn) break;
     }
@@ -150,10 +175,7 @@ static const struct vnode_ops dev_ops = { .write = dev_write };
 
 void audio_init(void) {
     hda_init();
-    struct audio_device *d = audio_device();
-    if (!d) { kprintf("audio: no sound hardware\n"); return; }
-    devfs_add("audio", VN_DEV, &dev_ops, NULL, 0);
-    kprintf("audio: %s, %s\n", d->name, d->detail);
+    if (!audio_device()) kprintf("audio: no sound card (USB audio devices register when plugged in)\n");
 }
 
 /* ---- WAV ---- */

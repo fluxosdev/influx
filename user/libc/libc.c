@@ -90,7 +90,7 @@ static void fmt_num(struct out *o, unsigned long v, int neg, int base, int upper
     char tmp[32]; int len = 0; const char *digits = upper ? "0123456789ABCDEF" : "0123456789abcdef";
     if (v == 0) tmp[len++] = '0';
     while (v) { tmp[len++] = digits[v % base]; v /= base; }
-    while (len < prec) tmp[len++] = '0';
+    while (len < prec && len < (int)sizeof tmp) tmp[len++] = '0';
     int total = len + (neg ? 1 : 0);
     if (!left && !zero) pad(o, width - total, ' ');
     if (neg) put(o, '-');
@@ -109,6 +109,7 @@ int vsnprintf(char *buf, size_t n, const char *fmt, va_list ap) {
         if (*fmt == '*') { width = va_arg(ap, int); fmt++; } else while (isdigit(*fmt)) width = width * 10 + (*fmt++ - '0');
         if (*fmt == '.') { fmt++; prec = 0; if (*fmt == '*') { prec = va_arg(ap, int); fmt++; } else while (isdigit(*fmt)) prec = prec * 10 + (*fmt++ - '0'); }
         int lng = 0; while (*fmt == 'l' || *fmt == 'z' || *fmt == 'j') { lng = 1; fmt++; } while (*fmt == 'h') fmt++;
+        if (!*fmt) break;
         switch (*fmt) {
         case 'd': case 'i': { long v = lng ? va_arg(ap, long) : va_arg(ap, int); fmt_num(&o, v < 0 ? (unsigned long)(-(v + 1)) + 1 : (unsigned long)v, v < 0, 10, 0, width, prec, left, zero); break; }
         case 'u': { unsigned long v = lng ? va_arg(ap, unsigned long) : va_arg(ap, unsigned); fmt_num(&o, v, 0, 10, 0, width, prec, left, zero); break; }

@@ -111,7 +111,7 @@ struct hda {
     struct pci_device *pci;
     volatile uint8_t *mmio, *sd;
     int sd_index, stream_tag;
-    bool immediate;
+    bool immediate, dma64;
     uint32_t *corb; volatile uint64_t *rirb;
     int corb_n, rirb_n, rirb_rp;
     int timeouts;
@@ -172,6 +172,7 @@ static uint32_t cmd_immediate(struct hda *h, uint32_t v) {
 }
 
 static uint32_t cmd_corb(struct hda *h, uint32_t v) {
+    h->rirb_rp = (r16(h, RIRBWP) & 0xFF) % h->rirb_n;   /* one command in flight: whatever is queued is late or unsolicited */
     int wp = (r16(h, CORBWP) + 1) % h->corb_n;
     h->corb[wp] = v;
     w16(h, CORBWP, wp);
@@ -197,10 +198,13 @@ static uint32_t verb(struct hda *h, int nid, uint32_t vb, uint32_t payload) {
 }
 static uint32_t param(struct hda *h, int nid, int p) { return verb(h, nid, V_PARAM, p); }
 
+static uint64_t dma_alloc(struct hda *h, size_t pages) { return h->dma64 ? pmm_alloc_pages(pages) : pmm_alloc_pages_low(pages); }
+
 static bool rings_init(struct hda *h) {
     w8(h, CORBCTL, 0); w8(h, RIRBCTL, 0);
     wait8(h, CORBCTL, 2, 0, 10); wait8(h, RIRBCTL, 2, 0, 10);
-    uint64_t page = pmm_alloc_page();   /* CORB in the first 1 KiB, RIRB from 2 KiB */
+    uint64_t page = dma_alloc(h, 1);   /* CORB in the first 1 KiB, RIRB from 2 KiB */
+    if (!page) return false;
     h->corb = P2V(page); h->rirb = P2V(page + 2048);
     uint8_t cs = r8(h, CORBSIZE) >> 4, rs = r8(h, RIRBSIZE) >> 4;
     int ccode = cs & 4 ? 2 : cs & 2 ? 1 : 0, rcode = rs & 4 ? 2 : rs & 2 ? 1 : 0;
@@ -526,6 +530,7 @@ static bool hda_probe(struct pci_device *d) {
     h->mmio = vmm_map_mmio(d->bar_addr[0], 0x4000);
     uint16_t gcap = r16(h, GCAP);
     int iss = (gcap >> 8) & 0xF, oss = (gcap >> 12) & 0xF;
+    h->dma64 = gcap & 1;
     if (!oss) { kprintf("hda: %02x:%02x.%d has no output streams\n", d->bus, d->slot, d->func); kfree(h); return false; }
 
     /* controller reset */
@@ -560,8 +565,9 @@ static bool hda_probe(struct pci_device *d) {
     h->sd_index = iss;
     h->sd = h->mmio + 0x80 + iss * 0x20;
     h->stream_tag = 1;
-    h->bdl_phys = pmm_alloc_page(); h->bdl = P2V(h->bdl_phys);
-    h->buf_phys = pmm_alloc_pages(BUF_SIZE / PAGE_SIZE); h->buf = P2V(h->buf_phys);
+    h->bdl_phys = dma_alloc(h, 1); h->bdl = P2V(h->bdl_phys);
+    h->buf_phys = dma_alloc(h, BUF_SIZE / PAGE_SIZE); h->buf = P2V(h->buf_phys);
+    if (!h->bdl_phys || !h->buf_phys) { kprintf("hda: no DMA memory%s\n", h->dma64 ? "" : " below 4 GiB"); return false; }
     for (int i = 0; i < NFRAGS; i++) { h->bdl[i].addr = h->buf_phys + i * FRAG_SIZE; h->bdl[i].len = FRAG_SIZE; h->bdl[i].flags = 1; }
     h->fmt = FMT_16BIT_STEREO; h->rate = 48000;
     program_dacs(h);

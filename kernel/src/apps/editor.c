@@ -112,6 +112,7 @@ static bool load_file(struct editor *e, const char *path) {
     int k = 0; for (int i = 0; i < e->len; i++) if (e->text[i] != '\r' && e->text[i]) e->text[k++] = e->text[i];
     e->len = k; e->text[k] = 0;
     e->cursor = 0; e->anchor = -1; e->scroll_y = 0; e->dirty = false;
+    kfree(e->undo_text); e->undo_text = NULL;
     strlcpy(e->path, path, sizeof e->path);
     reindex(e); update_title(e);
     return true;
@@ -234,7 +235,7 @@ static void handle_key(struct editor *e, struct event *ev) {
     case KEY_PGUP: case KEY_PGDN: { int vis = visible_lines(e); int nl = CLAMP(ev->key == KEY_PGUP ? l - vis : l + vis, 0, e->nlines - 1); e->scroll_y += ev->key == KEY_PGUP ? -vis : vis; clamp_scroll(e); move_cursor(e, offset_for_x(e, nl, e->pref_col < 0 ? text_x(e, e->line_starts[l], e->cursor) : e->pref_col), shift); return; }
     case KEY_BACKSPACE: snapshot(e); if (!delete_selection(e)) { if (alt) delete_range(e, word_left(e, e->cursor), e->cursor); else if (e->cursor > 0) { int p = e->cursor - 1; while (p > 0 && (e->text[p] & 0xC0) == 0x80) p--; delete_range(e, p, e->cursor); } } e->pref_col = -1; return;
     case KEY_DELETE: snapshot(e); if (!delete_selection(e)) { if (e->cursor < e->len) { int q = e->cursor + 1; while (q < e->len && (e->text[q] & 0xC0) == 0x80) q++; delete_range(e, e->cursor, q); } } return;
-    case KEY_ENTER: { snapshot(e); delete_selection(e); /* auto-indent */ int s = e->line_starts[l]; int ind = 0; while (e->text[s + ind] == ' ' || e->text[s + ind] == '\t') ind++; char buf[256]; buf[0] = '\n'; int n = MIN(ind, 200); memcpy(buf + 1, e->text + s, n); insert_text(e, buf, n + 1); e->pref_col = -1; return; }
+    case KEY_ENTER: { snapshot(e); delete_selection(e); l = line_of(e, e->cursor); /* auto-indent */ int s = e->line_starts[l]; int ind = 0; while (e->text[s + ind] == ' ' || e->text[s + ind] == '\t') ind++; char buf[256]; buf[0] = '\n'; int n = MIN(ind, 200); memcpy(buf + 1, e->text + s, n); insert_text(e, buf, n + 1); e->pref_col = -1; return; }
     case KEY_TAB: snapshot(e); delete_selection(e); insert_text(e, "    ", 4); return;
     case KEY_ESC: e->anchor = -1; return;
     }

@@ -1,10 +1,11 @@
 #include "arch.h"
+#include "acpi_internal.h"
 #include "io.h"
 #include "mm.h"
 
 static volatile uint32_t *lapic;
-static volatile uint32_t *ioapic;
-static int ioapic_entries;
+static struct { volatile uint32_t *regs; uint32_t gsi_base; int entries; } ioa[MAX_IOAPICS];
+static int nioa;
 
 #define LAPIC_ID        0x020
 #define LAPIC_EOI       0x0B0
@@ -57,41 +58,54 @@ void lapic_timer_start(uint32_t hz) {
 }
 
 /* ---- I/O APIC ---- */
-static inline uint32_t ioapic_read(uint32_t reg) { ioapic[0] = reg; return ioapic[4]; }
-static inline void ioapic_write(uint32_t reg, uint32_t v) { ioapic[0] = reg; ioapic[4] = v; }
+static inline uint32_t ioapic_read(int a, uint32_t reg) { ioa[a].regs[0] = reg; return ioa[a].regs[4]; }
+static inline void ioapic_write(int a, uint32_t reg, uint32_t v) { ioa[a].regs[0] = reg; ioa[a].regs[4] = v; }
+
+/* the I/O APIC serving a GSI, and the pin on it */
+static int ioapic_for(uint32_t gsi, uint32_t *idx) {
+    for (int a = 0; a < nioa; a++)
+        if (gsi >= ioa[a].gsi_base && gsi - ioa[a].gsi_base < (uint32_t)ioa[a].entries) { *idx = gsi - ioa[a].gsi_base; return a; }
+    return -1;
+}
 
 void ioapic_init(void) {
-    ioapic = vmm_map_mmio(madt.ioapic_addr, 0x1000);
-    uint32_t ver = ioapic_read(1);
-    int entries = ((ver >> 16) & 0xFF) + 1;
-    ioapic_entries = entries;
-    for (int i = 0; i < entries; i++) { ioapic_write(0x10 + i * 2, 0x10000); ioapic_write(0x11 + i * 2, 0); }
-    kprintf("ioapic: %d redirection entries\n", entries);
+    int n = nioapics ? nioapics : 1;
+    for (int a = 0; a < n; a++) {
+        ioa[a].regs = vmm_map_mmio(nioapics ? ioapics[a].addr : madt.ioapic_addr, 0x1000);
+        ioa[a].gsi_base = nioapics ? ioapics[a].gsi_base : madt.ioapic_gsi_base;
+        nioa = a + 1;
+        int entries = ((ioapic_read(a, 1) >> 16) & 0xFF) + 1;
+        ioa[a].entries = entries;
+        for (int i = 0; i < entries; i++) { ioapic_write(a, 0x10 + i * 2, 0x10000); ioapic_write(a, 0x11 + i * 2, 0); }
+        kprintf("ioapic: GSI %u-%u, %d redirection entries\n", ioa[a].gsi_base, ioa[a].gsi_base + entries - 1, entries);
+    }
 }
 
 void ioapic_route_irq(uint8_t irq, uint8_t vector) {
     uint32_t gsi = irq < 16 ? madt.iso_src[irq] : irq;
     uint16_t flags = irq < 16 ? madt.iso_flags[irq] : 0;
-    uint32_t idx = gsi - madt.ioapic_gsi_base;
+    uint32_t idx; int a = ioapic_for(gsi, &idx);
+    if (a < 0) { kprintf("ioapic: IRQ %u (GSI %u) has no I/O APIC\n", irq, gsi); return; }
     uint32_t lo = vector;
     if ((flags & 3) == 3) lo |= (1 << 13);     /* active low */
     if (((flags >> 2) & 3) == 3) lo |= (1 << 15); /* level triggered */
-    ioapic_write(0x11 + idx * 2, lapic_id() << 24);
-    ioapic_write(0x10 + idx * 2, lo);
+    ioapic_write(a, 0x11 + idx * 2, lapic_id() << 24);
+    ioapic_write(a, 0x10 + idx * 2, lo);
 }
 
 bool ioapic_route_gsi(uint32_t gsi, uint8_t vector, bool level, bool active_low) {
-    if (gsi < madt.ioapic_gsi_base || gsi - madt.ioapic_gsi_base >= (uint32_t)ioapic_entries) return false;
-    uint32_t idx = gsi - madt.ioapic_gsi_base;
-    ioapic_write(0x11 + idx * 2, lapic_id() << 24);
-    ioapic_write(0x10 + idx * 2, vector | (active_low ? 1 << 13 : 0) | (level ? 1 << 15 : 0));
+    uint32_t idx; int a = ioapic_for(gsi, &idx);
+    if (a < 0) return false;
+    ioapic_write(a, 0x11 + idx * 2, lapic_id() << 24);
+    ioapic_write(a, 0x10 + idx * 2, vector | (active_low ? 1 << 13 : 0) | (level ? 1 << 15 : 0));
     return true;
 }
 
 void ioapic_mask_irq(uint8_t irq, bool mask) {
     uint32_t gsi = irq < 16 ? madt.iso_src[irq] : irq;
-    uint32_t idx = gsi - madt.ioapic_gsi_base;
-    uint32_t lo = ioapic_read(0x10 + idx * 2);
+    uint32_t idx; int a = ioapic_for(gsi, &idx);
+    if (a < 0) return;
+    uint32_t lo = ioapic_read(a, 0x10 + idx * 2);
     if (mask) lo |= 0x10000; else lo &= ~0x10000u;
-    ioapic_write(0x10 + idx * 2, lo);
+    ioapic_write(a, 0x10 + idx * 2, lo);
 }

@@ -7,20 +7,25 @@
 static struct blockdev *devs[32];
 static int ndevs;
 static struct mutex io_lock = MUTEX_INIT;
+static struct mutex devs_lock = MUTEX_INIT;   /* devs[] / ndevs (hotplug vs. lookups) */
 
+/* translate to the whole disk; partitions were checked against the parent's size when created */
+static struct blockdev *resolve(struct blockdev *d, uint64_t lba, uint32_t count, uint64_t *off) {
+    if (lba > d->sectors || count > d->sectors - lba) return NULL;
+    struct blockdev *root = d; *off = lba;
+    for (;;) { if (root->removed) return NULL; if (!root->parent) return root; *off += root->start_lba; root = root->parent; }
+}
 int blockdev_read(struct blockdev *d, uint64_t lba, uint32_t count, void *buf) {
-    if (lba + count > d->sectors) return -EINVAL;
-    struct blockdev *root = d; uint64_t off = lba;
-    while (root->parent) { off += root->start_lba; root = root->parent; }
+    uint64_t off; struct blockdev *root = resolve(d, lba, count, &off);
+    if (!root) return lba > d->sectors || count > d->sectors - lba ? -EINVAL : -ENODEV;
     mutex_lock(&io_lock);
     int r = root->read(root, off, count, buf);
     mutex_unlock(&io_lock);
     return r;
 }
 int blockdev_write(struct blockdev *d, uint64_t lba, uint32_t count, const void *buf) {
-    if (lba + count > d->sectors) return -EINVAL;
-    struct blockdev *root = d; uint64_t off = lba;
-    while (root->parent) { off += root->start_lba; root = root->parent; }
+    uint64_t off; struct blockdev *root = resolve(d, lba, count, &off);
+    if (!root) return lba > d->sectors || count > d->sectors - lba ? -EINVAL : -ENODEV;
     mutex_lock(&io_lock);
     int r = root->write(root, off, count, buf);
     mutex_unlock(&io_lock);
@@ -82,8 +87,10 @@ struct gpt_header { char sig[8]; uint32_t rev, hdr_size, crc, res; uint64_t cur_
 struct gpt_entry { uint8_t type[16], guid[16]; uint64_t first, last, attrs; uint16_t name[36]; } PACKED;
 
 static void add_dev(struct blockdev *d) {
-    if (ndevs >= 32) return;
+    mutex_lock(&devs_lock);
+    if (ndevs >= 32) { mutex_unlock(&devs_lock); return; }
     devs[ndevs++] = d;
+    mutex_unlock(&devs_lock);
     d->vn = devfs_add(d->name, VN_BLK, &blk_ops, d, d->sectors * d->sector_size);
     char sz[32]; uint64_t bytes = d->sectors * d->sector_size;
     if (bytes >= 1024ULL * 1024 * 1024) snprintf(sz, sizeof sz, "%lu.%lu GiB", bytes >> 30, ((bytes >> 20) % 1024) / 103); else snprintf(sz, sizeof sz, "%lu MiB", bytes >> 20);
@@ -97,13 +104,16 @@ static void scan_partitions(struct blockdev *d) {
     if (blockdev_read(d, 1, 1, sec) == 0 && !memcmp(sec, "EFI PART", 8)) {
         struct gpt_header *h = (struct gpt_header *)sec;
         uint32_t n = MIN(h->nparts, 128u), psz = h->part_size; uint64_t plba = h->part_lba;
-        uint8_t *entries = kmalloc(n * psz);
-        if (blockdev_read(d, plba, (n * psz + d->sector_size - 1) / d->sector_size, entries) == 0) {
+        if (psz < sizeof(struct gpt_entry) || psz > 1024 || (psz & (psz - 1)) || !n) { kprintf("blockdev: %s: bad GPT entry size %u / count %u\n", d->name, psz, h->nparts); kfree(sec); return; }
+        uint32_t nsec = (n * psz + d->sector_size - 1) / d->sector_size;
+        uint8_t *entries = kmalloc((size_t)nsec * d->sector_size);
+        if (plba >= 2 && blockdev_read(d, plba, nsec, entries) == 0) {
             int idx = 1;
             for (uint32_t i = 0; i < n; i++) {
                 struct gpt_entry *e = (struct gpt_entry *)(entries + i * psz);
                 bool empty = true; for (int k = 0; k < 16; k++) if (e->type[k]) empty = false;
-                if (empty || e->last < e->first) continue;
+                if (empty) continue;
+                if (e->last < e->first || !e->first || e->last >= d->sectors) { kprintf("blockdev: %s: GPT entry %u out of range, ignored\n", d->name, i); continue; }
                 struct blockdev *p = kzalloc(sizeof *p);
                 snprintf(p->name, sizeof p->name, "%s%s%d", d->name, isdigit(d->name[strlen(d->name) - 1]) ? "p" : "", idx++);
                 p->parent = d; p->start_lba = e->first; p->sectors = e->last - e->first + 1; p->sector_size = d->sector_size;
@@ -118,6 +128,7 @@ static void scan_partitions(struct blockdev *d) {
             uint8_t *e = sec + 446 + i * 16;
             uint32_t start = *(uint32_t *)(e + 8), count = *(uint32_t *)(e + 12);
             if (!e[4] || !count || e[4] == 0xEE) continue;
+            if (!start || (uint64_t)start + count > d->sectors) { kprintf("blockdev: %s: MBR entry %d out of range, ignored\n", d->name, i); continue; }
             struct blockdev *p = kzalloc(sizeof *p);
             snprintf(p->name, sizeof p->name, "%s%s%d", d->name, isdigit(d->name[strlen(d->name) - 1]) ? "p" : "", i + 1);
             p->parent = d; p->start_lba = start; p->sectors = count; p->sector_size = d->sector_size;
@@ -133,17 +144,44 @@ void blockdev_register(struct blockdev *d) {
     add_dev(d);
     scan_partitions(d);
 }
+/* Old partition structs are not freed (a mounted fs, /dev node or open file may
+ * still hold them); they are marked removed so their I/O fails with -ENODEV. */
 void blockdev_rescan(struct blockdev *d) {
+    mutex_lock(&devs_lock);
     for (int i = 0; i < ndevs; ) {
         if (devs[i]->parent == d) {
             char p[32]; snprintf(p, sizeof p, "/dev/%s", devs[i]->name); vfs_unlink(p);
-            kfree(devs[i]);
+            devs[i]->removed = true;
             for (int j = i; j < ndevs - 1; j++) devs[j] = devs[j + 1];
             ndevs--;
         } else i++;
     }
+    mutex_unlock(&devs_lock);
     scan_partitions(d);
 }
+/* The structs are not freed: a filesystem that was mounted from the disk may
+ * still hold them, and fails its I/O with -ENODEV from here on. */
+void blockdev_unregister(struct blockdev *d) {
+    d->removed = true;
+    mutex_lock(&devs_lock);
+    for (int i = 0; i < ndevs; ) {
+        if (devs[i] == d || devs[i]->parent == d) {
+            char p[32]; snprintf(p, sizeof p, "/dev/%s", devs[i]->name); vfs_unlink(p);
+            kprintf("blockdev: /dev/%s removed\n", devs[i]->name);
+            devs[i]->removed = true;
+            for (int j = i; j < ndevs - 1; j++) devs[j] = devs[j + 1];
+            ndevs--;
+        } else i++;
+    }
+    mutex_unlock(&devs_lock);
+}
+void blockdev_alloc_name(const char *prefix, char *out, size_t n) {
+    for (char c = 'a'; c <= 'z'; c++) {
+        snprintf(out, n, "%s%c", prefix, c);
+        if (!blockdev_find(out)) return;
+    }
+}
+/* structs handed out are never freed, so they stay valid after the lock drops; blockdev_at may return NULL if the list shrank */
 int blockdev_count(void) { return ndevs; }
-struct blockdev *blockdev_at(int i) { return i >= 0 && i < ndevs ? devs[i] : NULL; }
-struct blockdev *blockdev_find(const char *name) { for (int i = 0; i < ndevs; i++) if (!strcmp(devs[i]->name, name)) return devs[i]; return NULL; }
+struct blockdev *blockdev_at(int i) { mutex_lock(&devs_lock); struct blockdev *d = i >= 0 && i < ndevs ? devs[i] : NULL; mutex_unlock(&devs_lock); return d; }
+struct blockdev *blockdev_find(const char *name) { mutex_lock(&devs_lock); struct blockdev *d = NULL; for (int i = 0; i < ndevs; i++) if (!strcmp(devs[i]->name, name)) { d = devs[i]; break; } mutex_unlock(&devs_lock); return d; }

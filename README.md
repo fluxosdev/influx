@@ -71,18 +71,57 @@ shell, user-space C library and build system.
   CRC32C checksums for metadata and data, extent-tree and free-space-tree
   bookkeeping. Volumes modified by inFlux pass `btrfs check` on Linux.
 
+### USB
+- **xHCI** (USB 3) host controller driver: BIOS hand-off, command and event
+  rings, a transfer ring per endpoint, MSI or INTx interrupts with a polling
+  fallback, USB 2 and USB 3 root ports; on Intel 7/8/9-series chipsets the
+  ports are switched over from the EHCI controllers
+- **EHCI** (USB 2.0) host controller driver: async schedule for control and
+  bulk, periodic schedule for interrupt endpoints, split transactions through
+  high-speed hubs; low/full-speed devices on root ports go to the companion
+  controller
+- USB core: enumeration, descriptors and strings, a hub thread that handles
+  **hot plug and unplug**, USB 2.0 and USB 3 hubs (up to five tiers)
+- **HID**: boot-protocol keyboards (software key repeat, Caps Lock LED),
+  mice and tablets from their report descriptors (relative or absolute
+  pointer, buttons, scroll wheel)
+- Isochronous transfers and alternate settings (xHCI), used by **USB audio**
+  (see Sound)
+- **Mass storage** (Bulk-Only Transport, SCSI): USB sticks and disks become
+  `/dev/sdX`, their partitions are mounted under `/mnt` and appear in Files;
+  unplugging unmounts them
+- `lsusb` (`-v` for interfaces and endpoints) shows the device tree
+
 ### Graphics
 - **ATI Radeon R700 driver** (HD 4800/4700/4600/4300/4500 and the RS880 IGP),
   modelled on the Linux `radeon` driver: PCI probe, register and VRAM
   aperture mapping, VRAM size and MC framebuffer location, inspection of the
   scanout that the video BIOS (BIOS boot) or GOP (UEFI boot) configured,
-  AtomBIOS ROM parsing (bootup message, part number, default clocks), a 64x64
+  video BIOS discovery (ACPI VFCT table, C000:0000 shadow, IGP stolen
+  memory or the PCI expansion ROM) and AtomBIOS parsing (bootup message,
+  part number, default clocks), a 64x64
   ARGB hardware cursor and vblank-synchronised double-buffered page flipping
-  of the primary surface. Every other adapter uses the **software fallback**
-  (CPU compositing into the bootloader's linear framebuffer).
-- **OpenGL**: a fixed-function OpenGL 1.x subset (immediate mode, matrix
-  stacks, depth test, Gouraud lighting, textures with bilinear filtering,
-  blending, culling, wireframe) with a software rasteriser. The same
+  of the primary surface. **Runtime mode setting** runs the video BIOS's own
+  command tables through an **AtomBIOS interpreter** (a port of Linux's
+  `atom.c`): the lit output is found through the BIOS object tables, the
+  monitor's EDID is read over the DDC lines (bit-banged I2C) for the mode
+  list, and the PLL, CRTC timing and DAC (VGA) or DIG/UNIPHY/LVTMA (DVI,
+  HDMI in DVI mode) encoders are programmed in Linux's order. DisplayPort,
+  LVDS panels, TV-out and a second display keep the boot mode. Every other
+  adapter uses the **software fallback** (CPU compositing into the
+  bootloader's linear framebuffer).
+- **OpenGL**: fixed-function OpenGL 1.1 with a software rasteriser:
+  immediate mode, vertex arrays (`glDrawArrays`/`glDrawElements`), display
+  lists, modelview/projection/texture matrix stacks, eight lights with
+  specular, spot lights, attenuation, two-sided lighting and colour material,
+  fog, mipmapped textures (`gluBuild2DMipmaps`, trilinear filtering,
+  repeat/clamp/mirrored wrapping, every texture environment), all blend
+  factors, alpha and depth tests, scissor, colour/depth masks, polygon
+  offset, point/line/fill polygon modes, wide lines and points,
+  `glReadPixels` and the `glGet*` queries. Rasterisation is
+  perspective-correct with a top-left fill rule and near-plane clipping.
+  Not implemented: stencil/accumulation buffers, `glDrawPixels`/`glBitmap`,
+  texgen, user clip planes, selection/feedback and `glPushAttrib`. The same
   implementation (`gl/gl.c`) is built into the kernel for desktop apps and
   into the user C library; `glGetString(GL_RENDERER)` names the adapter the
   frame ends up on. The desktop has an **OpenGL Demo** app and `/bin/glcube`
@@ -103,8 +142,9 @@ shell, user-space C library and build system.
   kernel. The installed system boots on BIOS and UEFI firmware; its root
   volume holds the persistent home directory, mounted at `/home`.
 - **Display resolution**: System Settings → Displays has a resolution
-  dropdown with the common modes the display supports. On QEMU, VirtualBox and
-  Bochs the mode changes immediately (DISPI mode setting; the compositor
+  dropdown with the common modes the display supports (on a Radeon R700, the
+  monitor's own EDID modes). On QEMU, VirtualBox and Bochs (DISPI mode
+  setting) and on the Radeon R700 (AtomBIOS) the mode changes immediately (the compositor
   re-lays out the desktop) and a "Keep this resolution?" banner reverts it
   after 15 seconds unless confirmed. A kept resolution is also written as
   `resolution:` into the installed system's `limine.conf`, so on real
@@ -142,6 +182,14 @@ shell, user-space C library and build system.
 - Playback from a 64 KiB cyclic DMA buffer at the source's sample rate when
   the codec supports it (8 to 192 kHz), otherwise resampled to 48 kHz; played
   regions are zeroed at once, so running dry gives silence, not a stutter loop
+- **USB audio** (USB Audio Class 1 and 2, on xHCI): headsets, speakers and
+  DACs play through isochronous transfers at a rate the device supports
+  (the source's, else 48 kHz, else the device's own), as 16-, 24- or 32-bit
+  samples in mono, stereo or multichannel layouts; adaptive and synchronous
+  devices get the nominal rate, asynchronous ones follow their feedback
+  endpoint. The device is unmuted at 0 dB and the master volume applies. A
+  USB audio device plugged in becomes the output; unplugging it stops what is
+  playing and the built-in card takes over again
 - Plays 8/16/24/32-bit integer and 32-bit float PCM, mono to 8 channels
   (front left/right are used), with a master volume
 - **Audio Player**: double-click a `.wav` file in Files; play/pause (Space),
@@ -202,8 +250,8 @@ Requirements (Debian/Ubuntu package names):
 
 ```sh
 make            # builds build/influx.iso
-make disk       # creates build/sata.img and build/nvme.img (btrfs test volumes)
-make run        # boots in QEMU with a SATA and an NVMe disk and an HD Audio card
+make disk       # creates build/install.img (blank target for the installer)
+make run        # boots in QEMU with a blank SATA install disk and an HD Audio card
 make run-kvm    # same, with KVM acceleration
 make run-installed       # boot the disk the installer wrote (build/install.img) on BIOS
 make run-installed-uefi  # the same under OVMF UEFI
@@ -234,6 +282,11 @@ Changing the SVG icon sources requires `python3` with `cairosvg`; run
 - The btrfs volumes appear in the Files sidebar and under `/mnt`. Try
   `echo hi > /mnt/sda1/hello.txt` in the Terminal, then inspect `build/sata.img`
   on Linux (the filesystem starts 1 MiB into the image).
+- `make run` adds an xHCI controller with a USB tablet. Attach a USB stick
+  image with `make run USB_STICK=stick.img` (for example a file formatted by
+  `mkfs.fat`); it is mounted under `/mnt`. `lsusb` lists the devices. For a
+  USB sound card, add `QEMU_USB="-device qemu-xhci,id=xhci -device
+  usb-tablet,bus=xhci.0 -device usb-audio,audiodev=snd0,bus=xhci.0"`.
 - Type `help` in the Terminal for the list of shell built-ins; programs in
   `/bin` run in user mode. `lsgpu` shows the graphics adapter, `glcube &`
   starts the user-mode OpenGL program.
@@ -251,7 +304,9 @@ Changing the SVG icon sources requires `python3` with `cairosvg`; run
 kernel/src/arch     GDT, IDT, APIC, ACPI, PCI, timers, serial
 kernel/src/mm       physical/virtual memory, heap
 kernel/src/sched    scheduler, synchronisation, ELF loader, system calls
-kernel/src/drivers  framebuffer, PS/2, AHCI, NVMe, block devices, GPU abstraction, Radeon R700, NE2000
+kernel/src/drivers  framebuffer, PS/2, AHCI, NVMe, block devices, GPU abstraction, Radeon R700
+                    (radeon.c, radeon_kms.c), AtomBIOS interpreter (atom.c), EDID (edid.c), NE2000
+kernel/src/usb      USB core and hubs (usb.c), xHCI, EHCI, HID, mass storage
 kernel/src/net      Ethernet/ARP, IPv4/ICMP, UDP, TCP, DHCP, DNS, HTTP client
 kernel/src/gl       kernel build of the OpenGL renderer and the OpenGL Demo app
 gl                  shared software OpenGL implementation (gl.c / gl.h)
@@ -269,7 +324,14 @@ third_party         Limine, stb headers
 
 ## Limitations
 
-- Single CPU (other cores are left parked), no audio, no USB.
+- Single CPU (other cores are left parked), no audio.
+- USB: no UHCI/OHCI drivers (keyboards on USB 1.1 companion ports keep working
+  through the BIOS's PS/2 emulation), isochronous transfers on xHCI only (USB
+  audio does not work behind an EHCI controller), mass storage over Bulk-Only
+  only (no UAS), one configuration per device.
+- USB audio: playback only (no microphones; the audio core has no capture
+  path), no MIDI, no webcams. Only QEMU's UAC1 device has been tested; UAC2
+  devices and feedback endpoints follow the specification but are untested.
 - Networking: IPv4 only, one NE2000 adapter type, TCP as a client only (no
   listening sockets), no IP fragment reassembly, DHCP leases are not renewed.
   The stack is used by the kernel and the desktop; user programs in `/bin`

@@ -11,6 +11,7 @@
 #include "net.h"
 #include "acpi.h"
 #include "audio.h"
+#include "usb.h"
 
 #define MAX_ARGS 128
 #define MAX_HIST 500
@@ -29,6 +30,7 @@ struct shell {
     char line[LINE_MAX]; int len, cursor;
     int hist_pos; char saved_line[LINE_MAX];
     int tab_count;
+    int cur_row, cur_col;   /* where the terminal cursor sits within the wrapped prompt + line */
     bool exiting;
     int depth;
 };
@@ -83,7 +85,7 @@ static void history_load(struct shell *sh) {
     void *data; size_t sz;
     if (vfs_read_file("/home/flux/.zsh_history", &data, &sz) < 0) return;
     char *save, *tok = strtok_r(data, "\n", &save);
-    while (tok) { if (tok[0]) { if (sh->nhist == MAX_HIST) { kfree(sh->history[0]); memmove(sh->history, sh->history + 1, (MAX_HIST - 1) * sizeof(char *)); sh->nhist--; } sh->history[sh->nhist++] = strdup(tok); } tok = strtok_r(NULL, "\n", &save); }
+    while (tok) { if (strlen(tok) >= LINE_MAX) tok[LINE_MAX - 1] = 0; if (tok[0]) { if (sh->nhist == MAX_HIST) { kfree(sh->history[0]); memmove(sh->history, sh->history + 1, (MAX_HIST - 1) * sizeof(char *)); sh->nhist--; } sh->history[sh->nhist++] = strdup(tok); } tok = strtok_r(NULL, "\n", &save); }
     kfree(data);
 }
 
@@ -107,8 +109,8 @@ static int tokenize(const char *s, struct token *toks, int max) {
         /* word */
         char buf[LINE_MAX]; int l = 0;
         while (*s && !strchr(" \t|&;<>", *s)) {
-            if (*s == '\'') { s++; t->quoted = true; while (*s && *s != '\'') buf[l++] = *s++; if (*s) s++; }
-            else if (*s == '"') { s++; t->quoted = true; while (*s && *s != '"') { if (*s == '\\' && (s[1] == '"' || s[1] == '\\' || s[1] == '$')) s++; buf[l++] = *s++; } if (*s) s++; }
+            if (*s == '\'') { s++; t->quoted = true; while (*s && *s != '\'' && l < LINE_MAX - 1) buf[l++] = *s++; if (*s == '\'') s++; }
+            else if (*s == '"') { s++; t->quoted = true; while (*s && *s != '"' && l < LINE_MAX - 1) { if (*s == '\\' && (s[1] == '"' || s[1] == '\\' || s[1] == '$')) s++; buf[l++] = *s++; } if (*s == '"') s++; }
             else if (*s == '\\' && s[1]) { s++; buf[l++] = *s++; }
             else { if (*s == '>' && l > 0 && buf[l - 1] == '2') { l--; break; } buf[l++] = *s++; }
             if (l >= LINE_MAX - 1) break;
@@ -164,6 +166,7 @@ static int expand_word(struct shell *sh, struct token *t, char **argv, int argc)
     /* glob the last path component only */
     char dir[PATH_MAX], pat[NAME_MAX + 1];
     char *slash = strrchr(buf, '/');
+    if (slash && (size_t)(slash - buf) >= sizeof dir) { if (argc < MAX_ARGS - 1) argv[argc++] = strdup(buf); return argc; }
     if (slash) { size_t dl = slash - buf; memcpy(dir, buf, dl); dir[dl] = 0; if (!dl) strcpy(dir, "/"); strlcpy(pat, slash + 1, sizeof pat); }
     else { strcpy(dir, "."); strlcpy(pat, buf, sizeof pat); }
     struct vnode *d = vfs_lookup_rel(sh->proc->cwd, dir);
@@ -179,7 +182,7 @@ static int expand_word(struct shell *sh, struct token *t, char **argv, int argc)
         }
         vnode_unref(d);
     }
-    if (argc == start) argv[argc++] = strdup(buf);   /* no match: keep literal (zsh would error) */
+    if (argc == start) { if (argc < MAX_ARGS - 1) argv[argc++] = strdup(buf); }   /* no match: keep literal (zsh would error) */
     else for (int i = start + 1; i < argc; i++) { char *k = argv[i]; int j = i - 1; while (j >= start && strcmp(argv[j], k) > 0) { argv[j + 1] = argv[j]; j--; } argv[j + 1] = k; }
     return argc;
 }
@@ -194,7 +197,7 @@ static int run_line(struct shell *sh, struct ctx *c, const char *line);
 
 static void resolve(struct shell *sh, const char *p, char *out, size_t n) { vfs_normalize(sh->proc->cwd, p, out, n); }
 static const char *errstr(int e) {
-    switch (-e) { case ENOENT: return "no such file or directory"; case EEXIST: return "file exists"; case ENOTDIR: return "not a directory"; case EISDIR: return "is a directory"; case ENOTEMPTY: return "directory not empty"; case EROFS: return "read-only file system"; case EACCES: return "permission denied"; case ENOSPC: return "no space left on device"; case EIO: return "input/output error"; default: return "error"; }
+    switch (-e) { case ENOENT: return "no such file or directory"; case EEXIST: return "file exists"; case ENOTDIR: return "not a directory"; case EISDIR: return "is a directory"; case ENOTEMPTY: return "directory not empty"; case EROFS: return "read-only file system"; case EACCES: return "permission denied"; case ENOSPC: return "no space left on device"; case EIO: return "input/output error"; case EBUSY: return "device or resource busy"; case EFBIG: return "file too large"; default: return "error"; }
 }
 static void format_size_h(uint64_t sz, char *out, size_t n) {
     if (sz < 1024) snprintf(out, n, "%luB", sz);
@@ -235,13 +238,15 @@ static int b_printf(struct ctx *c, int argc, char **argv) {
         if (*p != '%') { out[o++] = *p; continue; }
         p++; if (*p == '%') { out[o++] = '%'; continue; }
         char spec[16]; int sl = 0; spec[sl++] = '%';
-        while (*p && !isalpha(*p) && sl < 12) spec[sl++] = *p++;
+        int nd = 0;   /* drop '*' (it would pull an extra va_arg) and cap widths at 4 digits */
+        while (*p && !isalpha(*p) && sl < 12) { nd = isdigit(*p) ? nd + 1 : 0; if (*p != '*' && nd <= 4) spec[sl++] = *p; p++; }
         char conv = *p; spec[sl++] = conv == 'd' || conv == 'i' ? 'l' : conv; if (conv == 'd' || conv == 'i') spec[sl++] = 'd'; spec[sl] = 0;
-        const char *arg = ai < argc ? argv[ai++] : "";
-        if (conv == 's') o += snprintf(out + o, LINE_MAX - o, spec, arg);
-        else if (conv == 'd' || conv == 'i') o += snprintf(out + o, LINE_MAX - o, spec, strtol(arg, NULL, 0));
-        else if (conv == 'x' || conv == 'X' || conv == 'u' || conv == 'o') { spec[sl - 1] = conv; spec[sl] = 0; char s2[16]; snprintf(s2, sizeof s2, "%.*sl%c", sl - 1, spec, conv); o += snprintf(out + o, LINE_MAX - o, s2, strtoul(arg, NULL, 0)); }
-        else if (conv == 'c') o += snprintf(out + o, LINE_MAX - o, "%c", arg[0]);
+        const char *arg = ai < argc ? argv[ai++] : ""; int r = 0;
+        if (conv == 's') r = snprintf(out + o, LINE_MAX - o, spec, arg);
+        else if (conv == 'd' || conv == 'i') r = snprintf(out + o, LINE_MAX - o, spec, strtol(arg, NULL, 0));
+        else if (conv == 'x' || conv == 'X' || conv == 'u' || conv == 'o') { spec[sl - 1] = conv; spec[sl] = 0; char s2[16]; snprintf(s2, sizeof s2, "%.*sl%c", sl - 1, spec, conv); r = snprintf(out + o, LINE_MAX - o, s2, strtoul(arg, NULL, 0)); }
+        else if (conv == 'c') r = snprintf(out + o, LINE_MAX - o, "%c", arg[0]);
+        o += CLAMP(r, 0, LINE_MAX - 1 - o);   /* snprintf returns the untruncated length */
         if (!*p) break;
     }
     cwrite(c, out, o);
@@ -254,7 +259,7 @@ static int b_ls(struct ctx *c, int argc, char **argv) {
         else paths[npaths++] = argv[i];
     }
     if (!npaths) paths[npaths++] = ".";
-    bool tty_out = c->out && c->out->vn && c->out->vn->type == VN_DEV;
+    bool tty_out = c->out && c->out->vn == c->sh->tty->vn;   /* pipes are VN_DEV too */
     int status = 0;
     for (int pi = 0; pi < npaths; pi++) {
         char p[PATH_MAX]; resolve(c->sh, paths[pi], p, sizeof p);
@@ -369,13 +374,21 @@ static int copy_path(struct ctx *c, const char *src, const char *dst, bool rec) 
     if (st.type == VN_DIR) {
         if (!rec) return -EISDIR;
         int r = vfs_mkdir(dst); if (r < 0 && r != -EEXIST) return r;
-        struct vnode *d = vfs_lookup(src); struct dirent de;
-        for (int i = 0; d && vfs_readdir(d, i, &de) == 0; i++) { char a[PATH_MAX], b[PATH_MAX]; snprintf(a, sizeof a, "%s/%s", src, de.name); snprintf(b, sizeof b, "%s/%s", dst, de.name); copy_path(c, a, b, true); }
+        struct vnode *d = vfs_lookup(src); struct dirent de; int res = d ? 0 : -ENOENT;
+        for (int i = 0; d && vfs_readdir(d, i, &de) == 0; i++) { char a[PATH_MAX], b[PATH_MAX]; snprintf(a, sizeof a, "%s/%s", src, de.name); snprintf(b, sizeof b, "%s/%s", dst, de.name); int e = copy_path(c, a, b, true); if (e < 0) res = e; }
         if (d) vnode_unref(d);
-        return 0;
+        return res;
     }
     void *data; size_t sz; int r = vfs_read_file(src, &data, &sz); if (r < 0) return r;
     r = vfs_write_file(dst, data, sz); kfree(data); return r;
+}
+/* the (normalized) target is the source itself or lies inside it */
+static bool path_within(const char *p, const char *base) { size_t l = strlen(base); return !strcmp(base, "/") || (!strncmp(p, base, l) && (p[l] == 0 || p[l] == '/')); }
+static bool copy_target_ok(struct ctx *c, const char *cmd, const char *arg, const char *src, char *target) {
+    char tn[PATH_MAX]; vfs_normalize("/", target, tn, sizeof tn); strlcpy(target, tn, PATH_MAX);
+    if (!strcmp(tn, src)) { eprintf(c, "%s: %s and %s are the same file\n", cmd, arg, tn); return false; }
+    if (path_within(tn, src)) { eprintf(c, "%s: cannot %s %s into itself\n", cmd, !strcmp(cmd, "mv") ? "move" : "copy", arg); return false; }
+    return true;
 }
 static int b_cp(struct ctx *c, int argc, char **argv) {
     bool rec = false; char *args[MAX_ARGS]; int n = 0;
@@ -387,6 +400,7 @@ static int b_cp(struct ctx *c, int argc, char **argv) {
     for (int i = 0; i < n - 1; i++) {
         char src[PATH_MAX], target[PATH_MAX]; resolve(c->sh, args[i], src, sizeof src);
         if (dst_dir) snprintf(target, sizeof target, "%s/%s", dst, vfs_basename(src)); else strlcpy(target, dst, sizeof target);
+        if (!copy_target_ok(c, "cp", args[i], src, target)) { status = 1; continue; }
         int r = copy_path(c, src, target, rec);
         if (r < 0) { eprintf(c, "cp: %s: %s\n", args[i], errstr(r)); status = 1; }
     }
@@ -400,6 +414,7 @@ static int b_mv(struct ctx *c, int argc, char **argv) {
     for (int i = 1; i < argc - 1; i++) {
         char src[PATH_MAX], target[PATH_MAX]; resolve(c->sh, argv[i], src, sizeof src);
         if (dst_dir) snprintf(target, sizeof target, "%s/%s", dst, vfs_basename(src)); else strlcpy(target, dst, sizeof target);
+        if (!copy_target_ok(c, "mv", argv[i], src, target)) { status = 1; continue; }
         int r = copy_path(c, src, target, true);
         if (r == 0) r = remove_recursive(c, src);
         if (r < 0) { eprintf(c, "mv: %s: %s\n", argv[i], errstr(r)); status = 1; }
@@ -412,6 +427,8 @@ static int head_tail(struct ctx *c, int argc, char **argv, bool tail) {
     struct ctx fc = *c; struct file *f = NULL;
     if (file) { char p[PATH_MAX]; resolve(c->sh, file, p, sizeof p); int r = vfs_open(p, O_RDONLY, &f); if (r < 0) { eprintf(c, "%s: %s: %s\n", tail ? "tail" : "head", file, errstr(r)); return 1; } fc.in = f; fc.rlen = fc.rpos = 0; }
     char line[LINE_MAX];
+    if (tail && n > 65536) n = 65536;
+    if (n <= 0) { if (f) vfs_close(f); return 0; }
     if (!tail) { for (int i = 0; i < n && cgetline(&fc, line, sizeof line); i++) { cputs(c, line); cputs(c, "\n"); } }
     else { char **ring = kzalloc(sizeof(char *) * n); int cnt = 0; while (cgetline(&fc, line, sizeof line)) { kfree(ring[cnt % n]); ring[cnt % n] = strdup(line); cnt++; } int start = cnt > n ? cnt - n : 0; for (int i = start; i < cnt; i++) { cputs(c, ring[i % n]); cputs(c, "\n"); } for (int i = 0; i < n; i++) kfree(ring[i]); kfree(ring); }
     if (f) vfs_close(f);
@@ -453,10 +470,11 @@ static int b_grep(struct ctx *c, int argc, char **argv) {
             if (m != invert) {
                 found++; cnt++;
                 if (count) continue;
-                if (nf > 1) cprintf(c, "\033[35m%s\033[0m:", files[fi]);
-                if (lineno) cprintf(c, "\033[32m%d\033[0m:", ln);
+                bool tty = c->out && c->out->vn == c->sh->tty->vn;   /* colour only on the terminal, not into pipes or files */
+                if (nf > 1) cprintf(c, tty ? "\033[35m%s\033[0m:" : "%s:", files[fi]);
+                if (lineno) cprintf(c, tty ? "\033[32m%d\033[0m:" : "%d:", ln);
                 /* highlight matches */
-                if (!invert && !icase) { const char *p = line, *q; while ((q = strstr(p, pat))) { cwrite(c, p, q - p); cprintf(c, "\033[1;31m%s\033[0m", pat); p = q + strlen(pat); } cputs(c, p); cputs(c, "\n"); }
+                if (!invert && !icase && pat[0] && tty) { const char *p = line, *q; while ((q = strstr(p, pat))) { cwrite(c, p, q - p); cprintf(c, "\033[1;31m%s\033[0m", pat); p = q + strlen(pat); } cputs(c, p); cputs(c, "\n"); }
                 else { cputs(c, line); cputs(c, "\n"); }
             }
         }
@@ -499,19 +517,26 @@ static int b_clear(struct ctx *c, int argc, char **argv) { cputs(c, "\033[H\033[
 static int b_ps(struct ctx *c, int argc, char **argv) {
     bool threads = argc > 1 && (strstr(argv[1], "T") || strstr(argv[1], "t"));
     sched_sample_cpu();
+    /* format with irqs off so the reaper can't free a process mid-walk (single CPU); write once they're back on */
+    size_t cap = 32768, o = 0; char *out = kmalloc(cap);
+    #define PS_OUT(...) do { int r_ = snprintf(out + o, cap - o, __VA_ARGS__); o += CLAMP(r_, 0, (int)(cap - 1 - o)); } while (0)
+    uint64_t irqf = irq_save();
     struct process *list[64]; int n = process_list(list, 64);
-    cprintf(c, "  PID %s  %%CPU     MEM STAT  CMD\n", threads ? "  TID" : "     ");
+    PS_OUT("  PID %s  %%CPU     MEM STAT  CMD\n", threads ? "  TID" : "     ");
     for (int i = 0; i < n; i++) {
         struct process *p = list[i];
         uint64_t mem = p->heap_bytes + (p->pml4 ? vmm_user_pages(p->pml4) * PAGE_SIZE : 0);
         int cpu = 0, nt = 0; struct thread *t; list_for_each_entry(t, &p->threads, proc_link) { cpu += t->cpu_percent; nt++; }
         char memstr[16]; format_size_h(mem, memstr, sizeof memstr);
-        cprintf(c, "%5d %s %4d%% %7s %-4s  %s%s\n", p->pid, threads ? "     " : "", cpu, memstr, p->exited ? "Z" : "S", p->name, p->is_user ? "" : nt > 1 ? "" : "");
+        PS_OUT("%5d %s %4d%% %7s %-4s  %s%s\n", p->pid, threads ? "     " : "", cpu, memstr, p->exited ? "Z" : "S", p->name, p->is_user ? "" : nt > 1 ? "" : "");
         if (threads) list_for_each_entry(t, &p->threads, proc_link) {
             const char *st = t->state == THREAD_RUNNING ? "R" : t->state == THREAD_READY ? "R" : t->state == THREAD_SLEEPING ? "S" : t->state == THREAD_BLOCKED ? "D" : "Z";
-            cprintf(c, "      %5d %4d%%         %-4s    \u2514 %s\n", t->tid, t->cpu_percent, st, t->name);
+            PS_OUT("      %5d %4d%%         %-4s    \u2514 %s\n", t->tid, t->cpu_percent, st, t->name);
         }
     }
+    irq_restore(irqf);
+    #undef PS_OUT
+    cwrite(c, out, o); kfree(out);
     return 0;
 }
 static int b_kill(struct ctx *c, int argc, char **argv) {
@@ -547,6 +572,7 @@ static int b_df(struct ctx *c, int argc, char **argv) {
     cprintf(c, "%-16s %10s %10s %10s %4lu%%  /\n", "tmpfs", a, b, d, u * 100 / t);
     for (int i = 0; i < vfs_mount_count(); i++) {
         char mp[PATH_MAX]; struct vnode *r = vfs_mount_at(i, mp, sizeof mp);
+        if (!r) continue;
         uint64_t tot = r->fs_total, fre = r->fs_free, use = tot > fre ? tot - fre : 0;
         if (h) { format_size_h(tot, a, 16); format_size_h(use, b, 16); format_size_h(fre, d, 16); } else { snprintf(a, 16, "%lu", tot / 1024); snprintf(b, 16, "%lu", use / 1024); snprintf(d, 16, "%lu", fre / 1024); }
         cprintf(c, "%-16s %10s %10s %10s %4lu%%  %s\n", r->fs_name ? r->fs_name : "?", a, b, d, tot ? use * 100 / tot : 0, mp);
@@ -555,15 +581,15 @@ static int b_df(struct ctx *c, int argc, char **argv) {
 }
 static int b_mount(struct ctx *c, int argc, char **argv) {
     cprintf(c, "tmpfs on / type tmpfs (rw)\n");
-    for (int i = 0; i < vfs_mount_count(); i++) { char mp[PATH_MAX]; struct vnode *r = vfs_mount_at(i, mp, sizeof mp); cprintf(c, "%s on %s type %s (rw)\n", r->name[0] ? r->name : "?", mp, r->fs_name ? r->fs_name : "?"); }
+    for (int i = 0; i < vfs_mount_count(); i++) { char mp[PATH_MAX]; struct vnode *r = vfs_mount_at(i, mp, sizeof mp); if (!r) continue; cprintf(c, "%s on %s type %s (rw)\n", r->name[0] ? r->name : "?", mp, r->fs_name ? r->fs_name : "?"); }
     return 0;
 }
 static int b_lsblk(struct ctx *c, int argc, char **argv) {
     cprintf(c, "%-10s %4s %10s %-5s %-24s %s\n", "NAME", "TYPE", "SIZE", "FS", "MODEL", "MOUNTPOINT");
     for (int i = 0; i < blockdev_count(); i++) {
-        struct blockdev *b = blockdev_at(i);
+        struct blockdev *b = blockdev_at(i); if (!b) continue;
         char sz[16]; format_size_h(b->sectors * b->sector_size, sz, sizeof sz);
-        char mp[PATH_MAX] = ""; for (int m = 0; m < vfs_mount_count(); m++) { char p[PATH_MAX]; struct vnode *r = vfs_mount_at(m, p, sizeof p); if (r->priv == b) strlcpy(mp, p, sizeof mp); }
+        char mp[PATH_MAX] = ""; for (int m = 0; m < vfs_mount_count(); m++) { char p[PATH_MAX]; struct vnode *r = vfs_mount_at(m, p, sizeof p); if (r && r->priv == b) strlcpy(mp, p, sizeof mp); }
         cprintf(c, "%s%-9s %4s %10s %-5s %-24s %s\n", b->parent ? "\u2514\u2500" : "", b->name, b->parent ? "part" : "disk", sz, b->fs_type ? b->fs_type : "", b->parent ? "" : b->model, mp);
     }
     return 0;
@@ -633,6 +659,13 @@ static int b_acpi(struct ctx *c, int argc, char **argv) {
              "       acpi irq             PCI interrupt routing from _PRT\n");
     return 1;
 }
+/* ---- USB ---- */
+static int b_lsusb(struct ctx *c, int argc, char **argv) {
+    bool verbose = argc > 1 && !strcmp(argv[1], "-v");
+    if (argc > 1 && !verbose) { cputs(c, "usage: lsusb [-v]\n"); return 1; }
+    usb_print(verbose, acpi_line, c);
+    return 0;
+}
 /* ---- sound ---- */
 static int b_play(struct ctx *c, int argc, char **argv) {
     if (argc < 2) { cputs(c, "usage: play file.wav ...\n"); return 1; }
@@ -653,19 +686,23 @@ static int b_play(struct ctx *c, int argc, char **argv) {
         size_t fb = w.channels * w.bits / 8, cap = 65536 / fb * fb;
         uint8_t *buf = kmalloc(cap);
         uint64_t shown = ~0ULL;
+        bool gone = false;
         for (uint64_t off = 0; off < w.data_len && !c->sh->cancel; ) {
             int64_t got = vfs_pread(v, w.data_off + off, buf, MIN((uint64_t)cap, w.data_len - off));
             if (got <= 0) break;
             got -= got % fb;
             if (!got) break;
-            audio_stream_write(s, buf, got / fb, &c->sh->cancel);
+            if (audio_stream_write(s, buf, got / fb, &c->sh->cancel) < 0) { gone = true; break; }   /* USB device unplugged */
             off += got;
             uint64_t sec = audio_stream_position(s) / w.rate;
             if (sec != shown) { cprintf(c, "\r  %lu:%02lu / %lu:%02lu", sec / 60, sec % 60, total / 60, total % 60); shown = sec; }
         }
-        audio_stream_drain(s, &c->sh->cancel);
-        if (c->sh->cancel) audio_stream_stop(s);
-        else cprintf(c, "\r  %lu:%02lu / %lu:%02lu", total / 60, total % 60, total / 60, total % 60);
+        if (gone) { cputs(c, "\n"); eprintf(c, "play: the audio device was disconnected"); status = 1; }
+        else {
+            audio_stream_drain(s, &c->sh->cancel);
+            if (c->sh->cancel) audio_stream_stop(s);
+            else cprintf(c, "\r  %lu:%02lu / %lu:%02lu", total / 60, total % 60, total / 60, total % 60);
+        }
         cputs(c, "\n");
         audio_stream_close(s);
         kfree(buf);
@@ -912,7 +949,7 @@ static int b_basename(struct ctx *c, int argc, char **argv) { if (argc < 2) retu
 static int b_dirname(struct ctx *c, int argc, char **argv) { if (argc < 2) return 1; char d[PATH_MAX]; vfs_dirname(argv[1], d, sizeof d); cprintf(c, "%s\n", d); return 0; }
 static void tree_walk(struct ctx *c, const char *path, const char *prefix, int depth, int *dirs, int *files) {
     struct vnode *d = vfs_lookup(path); if (!d) return;
-    struct dirent ents[256]; int n = 0;
+    struct dirent *ents = kmalloc(256 * sizeof *ents); int n = 0;   /* 75 KiB: not on the stack of a recursive function */
     for (int i = 0; n < 256 && vfs_readdir(d, i, &ents[n]) == 0; i++) if (ents[n].name[0] != '.') n++;
     vnode_unref(d);
     for (int i = 0; i < n; i++) {
@@ -921,6 +958,7 @@ static void tree_walk(struct ctx *c, const char *path, const char *prefix, int d
         if (ents[i].type == VN_DIR) { (*dirs)++; if (depth < 8) { char sub[PATH_MAX], np[256]; snprintf(sub, sizeof sub, "%s/%s", !strcmp(path, "/") ? "" : path, ents[i].name); snprintf(np, sizeof np, "%s%s", prefix, last ? "    " : "\u2502   "); tree_walk(c, sub, np, depth + 1, dirs, files); } }
         else (*files)++;
     }
+    kfree(ents);
 }
 static int b_tree(struct ctx *c, int argc, char **argv) {
     char p[PATH_MAX]; resolve(c->sh, argc > 1 ? argv[1] : ".", p, sizeof p);
@@ -966,7 +1004,7 @@ static int b_source(struct ctx *c, int argc, char **argv) {
     if (argc < 2) return 1;
     char p[PATH_MAX]; resolve(c->sh, argv[1], p, sizeof p); void *data; size_t sz;
     if (vfs_read_file(p, &data, &sz) < 0) { eprintf(c, "source: no such file: %s\n", argv[1]); return 1; }
-    if (c->sh->depth > 8) { kfree(data); return 1; }
+    if (c->sh->depth >= 3) { kfree(data); eprintf(c, "source: nested too deeply\n"); return 1; }   /* each level costs a run_line frame on the 128 KiB stack */
     c->sh->depth++;
     char *save, *line = strtok_r(data, "\n", &save); int st = 0;
     while (line) { st = run_line(c->sh, c, line); line = strtok_r(NULL, "\n", &save); }
@@ -1019,7 +1057,7 @@ static const struct builtin builtins[] = {
     { "history", b_history, "show command history (-c clears)" }, { "host", b_nslookup, "look up a host name" }, { "hostname", b_hostname, "print the host name" },
     { "id", b_id, "print user identity" }, { "ifconfig", b_ifconfig, "show or configure network adapters" }, { "install", b_install, "install inFlux to a disk" }, { "kill", b_kill, "terminate a process: kill [-9] pid" },
     { "ls", b_ls, "list directory contents (-l -a -h)" }, { "lsblk", b_lsblk, "list block devices" }, { "lsgpu", b_lsgpu, "show graphics adapters" },
-    { "lspci", b_lspci, "list PCI devices" }, { "mkdir", b_mkdir, "create directories (-p)" },
+    { "lspci", b_lspci, "list PCI devices" }, { "lsusb", b_lsusb, "list USB devices (-v: interfaces and endpoints)" }, { "mkdir", b_mkdir, "create directories (-p)" },
     { "mount", b_mount, "list mounted filesystems" }, { "mv", b_mv, "move or rename files" }, { "netstat", b_netstat, "list TCP connections" },
     { "nproc", b_nproc, "number of processors" }, { "nslookup", b_nslookup, "query DNS for a host name" }, { "open", b_open, "open a file or folder in the desktop (-a App)" },
     { "ping", b_ping, "send ICMP echo requests (-c count)" }, { "play", b_play, "play WAV files (Ctrl+C stops)" }, { "printf", b_printf, "formatted output" }, { "ps", b_ps, "list processes (-T shows threads)" },
@@ -1040,20 +1078,23 @@ static const struct builtin builtins[] = {
 
 /* ---- execution ---- */
 struct stage { int argc; char *argv[MAX_ARGS]; char *redir_out, *redir_in, *redir_err; bool append, err2out; };
-struct job { struct ctx ctx; const struct builtin *b; int argc; char **argv; struct semaphore done; int status; };
+struct job { struct ctx ctx; const struct builtin *b; int argc; char **argv; struct semaphore done; int status; bool detached; };
 
 static void job_close(struct job *j) { if (j->ctx.in) vfs_close(j->ctx.in); if (j->ctx.out) vfs_close(j->ctx.out); if (j->ctx.err) vfs_close(j->ctx.err); j->ctx.in = j->ctx.out = j->ctx.err = NULL; }
 static void job_thread(void *p) {
     struct job *j = p;
     j->status = j->b->fn(&j->ctx, j->argc, j->argv);
     job_close(j);
-    sem_post(&j->done);
+    if (!j->detached) { sem_post(&j->done); return; }
+    /* background job: nobody waits, it owns its copy of the job and argv */
+    for (int i = 0; i < j->argc; i++) kfree(j->argv[i]);
+    kfree(j->argv); kfree(j);
 }
 
 static int run_pipeline(struct shell *sh, struct ctx *base, struct stage *st, int n, bool background) {
     struct file *in = base->in ? vfs_dup(base->in) : NULL;
-    struct job jobs[16]; int pids[16]; int njobs = 0; int status = 0;
-    memset(jobs, 0, sizeof jobs);
+    struct job *jobs = kzalloc(16 * sizeof *jobs); int pids[16]; int njobs = 0; int status = 0; const char *lastname = NULL;   /* heap: keeps nested `source` off the stack */
+    if (!background) tty_set_raw(sh->tty, false);   /* builtins and programs reading the terminal get line editing, echo and ^C */
     for (int i = 0; i < n; i++) {
         struct stage *s = &st[i];
         if (!s->argc) continue;
@@ -1072,8 +1113,16 @@ static int run_pipeline(struct shell *sh, struct ctx *base, struct stage *st, in
             sem_init(&j->done, 0); pids[njobs] = 0;
             in = out = err = NULL;   /* the job owns these now */
             if (n == 1 && !background) { j->status = b->fn(&j->ctx, s->argc, s->argv); job_close(j); sem_post(&j->done); }
+            else if (background) {
+                /* run_pipeline's frame and the stage argv die before the job does: give it its own copies */
+                struct job *bj = kmalloc(sizeof *bj); *bj = *j; bj->detached = true; sem_init(&bj->done, 0);
+                bj->argv = kzalloc((s->argc + 1) * sizeof(char *));
+                for (int k = 0; k < s->argc; k++) bj->argv[k] = strdup(s->argv[k]);
+                j->ctx.in = j->ctx.out = j->ctx.err = NULL; j->b = NULL;
+                thread_create(sh->proc, b->name, job_thread, bj);
+            }
             else { thread_create(sh->proc, b->name, job_thread, j); }
-            njobs++;
+            lastname = s->argv[0]; njobs++;
         } else {
             char p[PATH_MAX];
             if (strchr(s->argv[0], '/')) resolve(sh, s->argv[0], p, sizeof p); else snprintf(p, sizeof p, "/bin/%s", s->argv[0]);
@@ -1084,20 +1133,21 @@ static int run_pipeline(struct shell *sh, struct ctx *base, struct stage *st, in
                 in = next_in; continue;
             }
             struct file *stdio[3] = { in, out, err };
-            if (!background) { tty_set_raw(sh->tty, false); }
             int pid = process_spawn(p, s->argc, s->argv, stdio, sh->proc->cwd);
             if (pid < 0) { eprintf(base, "zsh: %s: %s\n", s->argv[0], pid == -ENOEXEC ? "exec format error" : errstr(pid)); status = 126; }
-            else { if (!background && last) sh->tty->fg_pid = pid; pids[njobs] = pid; jobs[njobs].b = NULL; njobs++; }
+            else { if (!background && last) sh->tty->fg_pid = pid; pids[njobs] = pid; jobs[njobs].b = NULL; lastname = s->argv[0]; njobs++; }
         }
         if (in) vfs_close(in); if (out) vfs_close(out); if (err) vfs_close(err);
         in = next_in;
     }
     if (in) vfs_close(in);
-    if (background) { if (njobs) cprintf(base, "[1] %d\n", pids[njobs - 1]); return 0; }
+    /* a builtin runs as a thread of the shell and has no pid of its own: name it instead */
+    if (background) { if (njobs) { if (pids[njobs - 1]) cprintf(base, "[1] %d\n", pids[njobs - 1]); else cprintf(base, "[1] %s\n", lastname); } kfree(jobs); return 0; }
     for (int i = 0; i < njobs; i++) {
         if (jobs[i].b) { sem_wait(&jobs[i].done); status = jobs[i].status; }
         else { int s2 = 0; process_wait(pids[i], &s2); status = s2; }
     }
+    kfree(jobs);
     sh->tty->fg_pid = 0;
     tty_set_raw(sh->tty, true);
     return status;
@@ -1108,8 +1158,9 @@ static int run_line(struct shell *sh, struct ctx *c, const char *line) {
     if (!nt) return sh->last_status;
     int i = 0, status = 0; int connector = 0;   /* 0 none, 1 &&, 2 || */
     bool skip = false;
+    struct stage *st = kmalloc(16 * sizeof *st);   /* 17 KiB: heap, so nested `source` fits the stack */
     while (i < nt && !sh->exiting) {
-        struct stage st[16]; int ns = 0; memset(st, 0, sizeof st);
+        int ns = 0; memset(st, 0, 16 * sizeof *st);
         bool background = false;
         /* parse one pipeline */
         while (i < nt && toks[i].type != T_SEMI && toks[i].type != T_AND && toks[i].type != T_OR && toks[i].type != T_AMP) {
@@ -1150,6 +1201,7 @@ static int run_line(struct shell *sh, struct ctx *c, const char *line) {
         skip = (connector == 1 && status != 0) || (connector == 2 && status == 0);
         if (!skip) connector = 0;
     }
+    kfree(st);
     for (int k = 0; k < nt; k++) kfree(toks[k].text);
     return status;
 }
@@ -1163,16 +1215,26 @@ static void prompt_string(struct shell *sh, char *out, size_t n) {
 static int visible_len(const char *s) { int n = 0; while (*s) { if (*s == 27) { while (*s && *s != 'm') s++; if (*s) s++; continue; } s++; n++; } return n; }
 static void redraw_line(struct shell *sh) {
     char prompt[PATH_MAX + 64]; prompt_string(sh, prompt, sizeof prompt);
-    char buf[LINE_MAX + PATH_MAX + 128]; int o = 0;
-    o += snprintf(buf + o, sizeof buf - o, "\r\033[K%s", prompt);
-    int plen = visible_len(prompt);
-    int cols = sh->tty->cols; int avail = cols - plen - 1; if (avail < 10) avail = 10;
-    int start = 0; if (sh->cursor > avail) start = sh->cursor - avail;
-    int show = MIN(sh->len - start, avail);
-    memcpy(buf + o, sh->line + start, show); o += show;
-    int back = show - (sh->cursor - start);
-    if (back > 0) o += snprintf(buf + o, sizeof buf - o, "\033[%dD", back);
+    char buf[LINE_MAX + PATH_MAX + 160]; int o = 0;
+    int cols = MAX(sh->tty->cols, 1), plen = visible_len(prompt);
+    /* back to the prompt's first row, clear everything below, draw it all and let the terminal wrap */
+    if (sh->cur_row > 0) o += snprintf(buf + o, sizeof buf - o, "\033[%dA", sh->cur_row);
+    o += snprintf(buf + o, sizeof buf - o, "\r\033[J%s", prompt);
+    memcpy(buf + o, sh->line, sh->len); o += sh->len;
+    int end = plen + sh->len, pos = plen + sh->cursor;
+    if (end % cols == 0) o += snprintf(buf + o, sizeof buf - o, "\r\n");   /* leave the pending wrap at the last column */
+    int erow = end / cols, prow = pos / cols, pcol = pos % cols;
+    if (erow > prow) o += snprintf(buf + o, sizeof buf - o, "\033[%dA", erow - prow);
+    o += snprintf(buf + o, sizeof buf - o, "\r");
+    if (pcol) o += snprintf(buf + o, sizeof buf - o, "\033[%dC", pcol);
+    sh->cur_row = prow; sh->cur_col = pcol;
     tty_write(sh->tty, buf, o);
+}
+/* put the terminal cursor on a fresh row below the whole line (sh->cursor is kept) */
+static void leave_line(struct shell *sh) {
+    int c = sh->cursor; sh->cursor = sh->len; redraw_line(sh); sh->cursor = c;
+    if (sh->cur_col) tty_write(sh->tty, "\n", 1);
+    sh->cur_row = 0;
 }
 static void insert_str(struct shell *sh, const char *s, int n) {
     if (sh->len + n >= LINE_MAX - 1) return;
@@ -1180,7 +1242,8 @@ static void insert_str(struct shell *sh, const char *s, int n) {
     memcpy(sh->line + sh->cursor, s, n); sh->len += n; sh->cursor += n; sh->line[sh->len] = 0;
 }
 
-static void complete(struct shell *sh) {
+static bool has_cand(char (*c)[NAME_MAX + 2], int n, const char *s) { for (int i = 0; i < n; i++) if (!strcmp(c[i], s)) return true; return false; }
+__attribute__((noinline)) static void complete(struct shell *sh) {   /* 33 KiB of candidates: keep them out of shell_main's frame */
     /* find the word under the cursor */
     int ws = sh->cursor; while (ws > 0 && sh->line[ws - 1] != ' ' && sh->line[ws - 1] != '|' && sh->line[ws - 1] != ';') ws--;
     char word[LINE_MAX]; int wl = sh->cursor - ws; memcpy(word, sh->line + ws, wl); word[wl] = 0;
@@ -1191,15 +1254,16 @@ static void complete(struct shell *sh) {
     bool path_mode = !first || strchr(word, '/');
     if (!path_mode) {
         for (int i = 0; i < nbuiltins && nc < 128; i++) if (!strncmp(builtins[i].name, word, wl)) strlcpy(cands[nc++], builtins[i].name, NAME_MAX + 2);
-        for (int i = 0; i < sh->naliases && nc < 128; i++) if (!strncmp(sh->aliases[i].name, word, wl)) strlcpy(cands[nc++], sh->aliases[i].name, NAME_MAX + 2);
+        for (int i = 0; i < sh->naliases && nc < 128; i++) if (!strncmp(sh->aliases[i].name, word, wl) && !has_cand(cands, nc, sh->aliases[i].name)) strlcpy(cands[nc++], sh->aliases[i].name, NAME_MAX + 2);
         struct vnode *b = vfs_lookup("/bin"); struct dirent de;
-        for (int i = 0; b && nc < 128 && vfs_readdir(b, i, &de) == 0; i++) if (!strncmp(de.name, word, wl)) strlcpy(cands[nc++], de.name, NAME_MAX + 2);
+        for (int i = 0; b && nc < 128 && vfs_readdir(b, i, &de) == 0; i++) if (!strncmp(de.name, word, wl) && !has_cand(cands, nc, de.name)) strlcpy(cands[nc++], de.name, NAME_MAX + 2);
         if (b) vnode_unref(b);
         dirdisp[0] = 0;
     } else {
         char w2[LINE_MAX]; strlcpy(w2, word, sizeof w2);
         if (w2[0] == '~' && (w2[1] == '/' || !w2[1])) { char tb[LINE_MAX]; snprintf(tb, sizeof tb, "/home/flux%s", w2 + 1); strcpy(w2, tb); }
         char *slash = strrchr(w2, '/');
+        if (slash && ((size_t)(slash - w2) >= sizeof dir || (size_t)(strrchr(word, '/') - word + 1) >= sizeof dirdisp)) return;
         if (slash) { size_t dl = slash - w2; memcpy(dirdisp, word, strrchr(word, '/') - word + 1); dirdisp[strrchr(word, '/') - word + 1] = 0; memcpy(dir, w2, dl); dir[dl] = 0; if (!dl) strcpy(dir, "/"); strlcpy(prefix, slash + 1, sizeof prefix); }
         else { strcpy(dir, "."); dirdisp[0] = 0; strlcpy(prefix, w2, sizeof prefix); }
         struct vnode *d = vfs_lookup_rel(sh->proc->cwd, dir); struct dirent de;
@@ -1223,7 +1287,7 @@ static void complete(struct shell *sh) {
     }
     if (++sh->tab_count >= 2 || nc <= 1) {
         /* list candidates */
-        tty_write(sh->tty, "\n", 1);
+        leave_line(sh);
         int maxw = 0; for (int i = 0; i < nc; i++) maxw = MAX(maxw, (int)strlen(cands[i]));
         int colw = maxw + 2, cols = MAX(1, sh->tty->cols / colw);
         for (int i = 0; i < nc; i++) { char buf[NAME_MAX + 8]; int n = snprintf(buf, sizeof buf, "%-*s", colw, cands[i]); tty_write(sh->tty, buf, n); if ((i + 1) % cols == 0 || i == nc - 1) tty_write(sh->tty, "\n", 1); }
@@ -1232,21 +1296,21 @@ static void complete(struct shell *sh) {
 }
 
 static bool read_line(struct shell *sh) {
-    sh->len = 0; sh->cursor = 0; sh->line[0] = 0; sh->hist_pos = sh->nhist; sh->tab_count = 0;
+    sh->len = 0; sh->cursor = 0; sh->line[0] = 0; sh->hist_pos = sh->nhist; sh->tab_count = 0; sh->cur_row = 0;
     redraw_line(sh);
     for (;;) {
         char ch;
         int64_t n = tty_read(sh->tty, &ch, 1);
         if (n <= 0) { if (thread_should_exit() || sh->tty->closed) return false; continue; }
         if (ch != '\t') sh->tab_count = 0;
-        if (ch == '\r' || ch == '\n') { tty_write(sh->tty, "\n", 1); return true; }
+        if (ch == '\r' || ch == '\n') { leave_line(sh); return true; }
         else if (ch == 27) {
             char seq[8]; int sl = 0;
             while (sl < 7) { if (tty_read(sh->tty, &seq[sl], 1) <= 0) break; sl++; if (isalpha(seq[sl - 1]) || seq[sl - 1] == '~') break; }
             seq[sl] = 0;
             if (!strcmp(seq, "[A") || !strcmp(seq, "[B")) {
-                if (seq[1] == 'A' && sh->hist_pos > 0) { if (sh->hist_pos == sh->nhist) strcpy(sh->saved_line, sh->line); sh->hist_pos--; strcpy(sh->line, sh->history[sh->hist_pos]); }
-                else if (seq[1] == 'B' && sh->hist_pos < sh->nhist) { sh->hist_pos++; strcpy(sh->line, sh->hist_pos == sh->nhist ? sh->saved_line : sh->history[sh->hist_pos]); }
+                if (seq[1] == 'A' && sh->hist_pos > 0) { if (sh->hist_pos == sh->nhist) strcpy(sh->saved_line, sh->line); sh->hist_pos--; strlcpy(sh->line, sh->history[sh->hist_pos], sizeof sh->line); }
+                else if (seq[1] == 'B' && sh->hist_pos < sh->nhist) { sh->hist_pos++; strlcpy(sh->line, sh->hist_pos == sh->nhist ? sh->saved_line : sh->history[sh->hist_pos], sizeof sh->line); }
                 sh->len = sh->cursor = strlen(sh->line);
             }
             else if (!strcmp(seq, "[C")) { if (sh->cursor < sh->len) sh->cursor++; }
@@ -1267,8 +1331,8 @@ static bool read_line(struct shell *sh) {
         else if (ch == 11) { sh->len = sh->cursor; sh->line[sh->len] = 0; }
         else if (ch == 21) { memmove(sh->line, sh->line + sh->cursor, sh->len - sh->cursor + 1); sh->len -= sh->cursor; sh->cursor = 0; }
         else if (ch == 23) { int e = sh->cursor, s = e; while (s > 0 && sh->line[s - 1] == ' ') s--; while (s > 0 && sh->line[s - 1] != ' ') s--; memmove(sh->line + s, sh->line + e, sh->len - e + 1); sh->len -= e - s; sh->cursor = s; }
-        else if (ch == 12) { tty_write(sh->tty, "\033[H\033[2J", 7); }
-        else if (ch == 3) { tty_write(sh->tty, "^C\n", 3); sh->len = sh->cursor = 0; sh->line[0] = 0; sh->hist_pos = sh->nhist; }
+        else if (ch == 12) { tty_write(sh->tty, "\033[H\033[2J", 7); sh->cur_row = 0; }
+        else if (ch == 3) { sh->cursor = sh->len; redraw_line(sh); tty_write(sh->tty, "^C\n", 3); sh->cur_row = 0; sh->len = sh->cursor = 0; sh->line[0] = 0; sh->hist_pos = sh->nhist; }
         else if (ch == 4) { if (sh->len == 0) { tty_write(sh->tty, "exit\n", 5); return false; } }
         else if (ch == '\t') { complete(sh); }
         else if ((unsigned char)ch >= 32) insert_str(sh, &ch, 1);
@@ -1298,8 +1362,12 @@ void shell_main(void *arg) {
     }
     while (!sh->exiting && !thread_should_exit()) {
         /* reap finished background jobs */
+        struct { int pid; char name[32]; } done[16]; int nd = 0;
+        uint64_t irqf = irq_save();   /* copy under irqs-off: a process can't be freed mid-scan (single CPU) */
         struct process *plist[64]; int np = process_list(plist, 64);
-        for (int i = 0; i < np; i++) if (plist[i]->parent == sh->proc && plist[i]->exited && plist[i]->is_user) { char msg[64]; int ml = snprintf(msg, sizeof msg, "[1]  + done  %s\n", plist[i]->name); tty_write(sh->tty, msg, ml); process_wait(plist[i]->pid, NULL); }
+        for (int i = 0; i < np && nd < 16; i++) if (plist[i]->parent == sh->proc && plist[i]->exited && plist[i]->is_user) { done[nd].pid = plist[i]->pid; strlcpy(done[nd].name, plist[i]->name, sizeof done[nd].name); nd++; }
+        irq_restore(irqf);
+        for (int i = 0; i < nd; i++) { char msg[64]; int ml = snprintf(msg, sizeof msg, "[1]  + done  %s\n", done[i].name); tty_write(sh->tty, msg, ml); process_wait(done[i].pid, NULL); }
         char title[PATH_MAX + 16]; int tl = snprintf(title, sizeof title, "\033]0;%s\007", sh->proc->cwd); tty_write(sh->tty, title, tl);
         if (!read_line(sh)) break;
         if (sh->len == 0) continue;

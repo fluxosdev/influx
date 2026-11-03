@@ -16,7 +16,7 @@ static void fmt_num(struct out *o, uint64_t v, bool neg, int base, bool upper, i
     const char *digits = upper ? "0123456789ABCDEF" : "0123456789abcdef";
     if (v == 0) tmp[len++] = '0';
     while (v) { tmp[len++] = digits[v % base]; v /= base; }
-    while (len < prec) tmp[len++] = '0';
+    while (len < prec && len < (int)sizeof tmp) tmp[len++] = '0';
     int total = len + (neg ? 1 : 0) + (alt && base == 16 ? 2 : 0);
     if (!left && !zero) pad(o, width - total, ' ');
     if (neg) put(o, '-');
@@ -44,6 +44,7 @@ int vsnprintf(char *buf, size_t n, const char *fmt, va_list ap) {
         while (*fmt == 'l') { lng++; fmt++; }
         if (*fmt == 'z' || *fmt == 'j' || *fmt == 't') { lng = 2; fmt++; }
         if (*fmt == 'h') { fmt++; if (*fmt == 'h') fmt++; }
+        if (!*fmt) break;
         switch (*fmt) {
         case 'd': case 'i': {
             int64_t v = lng ? va_arg(ap, int64_t) : va_arg(ap, int);

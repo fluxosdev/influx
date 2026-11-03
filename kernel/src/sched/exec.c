@@ -12,6 +12,9 @@ struct elf64_ehdr { uint8_t ident[16]; uint16_t type, machine; uint32_t version;
 struct elf64_phdr { uint32_t type, flags; uint64_t offset, vaddr, paddr, filesz, memsz, align; } PACKED;
 #define PT_LOAD 1
 #define USER_MAX 0x0000800000000000ULL
+#define USER_LIMIT (USER_STACK_TOP - USER_STACK_SIZE - PAGE_SIZE)   /* image and heap stay below the stack and its guard page */
+#define USER_BRK_MAX (1ULL << 32)                                    /* per-process sbrk heap */
+#define PMM_RESERVE_PAGES 4096                                       /* left for the kernel when mapping user memory */
 
 struct syscall_frame { uint64_t rax, r9, r8, r10, rdx, rsi, rdi, r15, r14, r13, r12, rbp, rbx, rflags, rip, rsp; };
 
@@ -33,6 +36,8 @@ static int copy_user_string(struct process *p, uint64_t addr, char *out, size_t 
 
 /* map a zeroed page range into the process */
 static int map_user_range(struct process *p, uint64_t start, uint64_t end) {
+    uint64_t need = (PAGE_ALIGN_UP(end) - PAGE_ALIGN_DOWN(start)) / PAGE_SIZE;
+    if (need + need / 512 + PMM_RESERVE_PAGES > pmm_free_bytes() / PAGE_SIZE) return -ENOMEM;
     for (uint64_t a = PAGE_ALIGN_DOWN(start); a < PAGE_ALIGN_UP(end); a += PAGE_SIZE) {
         if (vmm_get_phys(p->pml4, a)) continue;
         uint64_t phys = pmm_alloc_page();
@@ -55,22 +60,29 @@ int process_spawn(const char *path, int argc, char **argv, struct file *stdio[3]
     int r = vfs_read_file(path, &data, &size);
     if (r < 0) return r;
     struct elf64_ehdr *eh = data;
-    if (size < sizeof *eh || memcmp(eh->ident, "\x7f" "ELF", 4) || eh->ident[4] != 2 || eh->machine != 62 || eh->type != 2) { kfree(data); return -ENOEXEC; }
+    if (size < sizeof *eh || memcmp(eh->ident, "\x7f" "ELF", 4) || eh->ident[4] != 2 || eh->machine != 62 || eh->type != 2 ||
+        eh->entry < PAGE_SIZE || eh->entry >= USER_LIMIT || (eh->phnum && (eh->phentsize < sizeof(struct elf64_phdr) ||
+        eh->phoff > size || (uint64_t)eh->phnum * eh->phentsize > size - eh->phoff))) { kfree(data); return -ENOEXEC; }
+    for (int i = 0; i < eh->phnum; i++) {
+        struct elf64_phdr *ph = (struct elf64_phdr *)((uint8_t *)data + eh->phoff + (uint64_t)i * eh->phentsize);
+        if (ph->type != PT_LOAD || ph->memsz == 0) continue;
+        if (ph->filesz > ph->memsz || ph->vaddr < PAGE_SIZE || ph->vaddr >= USER_LIMIT || ph->memsz > USER_LIMIT - ph->vaddr ||
+            ph->offset > size || ph->filesz > size - ph->offset) { kfree(data); return -ENOEXEC; }
+    }
     struct process *p = process_create(vfs_basename(path), true);
     strlcpy(p->cwd, cwd ? cwd : "/", sizeof p->cwd);
     uint64_t brk = 0;
     for (int i = 0; i < eh->phnum; i++) {
-        struct elf64_phdr *ph = (struct elf64_phdr *)((uint8_t *)data + eh->phoff + i * eh->phentsize);
+        struct elf64_phdr *ph = (struct elf64_phdr *)((uint8_t *)data + eh->phoff + (uint64_t)i * eh->phentsize);
         if (ph->type != PT_LOAD || ph->memsz == 0) continue;
-        if (ph->vaddr + ph->memsz > USER_MAX || ph->offset + ph->filesz > size) { kfree(data); process_kill(p->pid, 9); return -ENOEXEC; }
-        map_user_range(p, ph->vaddr, ph->vaddr + ph->memsz);
+        if (map_user_range(p, ph->vaddr, ph->vaddr + ph->memsz) < 0) goto nomem;
         copy_to_user_space(p, ph->vaddr, (uint8_t *)data + ph->offset, ph->filesz);
         if (ph->vaddr + ph->memsz > brk) brk = ph->vaddr + ph->memsz;
     }
     p->brk_start = p->brk = PAGE_ALIGN_UP(brk) + PAGE_SIZE;
     /* stack with argv */
     uint64_t stack_bottom = USER_STACK_TOP - USER_STACK_SIZE;
-    map_user_range(p, stack_bottom, USER_STACK_TOP);
+    if (map_user_range(p, stack_bottom, USER_STACK_TOP) < 0) goto nomem;
     size_t strs = 0; for (int i = 0; i < argc; i++) strs += strlen(argv[i]) + 1;
     uint64_t sp = USER_STACK_TOP - 16;
     sp -= ALIGN_UP(strs, 16);
@@ -89,6 +101,12 @@ int process_spawn(const char *path, int argc, char **argv, struct file *stdio[3]
     kfree(data);
     thread_create_user(p, p->name, entry, sp);
     return p->pid;
+nomem:
+    /* no thread ever ran: mark it exited and reap it here */
+    kfree(data);
+    p->exited = true;
+    process_wait(p->pid, NULL);
+    return -ENOMEM;
 }
 
 /* ---- syscalls ---- */
@@ -109,7 +127,7 @@ struct user_blkinfo { char name[16], model[48], fs[16]; uint64_t bytes; int32_t 
 void process_close_windows(struct process *p) { for (int i = 0; i < 8; i++) if (p->uwin[i]) { window_destroy(p->uwin[i]); p->uwin[i] = NULL; } }
 static struct window *uwin_get(struct process *p, uint64_t id) { return id < 8 ? p->uwin[id] : NULL; }
 static int fd_alloc(struct process *p, struct file *f) { for (int i = 0; i < MAX_FDS; i++) if (!p->fds[i]) { p->fds[i] = f; return i; } vfs_close(f); return -ENOMEM; }
-static struct file *fd_get(struct process *p, int fd) { return fd >= 0 && fd < MAX_FDS ? p->fds[fd] : NULL; }
+static struct file *fd_get(struct process *p, uint64_t fd) { return fd < MAX_FDS ? p->fds[fd] : NULL; }
 
 static int64_t do_syscall(struct syscall_frame *f) {
     struct process *p = current_thread->proc;
@@ -122,7 +140,10 @@ static int64_t do_syscall(struct syscall_frame *f) {
     case SYS_CLOSE: { struct file *fl = fd_get(p, a1); if (!fl) return -EBADF; p->fds[a1] = NULL; vfs_close(fl); return 0; }
     case SYS_LSEEK: { struct file *fl = fd_get(p, a1); if (!fl) return -EBADF; return vfs_seek(fl, (int64_t)a2, (int)a3); }
     case SYS_GETPID: return p->pid;
-    case SYS_SBRK: { int64_t incr = (int64_t)a1; uint64_t old = p->brk; if (incr > 0) { if (p->brk + incr > USER_HEAP_BASE + (1ULL << 32)) return -ENOMEM; map_user_range(p, p->brk, p->brk + incr); } p->brk += incr; return old; }
+    case SYS_SBRK: { int64_t incr = (int64_t)a1; uint64_t old = p->brk;
+        if (incr > 0) { if ((uint64_t)incr > USER_BRK_MAX - (p->brk - p->brk_start) || p->brk + incr > USER_LIMIT || map_user_range(p, p->brk, p->brk + incr) < 0) return -ENOMEM; }
+        else if (incr < 0 && 0 - (uint64_t)incr > p->brk - p->brk_start) return -EINVAL;
+        p->brk += incr; return old; }
     case SYS_SLEEP: thread_sleep_ms(a1); return 0;
     case SYS_YIELD: thread_yield(); return 0;
     case SYS_GETCWD: { size_t l = strlen(p->cwd) + 1; if (a2 < l || !user_range_ok(p, a1, l)) return -EINVAL; memcpy((void *)a1, p->cwd, l); return 0; }
@@ -147,11 +168,11 @@ static int64_t do_syscall(struct syscall_frame *f) {
     case SYS_TIME: return time_unix();
     case SYS_UPTIME: return system_ticks;
     case SYS_IOCTL: { struct file *fl = fd_get(p, a1); if (!fl) return -EBADF; if (!fl->vn->ops->ioctl) return -ENOTTY_; if (a2 == 2 && !user_range_ok(p, a3, 8)) return -EINVAL; return fl->vn->ops->ioctl(fl->vn, (int)a2, (void *)a3); }
-    case SYS_DUP2: { struct file *fl = fd_get(p, a1); if (!fl || a2 >= MAX_FDS) return -EBADF; if (a1 == a2) return a2; if (p->fds[a2]) vfs_close(p->fds[a2]); p->fds[a2] = vfs_dup(fl); return a2; }
-    case SYS_PIPE: { if (!user_range_ok(p, a1, 8)) return -EINVAL; struct file *r, *w; pipe_create(&r, &w); int fr = fd_alloc(p, r); int fw = fd_alloc(p, w); if (fr < 0 || fw < 0) return -ENOMEM; ((int *)a1)[0] = fr; ((int *)a1)[1] = fw; return 0; }
-    case SYS_KILL: return process_kill((int)a1, (int)a2) ? 0 : -ESRCH;
+    case SYS_DUP2: { struct file *fl = fd_get(p, a1); if (!fl || a2 >= MAX_FDS) return -EBADF; if (a1 == a2) return a2; struct file *nf = vfs_dup(fl); if (p->fds[a2]) vfs_close(p->fds[a2]); p->fds[a2] = nf; return a2; }
+    case SYS_PIPE: { if (!user_range_ok(p, a1, 8)) return -EINVAL; struct file *r, *w; pipe_create(&r, &w); int fr = fd_alloc(p, r); if (fr < 0) { vfs_close(w); return -ENOMEM; } int fw = fd_alloc(p, w); if (fw < 0) { p->fds[fr] = NULL; vfs_close(r); return -ENOMEM; } ((int *)a1)[0] = fr; ((int *)a1)[1] = fw; return 0; }
+    case SYS_KILL: { uint64_t fl = irq_save(); struct process *tp = process_find((int)a1); int r = !tp ? -ESRCH : !tp->is_user ? -EACCES : 0; irq_restore(fl); if (r) return r; return process_kill((int)a1, (int)a2) ? 0 : -ESRCH; }
     case SYS_SYSINFO: { if (!user_range_ok(p, a1, sizeof(struct user_sysinfo))) return -EINVAL; struct user_sysinfo *si = (void *)a1; si->uptime_ms = system_ticks; si->total_mem = pmm_total_bytes(); si->free_mem = pmm_free_bytes(); si->used_mem = pmm_used_bytes(); struct process *l[64]; si->procs = process_list(l, 64); struct thread *t[128]; si->threads = thread_list(t, 128); return 0; }
-    case SYS_PS: { int max = (int)a2; if (max > 64) max = 64; if (!user_range_ok(p, a1, max * sizeof(struct user_procinfo))) return -EINVAL; sched_sample_cpu(); struct process *l[64]; int n = process_list(l, 64); struct user_procinfo *out = (void *)a1; int k = 0; for (int i = 0; i < n && k < max; i++) { out[k].pid = l[i]->pid; strlcpy(out[k].name, l[i]->name, 32); out[k].user = l[i]->is_user; out[k].mem = l[i]->heap_bytes + (l[i]->pml4 ? vmm_user_pages(l[i]->pml4) * PAGE_SIZE : 0); int cpu = 0, nt = 0; struct thread *t; list_for_each_entry(t, &l[i]->threads, proc_link) { cpu += t->cpu_percent; nt++; } out[k].cpu = l[i]->pid == 1 ? 0 : cpu; out[k].threads = nt; k++; } return k; }
+    case SYS_PS: { int max = (int)a2; if (max > 64) max = 64; if (!user_range_ok(p, a1, max * sizeof(struct user_procinfo))) return -EINVAL; sched_sample_cpu(); uint64_t fl = irq_save(); struct process *l[64]; int n = process_list(l, 64); struct user_procinfo *out = (void *)a1; int k = 0; for (int i = 0; i < n && k < max; i++) { out[k].pid = l[i]->pid; strlcpy(out[k].name, l[i]->name, 32); out[k].user = l[i]->is_user; out[k].mem = l[i]->heap_bytes + (l[i]->pml4 ? vmm_user_pages(l[i]->pml4) * PAGE_SIZE : 0); int cpu = 0, nt = 0; struct thread *t; list_for_each_entry(t, &l[i]->threads, proc_link) { cpu += t->cpu_percent; nt++; } out[k].cpu = l[i]->pid == 1 ? 0 : cpu; out[k].threads = nt; k++; } irq_restore(fl); return k; }
     case SYS_SYNC: vfs_sync(); return 0;
     case SYS_WIN_CREATE: {
         char title[128]; if (copy_user_string(p, a3, title, sizeof title) < 0) strcpy(title, p->name);
@@ -165,10 +186,14 @@ static int64_t do_syscall(struct syscall_frame *f) {
         return slot; }
     case SYS_WIN_PRESENT: {
         struct window *win = uwin_get(p, a1); if (!win) return -EBADF;
+        /* a3/r10 = the buffer's width/height (0: legacy, buffer matches the window) */
+        uint64_t sw = a3, sh = f->r10;
+        if ((sw || sh) && (!sw || !sh || sw > 4096 || sh > 4096)) return -EINVAL;
         struct canvas *cv = window_begin_draw(win);
-        size_t bytes = (size_t)cv->w * cv->h * 4;
-        if (!user_range_ok(p, a2, bytes)) { window_end_draw(win, NULL); return -EINVAL; }
-        memcpy(cv->px, (void *)a2, bytes);
+        if (!sw) { sw = cv->w; sh = cv->h; }
+        if (!user_range_ok(p, a2, sw * sh * 4)) { window_end_draw(win, NULL); return -EINVAL; }
+        int cw = MIN((int)sw, cv->w), ch = MIN((int)sh, cv->h);
+        for (int y = 0; y < ch; y++) memcpy(cv->px + (size_t)y * cv->stride, (uint32_t *)a2 + y * sw, (size_t)cw * 4);
         window_end_draw(win, NULL);
         return 0; }
     case SYS_WIN_EVENT: {
@@ -181,13 +206,15 @@ static int64_t do_syscall(struct syscall_frame *f) {
         return 1; }
     case SYS_WIN_DESTROY: { struct window *win = uwin_get(p, a1); if (!win) return -EBADF; p->uwin[a1] = NULL; window_destroy(win); return 0; }
     case SYS_WIN_TITLE: { struct window *win = uwin_get(p, a1); if (!win) return -EBADF; char t[128]; if (copy_user_string(p, a2, t, sizeof t) < 0) return -EINVAL; window_set_title(win, t); return 0; }
-    case SYS_LSBLK: { int max = (int)a2; if (max > 32) max = 32; if (!user_range_ok(p, a1, max * sizeof(struct user_blkinfo))) return -EINVAL; struct user_blkinfo *out = (void *)a1; int n = 0; for (int i = 0; i < blockdev_count() && n < max; i++) { struct blockdev *b = blockdev_at(i); strlcpy(out[n].name, b->name, 16); strlcpy(out[n].model, b->parent ? b->parent->model : b->model, 48); strlcpy(out[n].fs, b->fs_type ? b->fs_type : "", 16); out[n].bytes = b->sectors * b->sector_size; out[n].partition = b->parent != NULL; n++; } return n; }
+    case SYS_LSBLK: { int max = (int)a2; if (max > 32) max = 32; if (!user_range_ok(p, a1, max * sizeof(struct user_blkinfo))) return -EINVAL; struct user_blkinfo *out = (void *)a1; int n = 0; for (int i = 0; i < blockdev_count() && n < max; i++) { struct blockdev *b = blockdev_at(i); if (!b) continue; strlcpy(out[n].name, b->name, 16); strlcpy(out[n].model, b->parent ? b->parent->model : b->model, 48); strlcpy(out[n].fs, b->fs_type ? b->fs_type : "", 16); out[n].bytes = b->sectors * b->sector_size; out[n].partition = b->parent != NULL; n++; } return n; }
     }
     return -ENOSYS;
 }
 
 void syscall_dispatch(struct syscall_frame *f) {
     f->rax = (uint64_t)do_syscall(f);
+    /* sysret to a non-canonical rip would fault in ring 0 on the user stack */
+    if (f->rip >= USER_MAX) current_thread->kill_pending = true;
     if (current_thread->kill_pending) process_exit(current_thread->proc->exit_code);
 }
 

@@ -29,14 +29,16 @@ static int64_t pipe_write(struct vnode *v, uint64_t off, const void *buf, size_t
 }
 static void pipe_release_r(struct vnode *v) {
     struct pipe *p = v->priv;
-    spin_lock(&p->lock); p->readers--; bool dead = p->readers == 0 && p->writers == 0; spin_unlock(&p->lock);
-    waitq_wake_all(&p->wr_wq);
+    spin_lock(&p->lock); p->readers--; bool dead = p->readers == 0 && p->writers == 0;
+    waitq_wake_all(&p->wr_wq);   /* under p->lock (it only takes sched_lock): once dropped, the other end may free p */
+    spin_unlock(&p->lock);
     if (dead) { kfree(p->buf); kfree(p); }
 }
 static void pipe_release_w(struct vnode *v) {
     struct pipe *p = v->priv;
-    spin_lock(&p->lock); p->writers--; bool dead = p->readers == 0 && p->writers == 0; spin_unlock(&p->lock);
-    waitq_wake_all(&p->rd_wq);
+    spin_lock(&p->lock); p->writers--; bool dead = p->readers == 0 && p->writers == 0;
+    waitq_wake_all(&p->rd_wq);   /* under p->lock (it only takes sched_lock): once dropped, the other end may free p */
+    spin_unlock(&p->lock);
     if (dead) { kfree(p->buf); kfree(p); }
 }
 static const struct vnode_ops pipe_r_ops = { pipe_read, NULL, NULL, NULL, NULL, NULL, NULL, NULL, pipe_release_r, NULL };

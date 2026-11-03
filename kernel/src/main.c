@@ -7,6 +7,8 @@
 #include "io.h"
 #include "simd.h"
 #include "acpi.h"
+#include "input.h"
+#include "usb.h"
 #include <limine.h>
 
 __attribute__((used, section(".limine_requests_start"))) static volatile LIMINE_REQUESTS_START_MARKER;
@@ -37,8 +39,10 @@ static void init_thread(void *arg) {
     pci_init();
     fb_boot_progress("Loading ACPI");
     acpi_namespace_init();   /* before the drivers: they route PCI interrupts through _PRT */
+    input_init();            /* USB keyboards and mice deliver events from here on */
     drivers_init();
     storage_init();
+    usb_init();              /* after the disks: a USB stick does not take /home from an installed disk */
     net_init();
     syscall_init();
     desktop_main(NULL);

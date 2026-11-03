@@ -40,15 +40,29 @@ static void app_thread(void *p) {
     /* process exits when this (last) thread returns */
 }
 
+/* desktop processes have no parent waiting on them: reap each one when it exits */
+static void reaper_thread(void *arg) { process_wait((int)(intptr_t)arg, NULL); wm_notify_app_state(); }
+static void reap_when_done(struct process *p) { thread_create(NULL, "reaper", reaper_thread, (void *)(intptr_t)p->pid); }
+
+/* running instances of an app; with irqs off so the reaper can't free a process mid-scan (single CPU).
+   The pointers are only compared against window owners afterwards, never dereferenced. */
+static int app_instances(int id, struct process **out, int max) {
+    uint64_t f = irq_save();
+    struct process *list[64]; int n = process_list(list, 64), k = 0;
+    for (int i = 0; i < n && k < max; i++) if (list[i]->app_id == id && !list[i]->exited) out[k++] = list[i];
+    irq_restore(f);
+    return k;
+}
+
 int app_launch(int id, const char *arg) {
     if (id < 0 || id >= APP_COUNT) return -1;
     if (app_table[id].single_instance && app_is_running(id)) {
         app_activate(id);
         if (arg) { /* forward the open request */
-            struct process *list[64]; int n = process_list(list, 64);
-            for (int i = 0; i < n; i++) if (list[i]->app_id == id && !list[i]->exited) {
-                struct window *w = window_top_of_process(list[i]);
-                if (w) { struct event e = { .type = EV_OPEN, .path = strdup(arg) }; window_post_event(w, &e); }
+            struct process *list[64]; int n = app_instances(id, list, 64);
+            for (int i = 0; i < n; i++) {
+                struct event e = { .type = EV_OPEN, .path = strdup(arg) };
+                if (!window_post_process(list[i], &e)) kfree(e.path);
             }
         }
         return 0;
@@ -59,21 +73,15 @@ int app_launch(int id, const char *arg) {
     struct app_start *s = kmalloc(sizeof *s);
     s->id = id; s->arg = arg ? strdup(arg) : NULL;
     thread_create(p, app_table[id].name, app_thread, s);
+    reap_when_done(p);
     return p->pid;
 }
 
-bool app_is_running(int id) {
-    struct process *list[64]; int n = process_list(list, 64);
-    for (int i = 0; i < n; i++) if (list[i]->app_id == id && !list[i]->exited) return true;
-    return false;
-}
+bool app_is_running(int id) { struct process *p; return app_instances(id, &p, 1) > 0; }
 
 void app_activate(int id) {
-    struct process *list[64]; int n = process_list(list, 64);
-    for (int i = 0; i < n; i++) if (list[i]->app_id == id && !list[i]->exited) {
-        struct window *w = window_top_of_process(list[i]);
-        if (w) { window_focus(w); return; }
-    }
+    struct process *list[64]; int n = app_instances(id, list, 64);
+    for (int i = 0; i < n; i++) if (window_focus_process(list[i])) return;
 }
 
 const char *icon_for_file(const char *name, int type) {
@@ -180,6 +188,7 @@ static void about_thread(void *arg) {
 void about_show(void) {
     struct process *p = process_create("About inFlux", false);
     thread_create(p, "about", about_thread, NULL);
+    reap_when_done(p);
 }
 
 void wm_system_command(int cmd) {
@@ -188,8 +197,8 @@ void wm_system_command(int cmd) {
     case CMD_SETTINGS: app_launch(APP_SETTINGS, NULL); break;
     case CMD_TASKMAN: app_launch(APP_TASKMAN, NULL); break;
     case CMD_INSTALL: app_launch(APP_INSTALLER, NULL); break;
-    case CMD_RESTART: { struct process *p = process_create("Restart", false); extern void power_restart_thread(void *); thread_create(p, "restart", power_restart_thread, NULL); break; }
-    case CMD_SHUTDOWN: { struct process *p = process_create("Shut Down", false); extern void power_shutdown_thread(void *); thread_create(p, "shutdown", power_shutdown_thread, NULL); break; }
+    case CMD_RESTART: { struct process *p = process_create("Restart", false); extern void power_restart_thread(void *); thread_create(p, "restart", power_restart_thread, NULL); reap_when_done(p); break; }
+    case CMD_SHUTDOWN: { struct process *p = process_create("Shut Down", false); extern void power_shutdown_thread(void *); thread_create(p, "shutdown", power_shutdown_thread, NULL); reap_when_done(p); break; }
     }
 }
 
