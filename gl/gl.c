@@ -1,6 +1,6 @@
 /* inFlux software OpenGL. See gl.h. Compiled once for the kernel, once for user space. */
 #include "gl.h"
-#include "gl_port.h"   /* GL_MALLOC, GL_FREE, GL_MEMSET, GL_MEMCPY, GL_STRLEN */
+#include "gl_port.h"   /* GL_MALLOC, GL_FREE, GL_MEMSET, GL_MEMCPY, GL_STRLEN, GL_GET_CURRENT, GL_SET_CURRENT, GL_FORGET_CONTEXT */
 
 #define MAX_STACK 32
 #define MAX_TEX_STACK 8
@@ -12,6 +12,8 @@
 #define MAX_LIST_NESTING 64
 #define INITIAL_VERTS 3072     /* divisible by 1, 2, 3 and 4 so independent primitives flush on a boundary */
 #define MAX_VERTS (1 << 22)
+#define MAX_FB_DIM 8192        /* also GL_MAX_VIEWPORT_DIMS */
+#define MAX_IMAGE_PIXELS ((size_t)MAX_FB_DIM * MAX_FB_DIM)   /* largest client image converted in one go (gluBuild2DMipmaps input) */
 #define CLIP_W_EPS 1e-4f
 
 /* ---- math ---- */
@@ -29,6 +31,7 @@ float glm_cosf(float x) { return glm_sinf(x + GLM_PI / 2); }
 float glm_tanf(float x) { return glm_sinf(x) / glm_cosf(x); }
 static float fabsf_(float x) { return x < 0 ? -x : x; }
 static float clamp01(float v) { return v < 0 ? 0 : v > 1 ? 1 : v; }
+static long long clampll(long long v, long long lo, long long hi) { return v < lo ? lo : v > hi ? hi : v; }
 static float fastfloor(float v) { int i = (int)v; return (float)(v < i ? i - 1 : i); }
 static float log2f_(float x) {
     if (!(x > 0)) return -128;
@@ -125,10 +128,12 @@ struct gl_context {
     /* display lists */
     struct dlist *lists; int nlists; struct dlist building; GLuint compiling, list_base; GLenum list_mode; int list_depth;
     GLenum error;
+    char renderer[128];                /* glGetString(GL_RENDERER) */
 };
 
-static GLcontext *cur;
-static char renderer_name[128] = "inFlux Software Rasterizer";
+/* The current context lives in the port: per thread in the kernel (demo windows render concurrently), a static in user space */
+#define CUR() ((GLcontext *)GL_GET_CURRENT())
+#define DEFAULT_RENDERER "inFlux Software Rasterizer"
 
 static void tex_defaults(struct texture *t) {
     GL_MEMSET(t, 0, sizeof *t);
@@ -142,11 +147,12 @@ static void material_defaults(struct material *m) {
 }
 
 GLcontext *glxCreateContext(int w, int h) {
-    if (w <= 0 || h <= 0) return 0;
+    if (w <= 0 || h <= 0 || w > MAX_FB_DIM || h > MAX_FB_DIM) return 0;   /* also keeps w * h * 4 far from overflow */
     GLcontext *c = GL_MALLOC(sizeof *c);
     if (!c) return 0;
     GL_MEMSET(c, 0, sizeof *c);
     c->width = w; c->height = h;
+    GL_MEMCPY(c->renderer, DEFAULT_RENDERER, sizeof DEFAULT_RENDERER);
     c->color = GL_MALLOC((size_t)w * h * 4);
     c->depth = GL_MALLOC((size_t)w * h * sizeof(float));
     c->cap_verts = INITIAL_VERTS;
@@ -197,17 +203,17 @@ void glxDestroyContext(GLcontext *c) {
     if (c->depth) GL_FREE(c->depth);
     if (c->verts) GL_FREE(c->verts);
     if (c->cverts) GL_FREE(c->cverts);
-    if (cur == c) cur = 0;
+    GL_FORGET_CONTEXT(c);
     GL_FREE(c);
 }
-void glxMakeCurrent(GLcontext *c) { cur = c; }
+int glxMakeCurrent(GLcontext *c) { return GL_SET_CURRENT(c); }
 uint32_t *glxGetPixels(GLcontext *c) { return c ? c->color : 0; }
 int glxGetWidth(GLcontext *c) { return c ? c->width : 0; }
 int glxGetHeight(GLcontext *c) { return c ? c->height : 0; }
-void glxSetRendererName(const char *n) { size_t l = GL_STRLEN(n); if (l > sizeof renderer_name - 1) l = sizeof renderer_name - 1; GL_MEMCPY(renderer_name, n, l); renderer_name[l] = 0; }
+void glxSetRendererName(GLcontext *c, const char *n) { if (!c || !n) return; size_t l = GL_STRLEN(n); if (l > sizeof c->renderer - 1) l = sizeof c->renderer - 1; GL_MEMCPY(c->renderer, n, l); c->renderer[l] = 0; }
 
-static void set_error(GLenum e) { if (cur && cur->error == GL_NO_ERROR) cur->error = e; }
-#define CTX(ret) GLcontext *c = cur; if (!c) return ret
+static void set_error(GLenum e) { GLcontext *c = CUR(); if (c && c->error == GL_NO_ERROR) c->error = e; }
+#define CTX(ret) GLcontext *c = CUR(); if (!c) return ret
 
 /* ---- display list recording ----
  * A list is a stream of words: a header (opcode | argument count << 8) followed
@@ -267,9 +273,9 @@ void glClear(GLbitfield mask) {
     CTX(); RECORD(OP_CLEAR, (float)mask);
     if (c->in_begin) { set_error(GL_INVALID_OPERATION); return; }
     int x0 = 0, y0 = 0, x1 = c->width, y1 = c->height;
-    if (c->scissor_test) {
-        int sx1 = c->sc_x + c->sc_w, sy0 = c->height - c->sc_y - c->sc_h, sy1 = c->height - c->sc_y;
-        if (c->sc_x > x0) x0 = c->sc_x; if (sx1 < x1) x1 = sx1; if (sy0 > y0) y0 = sy0; if (sy1 < y1) y1 = sy1;
+    if (c->scissor_test) {   /* 64-bit: the box is any int rectangle */
+        long long sx1 = (long long)c->sc_x + c->sc_w, sy0 = (long long)c->height - c->sc_y - c->sc_h, sy1 = (long long)c->height - c->sc_y;
+        x0 = (int)clampll(c->sc_x, 0, x1); x1 = (int)clampll(sx1, 0, x1); y0 = (int)clampll(sy0, 0, y1); y1 = (int)clampll(sy1, 0, y1);
     }
     if (x0 >= x1 || y0 >= y1) return;
     if (mask & GL_COLOR_BUFFER_BIT) {
@@ -283,17 +289,17 @@ void glClear(GLbitfield mask) {
     if ((mask & GL_DEPTH_BUFFER_BIT) && c->depth_write)
         for (int y = y0; y < y1; y++) { float *row = c->depth + (size_t)y * c->width; for (int x = x0; x < x1; x++) row[x] = c->clear_depth; }
 }
-void glViewport(GLint x, GLint y, GLsizei w, GLsizei h) { CTX(); RECORD(OP_VIEWPORT, (float)x, (float)y, (float)w, (float)h); if (w < 0 || h < 0) { set_error(GL_INVALID_VALUE); return; } c->vp_x = x; c->vp_y = y; c->vp_w = w; c->vp_h = h; }
+void glViewport(GLint x, GLint y, GLsizei w, GLsizei h) { CTX(); RECORD(OP_VIEWPORT, (float)x, (float)y, (float)w, (float)h); if (w < 0 || h < 0) { set_error(GL_INVALID_VALUE); return; } c->vp_x = x; c->vp_y = y; c->vp_w = w < MAX_FB_DIM ? w : MAX_FB_DIM; c->vp_h = h < MAX_FB_DIM ? h : MAX_FB_DIM; }   /* sizes clamp to GL_MAX_VIEWPORT_DIMS */
 void glScissor(GLint x, GLint y, GLsizei w, GLsizei h) { CTX(); RECORD(OP_SCISSOR, (float)x, (float)y, (float)w, (float)h); if (w < 0 || h < 0) { set_error(GL_INVALID_VALUE); return; } c->sc_x = x; c->sc_y = y; c->sc_w = w; c->sc_h = h; }
 void glDepthRange(GLclampd n, GLclampd f) { CTX(); RECORD(OP_DEPTH_RANGE, (float)n, (float)f); c->depth_near = clamp01((float)n); c->depth_far = clamp01((float)f); }
-static void update_clip(GLcontext *c) {
-    int x0 = c->vp_x, y0 = c->height - c->vp_y - c->vp_h, x1 = c->vp_x + c->vp_w, y1 = c->height - c->vp_y;
+static void update_clip(GLcontext *c) {   /* 64-bit: viewport and scissor origins are any int */
+    long long x0 = c->vp_x, y0 = (long long)c->height - c->vp_y - c->vp_h, x1 = (long long)c->vp_x + c->vp_w, y1 = (long long)c->height - c->vp_y;
     if (c->scissor_test) {
-        int sx1 = c->sc_x + c->sc_w, sy0 = c->height - c->sc_y - c->sc_h, sy1 = c->height - c->sc_y;
+        long long sx1 = (long long)c->sc_x + c->sc_w, sy0 = (long long)c->height - c->sc_y - c->sc_h, sy1 = (long long)c->height - c->sc_y;
         if (c->sc_x > x0) x0 = c->sc_x; if (sx1 < x1) x1 = sx1; if (sy0 > y0) y0 = sy0; if (sy1 < y1) y1 = sy1;
     }
-    c->cx0 = x0 < 0 ? 0 : x0; c->cy0 = y0 < 0 ? 0 : y0;
-    c->cx1 = x1 > c->width ? c->width : x1; c->cy1 = y1 > c->height ? c->height : y1;
+    c->cx0 = (int)clampll(x0, 0, c->width); c->cy0 = (int)clampll(y0, 0, c->height);
+    c->cx1 = (int)clampll(x1, 0, c->width); c->cy1 = (int)clampll(y1, 0, c->height);
 }
 
 static void apply_color_material(GLcontext *c, const float *col);
@@ -367,7 +373,7 @@ GLenum glGetError(void) { CTX(GL_NO_ERROR); GLenum e = c->error; c->error = GL_N
 const GLubyte *glGetString(GLenum name) {
     switch (name) {
     case GL_VENDOR: return (const GLubyte *)"inFlux";
-    case GL_RENDERER: return (const GLubyte *)renderer_name;
+    case GL_RENDERER: { GLcontext *c = CUR(); return (const GLubyte *)(c ? c->renderer : DEFAULT_RENDERER); }
     case GL_VERSION: return (const GLubyte *)"1.1 inFlux software";
     case GL_EXTENSIONS: return (const GLubyte *)"GL_EXT_bgra GL_EXT_texture_edge_clamp GL_SGIS_texture_edge_clamp GL_ARB_texture_mirrored_repeat GL_EXT_texture_env_add GL_EXT_rescale_normal GL_EXT_draw_range_elements";
     }
@@ -428,7 +434,7 @@ static int get_state(GLcontext *c, GLenum p, float *v) {
     case GL_MAX_MODELVIEW_STACK_DEPTH: case GL_MAX_PROJECTION_STACK_DEPTH: v[0] = MAX_STACK; return 1;
     case GL_MAX_TEXTURE_STACK_DEPTH: v[0] = MAX_TEX_STACK; return 1;
     case GL_MAX_LIST_NESTING: v[0] = MAX_LIST_NESTING; return 1;
-    case GL_MAX_VIEWPORT_DIMS: v[0] = v[1] = 8192; return 2;
+    case GL_MAX_VIEWPORT_DIMS: v[0] = v[1] = MAX_FB_DIM; return 2;
     case GL_RED_BITS: case GL_GREEN_BITS: case GL_BLUE_BITS: case GL_ALPHA_BITS: v[0] = 8; return 1;
     case GL_DEPTH_BITS: v[0] = 24; return 1;
     case GL_STENCIL_BITS: v[0] = 0; return 1;
@@ -688,7 +694,7 @@ static size_t row_stride(int w, int row_len, int align, int bytes_per_px, int co
 }
 /* client pixels -> ARGB texels laid out for the texture's base format */
 static uint32_t *unpack_image(GLcontext *c, int w, int h, GLenum format, GLenum type, const void *pixels, GLenum base) {
-    uint32_t *out = GL_MALLOC((size_t)w * h * 4);
+    uint32_t *out = (size_t)w * h <= MAX_IMAGE_PIXELS ? GL_MALLOC((size_t)w * h * 4) : 0;   /* w, h > 0 are ints: the product cannot wrap */
     if (!out) { set_error(GL_OUT_OF_MEMORY); return 0; }
     if (!pixels) { GL_MEMSET(out, 0, (size_t)w * h * 4); return out; }
     int nc = format_components(format), cs = type_size(type);
@@ -779,13 +785,14 @@ void glTexSubImage2D(GLenum target, GLint level, GLint x, GLint y, GLsizei w, GL
     CTX();
     if (target != GL_TEXTURE_2D) { set_error(GL_INVALID_ENUM); return; }
     if (!format_components(format) || format == GL_DEPTH_COMPONENT || (type != GL_UNSIGNED_BYTE && type != GL_FLOAT)) { set_error(GL_INVALID_ENUM); return; }
-    if (level < 0 || level >= MAX_LEVELS || w < 0 || h < 0) { set_error(GL_INVALID_VALUE); return; }
+    /* no level is larger than MAX_TEX_SIZE: bounds the upload (and keeps recorded coordinates exact as floats) */
+    if (level < 0 || level >= MAX_LEVELS || x < 0 || y < 0 || w < 0 || h < 0 || w > MAX_TEX_SIZE - x || h > MAX_TEX_SIZE - y) { set_error(GL_INVALID_VALUE); return; }
     if (!w || !h) return;
     struct texture *t = &c->textures[c->bound_tex];
     if (!c->compiling) {
         struct level *l = &t->lv[level];
         if (!l->px) { set_error(GL_INVALID_OPERATION); return; }
-        if (x < 0 || y < 0 || x + w > l->w || y + h > l->h) { set_error(GL_INVALID_VALUE); return; }
+        if (w > l->w - x || h > l->h - y) { set_error(GL_INVALID_VALUE); return; }
     }
     uint32_t *px = unpack_image(c, w, h, format, type, pixels, t->base);
     if (!px) return;
@@ -797,7 +804,7 @@ void glTexSubImage2D(GLenum target, GLint level, GLint x, GLint y, GLsizei w, GL
         if (!copy) return;
         px = copy;
         struct level *l = &t->lv[level];
-        if (!l->px || x < 0 || y < 0 || x + w > l->w || y + h > l->h) { GL_FREE(px); set_error(GL_INVALID_VALUE); return; }
+        if (!l->px || w > l->w - x || h > l->h - y) { GL_FREE(px); set_error(GL_INVALID_VALUE); return; }
     }
     tex_sub_store(c, level, x, y, w, h, px);
     GL_FREE(px);
@@ -1482,12 +1489,14 @@ GLuint glGenLists(GLsizei range) {
 void glDeleteLists(GLuint list, GLsizei range) {
     CTX();
     if (range < 0) { set_error(GL_INVALID_VALUE); return; }
-    for (GLsizei k = 0; k < range; k++) if (list + k < (GLuint)c->nlists) dlist_free(&c->lists[list + k]);
+    if (list >= (GLuint)c->nlists) return;
+    if ((GLuint)range > (GLuint)c->nlists - list) range = (GLsizei)((GLuint)c->nlists - list);   /* no list + k wrap-around */
+    for (GLsizei k = 0; k < range; k++) dlist_free(&c->lists[list + k]);
 }
 GLboolean glIsList(GLuint list) { CTX(0); return list && list < (GLuint)c->nlists && c->lists[list].used; }
 void glNewList(GLuint list, GLenum mode) {
     CTX();
-    if (!list) { set_error(GL_INVALID_VALUE); return; }
+    if (!list || list >= MAX_LISTS) { set_error(GL_INVALID_VALUE); return; }   /* also keeps list + 1 from wrapping */
     if (mode != GL_COMPILE && mode != GL_COMPILE_AND_EXECUTE) { set_error(GL_INVALID_ENUM); return; }
     if (c->compiling || c->in_begin) { set_error(GL_INVALID_OPERATION); return; }
     if (!ensure_lists(c, list + 1)) { set_error(GL_OUT_OF_MEMORY); return; }
@@ -1560,8 +1569,9 @@ static void execute_list(GLcontext *c, GLuint id) {
             break; }
         case OP_TEX_SUB_IMAGE: {
             int lv = (int)a[0], x = (int)a[1], y = (int)a[2], w = (int)a[3], h = (int)a[4];
+            if (lv < 0 || lv >= MAX_LEVELS) break;
             struct level *dst = &c->textures[c->bound_tex].lv[lv];
-            if (!dst->px || x < 0 || y < 0 || x + w > dst->w || y + h > dst->h) { set_error(GL_INVALID_VALUE); break; }
+            if (!dst->px || x < 0 || y < 0 || w < 0 || h < 0 || w > dst->w - x || h > dst->h - y) { set_error(GL_INVALID_VALUE); break; }
             tex_sub_store(c, lv, x, y, w, h, l->blobs[(int)a[5]]);
             break; }
         case OP_TEX_PARAMETER: glTexParameterfv(E(0), E(1), a + 2); break;
@@ -1607,13 +1617,14 @@ void glReadPixels(GLint x, GLint y, GLsizei w, GLsizei h, GLenum format, GLenum 
     if (c->in_begin) { set_error(GL_INVALID_OPERATION); return; }
     size_t stride = row_stride(w, c->pack_row_len, c->pack_align, nc * cs, cs);
     uint8_t *base = (uint8_t *)pixels + (size_t)c->pack_skip_rows * stride + (size_t)c->pack_skip_px * nc * cs;
-    for (int j = 0; j < h; j++) {
+    /* only the part of the rectangle inside the buffer is written; 64-bit so x + w and y + h cannot overflow */
+    int j0 = (int)clampll(-(long long)y, 0, h), j1 = (int)clampll((long long)c->height - y, 0, h);
+    int i0 = (int)clampll(-(long long)x, 0, w), i1 = (int)clampll((long long)c->width - x, 0, w);
+    for (int j = j0; j < j1; j++) {
         int by = c->height - 1 - (y + j);          /* GL rows count up from the bottom */
-        if (by < 0 || by >= c->height) continue;
         uint8_t *row = base + (size_t)j * stride;
-        for (int i = 0; i < w; i++) {
+        for (int i = i0; i < i1; i++) {
             int bx = x + i;
-            if (bx < 0 || bx >= c->width) continue;
             size_t idx = (size_t)by * c->width + bx;
             float v[4], rgba[4];
             if (format == GL_DEPTH_COMPONENT) v[0] = c->depth[idx];
@@ -1703,20 +1714,20 @@ GLint gluUnProject(GLdouble wx, GLdouble wy, GLdouble wz, const GLdouble *model,
     *ox = out[0] / out[3]; *oy = out[1] / out[3]; *oz = out[2] / out[3];
     return GL_TRUE;
 }
-static int nearest_pow2(int v) { int p = 1; while (p * 2 <= v) p *= 2; return (p * 2 - v < v - p && p * 2 <= MAX_TEX_SIZE) ? p * 2 : p; }
+static int nearest_pow2(int v) { int p = 1; while (p < MAX_TEX_SIZE && p * 2 <= v) p *= 2; return (p < MAX_TEX_SIZE && p * 2 - v < v - p) ? p * 2 : p; }   /* <= MAX_TEX_SIZE, and p * 2 cannot overflow */
 static uint32_t *resample(const uint32_t *src, int w, int h, int nw, int nh) {
     uint32_t *dst = GL_MALLOC((size_t)nw * nh * 4);
     if (!dst) return 0;
     for (int y = 0; y < nh; y++) for (int x = 0; x < nw; x++) {
         /* box filter over the source footprint of this texel */
-        int sx0 = x * w / nw, sx1 = (x + 1) * w / nw, sy0 = y * h / nh, sy1 = (y + 1) * h / nh;
+        int sx0 = (int)((long long)x * w / nw), sx1 = (int)((long long)(x + 1) * w / nw), sy0 = (int)((long long)y * h / nh), sy1 = (int)((long long)(y + 1) * h / nh);
         if (sx1 <= sx0) sx1 = sx0 + 1; if (sy1 <= sy0) sy1 = sy0 + 1;
-        uint32_t sum[4] = { 0 }, cnt = 0;
+        uint64_t sum[4] = { 0 }, cnt = 0;
         for (int sy = sy0; sy < sy1; sy++) for (int sx = sx0; sx < sx1; sx++) {
             uint32_t p = src[(size_t)sy * w + sx];
             sum[0] += p >> 24; sum[1] += (p >> 16) & 0xFF; sum[2] += (p >> 8) & 0xFF; sum[3] += p & 0xFF; cnt++;
         }
-        dst[(size_t)y * nw + x] = (sum[0] + cnt / 2) / cnt << 24 | (sum[1] + cnt / 2) / cnt << 16 | (sum[2] + cnt / 2) / cnt << 8 | (sum[3] + cnt / 2) / cnt;
+        dst[(size_t)y * nw + x] = (uint32_t)((sum[0] + cnt / 2) / cnt << 24 | (sum[1] + cnt / 2) / cnt << 16 | (sum[2] + cnt / 2) / cnt << 8 | (sum[3] + cnt / 2) / cnt);
     }
     return dst;
 }

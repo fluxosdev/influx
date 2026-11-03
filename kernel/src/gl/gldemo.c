@@ -11,10 +11,12 @@ static const struct menu_item view_items[] = { MENU("Wireframe", DCMD_WIRE, 'w',
 static const struct menu menus[] = { { "File", file_items, ARRAY_LEN(file_items) }, { "View", view_items, ARRAY_LEN(view_items) } };
 static const struct app_menus demo_menus = { menus, ARRAY_LEN(menus) };
 
-struct demo { struct window *w; GLcontext *gl; GLuint tex, torus; float angle; bool wire, light, texture, spin, cull; int frames; uint64_t fps_t; int fps; int drag_x, drag_y; bool dragging; float rot_x, rot_y; };
+struct demo { struct window *w; GLcontext *gl; int fail_w, fail_h; char renderer[128]; GLuint tex, torus; float angle; bool wire, light, texture, spin, cull; int frames; uint64_t fps_t; int fps; int drag_x, drag_y; bool dragging; float rot_x, rot_y; };
 
 static void make_texture(struct demo *d) {
-    const int N = 64; GLubyte *px = kmalloc(N * N * 3);
+    const int N = 64; GLubyte *px = kmalloc_try(N * N * 3);
+    d->tex = 0;
+    if (!px) return;   /* no texture: the cube is drawn untextured */
     for (int y = 0; y < N; y++) for (int x = 0; x < N; x++) {
         int c = ((x / 8) + (y / 8)) & 1;
         GLubyte *p = px + (y * N + x) * 3;
@@ -69,15 +71,21 @@ static void draw_torus(float R, float r, int nu, int nv) {
     }
 }
 
-static void recreate(struct demo *d, int w, int h);
+static bool recreate(struct demo *d, int w, int h);
 
 static void render(struct demo *d) {
     struct canvas *c = window_begin_draw(d->w);
-    int cw = c->w, ch = c->h;
+    int cw = MIN(c->w, 8192), ch = MIN(c->h, 8192);   /* the largest GL framebuffer; a bigger window shows its top-left */
     mutex_unlock(&d->w->lock);
-    if (cw != glxGetWidth(d->gl) || ch != glxGetHeight(d->gl)) recreate(d, cw, ch);
+    if (!d->gl || ((cw != glxGetWidth(d->gl) || ch != glxGetHeight(d->gl)) && (cw != d->fail_w || ch != d->fail_h))) recreate(d, cw, ch);
+    if (!d->gl || !glxMakeCurrent(d->gl)) {   /* no framebuffer (out of memory) or no current-context slot: say so */
+        c = window_begin_draw(d->w);
+        gfx_fill_rect(c, 0, 0, c->w, c->h, RGB(28, 28, 33));
+        font_draw(c, font_ui_small, 16, 11, RGB(230, 230, 235), d->gl ? "OpenGL: no free current-context slot" : "OpenGL: not enough memory for a framebuffer of this size");
+        window_end_draw(d->w, NULL);
+        return;
+    }
     int W = glxGetWidth(d->gl), H = glxGetHeight(d->gl);
-    glxMakeCurrent(d->gl);
     glViewport(0, 0, W, H);
     glClearColor(0.11f, 0.11f, 0.13f, 1); glClear(GL_COLOR_BUFFER_BIT | GL_DEPTH_BUFFER_BIT);
     glMatrixMode(GL_PROJECTION); glLoadIdentity(); gluPerspective(45, (double)W / H, 0.5, 50);
@@ -109,6 +117,7 @@ static void render(struct demo *d) {
     {
         int cw2 = MIN(W, c->w), ch2 = MIN(H, c->h);
         uint32_t *src = glxGetPixels(d->gl);
+        if (cw2 < c->w || ch2 < c->h) gfx_fill_rect(c, 0, 0, c->w, c->h, RGB(28, 28, 33));   /* kept an older, smaller context */
         for (int y = 0; y < ch2; y++) memcpy(c->px + (size_t)y * c->stride, src + (size_t)y * W, (size_t)cw2 * 4);
     }
     char hud[160];
@@ -122,23 +131,35 @@ static void render(struct demo *d) {
     if (system_ticks - d->fps_t >= 1000) { d->fps = d->frames; d->frames = 0; d->fps_t = system_ticks; }
 }
 
-static void recreate(struct demo *d, int w, int h) {
+/* a new context at w x h. When it does not fit beside the old one, the old one is freed and w x h tried again, then the
+ * old size (presented cropped or padded, and w x h is not retried every frame); with no context at all render() retries */
+static bool recreate(struct demo *d, int w, int h) {
+    int ow = glxGetWidth(d->gl), oh = glxGetHeight(d->gl);
+    GLcontext *n = glxCreateContext(w, h);
+    if (!n && d->gl) {
+        glxDestroyContext(d->gl); d->gl = NULL;
+        if (!(n = glxCreateContext(w, h))) { d->fail_w = w; d->fail_h = h; n = glxCreateContext(ow, oh); }
+    }
+    if (!n) { d->fail_w = w; d->fail_h = h; return false; }
     if (d->gl) glxDestroyContext(d->gl);
-    d->gl = glxCreateContext(w, h);
-    glxMakeCurrent(d->gl);
+    d->gl = n;
+    if (glxGetWidth(n) == w && glxGetHeight(n) == h) d->fail_w = d->fail_h = 0;
+    glxSetRendererName(n, d->renderer);
+    if (!glxMakeCurrent(n)) return true;   /* render() reports it */
     make_texture(d);
     /* the torus geometry never changes: compile it once per context */
     d->torus = glGenLists(1);
     glNewList(d->torus, GL_COMPILE); draw_torus(1.0f, 0.42f, 28, 16); glEndList();
+    return true;
 }
 
 void gldemo_main(void *arg) {
-    struct demo *d = kzalloc(sizeof *d);
+    struct demo *d = kzalloc_try(sizeof *d);
+    if (!d) return;
     d->light = d->texture = d->spin = d->cull = true;
     build_cube();
     struct gpu_device *g = gpu_primary();
-    char rn[128]; snprintf(rn, sizeof rn, "inFlux Software Rasterizer (%s)", g ? g->name : "framebuffer");
-    glxSetRendererName(rn);
+    snprintf(d->renderer, sizeof d->renderer, "inFlux Software Rasterizer (%s)", g ? g->name : "framebuffer");   /* per context: other demos may be rendering */
     d->w = window_create("OpenGL Demo", 560, 400, WIN_STANDARD);
     window_set_min_size(d->w, 240, 180);
     window_set_menus(d->w, &demo_menus);
@@ -157,7 +178,7 @@ void gldemo_main(void *arg) {
             else if (ev.cmd == DCMD_TEXTURE) d->texture = !d->texture; else if (ev.cmd == DCMD_SPIN) d->spin = !d->spin; else if (ev.cmd == DCMD_CULL) d->cull = !d->cull;
             render(d); break;
         case EV_TIMER: if (d->spin) { d->angle += 1.2f; if (d->angle > 360) d->angle -= 360; render(d); } break;
-        case EV_RESIZE: recreate(d, ev.w, ev.h); render(d); break;
+        case EV_RESIZE: render(d); break;   /* render() recreates the context at the new canvas size */
         case EV_KEY_DOWN: if (ev.key == KEY_SPACE) d->spin = !d->spin; else if (ev.ch == 'w') d->wire = !d->wire; else if (ev.ch == 'l') d->light = !d->light; else if (ev.ch == 't') d->texture = !d->texture; render(d); break;
         case EV_MOUSE_DOWN: d->dragging = true; d->drag_x = ev.x; d->drag_y = ev.y; break;
         case EV_MOUSE_UP: d->dragging = false; break;
@@ -166,6 +187,6 @@ void gldemo_main(void *arg) {
         }
     }
     window_destroy(d->w);
-    glxDestroyContext(d->gl);
+    glxDestroyContext(d->gl);   /* also drops it as this thread's current context */
     kfree(d);
 }

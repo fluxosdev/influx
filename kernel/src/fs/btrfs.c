@@ -6,10 +6,13 @@
 #define EXTENT_MAX (1024 * 1024)
 #define MAX_INLINE 2048
 #define WBUF_MAX (256ull << 20)   /* files are buffered whole in memory while written */
-int btrfs_flush_dirty_files(struct btrfs_fs *fs, bool only_old);
-void btrfs_register_flusher(struct btrfs_fs *fs);
+#define WB_GIVE_UP 5              /* background write-back attempts before only sync/close retry */
+enum { FLUSH_ALL, FLUSH_IDLE, FLUSH_HEALTHY };   /* sync: everything; background: idle and not backing off; metadata ops: skip failing inodes */
+static int flush_all(struct btrfs_fs *fs, int mode);
+static void btrfs_register_flusher(struct btrfs_fs *fs);
 
-struct bnode { struct vnode vn; struct btrfs_fs *fs; uint64_t ino; struct bnode *hnext; uint8_t *wbuf; uint64_t wsize, wcap; bool wdirty; uint64_t wdirty_since; };
+/* wfails/wretry_at: failed write-backs of the buffered data and when the background flusher may try again */
+struct bnode { struct vnode vn; struct btrfs_fs *fs; uint64_t ino; struct bnode *hnext; uint8_t *wbuf; uint64_t wsize, wcap; bool wdirty; uint64_t wdirty_since; uint32_t wfails; uint64_t wretry_at; };
 static const struct vnode_ops btrfs_ops;
 
 static uint64_t now_sec(void) { return time_unix(); }
@@ -176,27 +179,48 @@ static int load_wbuf(struct btrfs_fs *fs, struct bnode *b) {
     int r = read_inode(fs, b->ino, &ii, NULL);
     if (r < 0) return r;
     if (ii.size > WBUF_MAX) return -EFBIG;
-    b->wcap = MAX(ii.size + 4096, 16384);
-    b->wbuf = kmalloc(b->wcap);
+    b->wcap = MIN(MAX(ii.size + 4096, 16384), WBUF_MAX);
+    b->wbuf = kmalloc_try(b->wcap);
+    if (!b->wbuf && ii.size) b->wbuf = kmalloc_try(b->wcap = ii.size);
+    if (!b->wbuf) { b->wcap = 0; return -ENOMEM; }
     b->wsize = ii.size;
-    if (ii.size) { int64_t got = read_data(fs, b->ino, 0, b->wbuf, ii.size); if (got < 0) { kfree(b->wbuf); b->wbuf = NULL; return (int)got; } if ((uint64_t)got < ii.size) memset(b->wbuf + got, 0, ii.size - got); }
+    if (ii.size) { int64_t got = read_data(fs, b->ino, 0, b->wbuf, ii.size); if (got < 0) { kfree(b->wbuf); b->wbuf = NULL; b->wcap = 0; return (int)got; } if ((uint64_t)got < ii.size) memset(b->wbuf + got, 0, ii.size - got); }
+    return 0;
+}
+/* make room for 'need' (<= WBUF_MAX) bytes: doubling while small, +25% once large, never past WBUF_MAX */
+static int grow_wbuf(struct bnode *b, uint64_t need) {
+    if (need <= b->wcap) return 0;
+    uint64_t nc = b->wcap < (16ull << 20) ? b->wcap * 2 : b->wcap + b->wcap / 4;
+    nc = MIN(ALIGN_UP(MAX(nc, need), 4096), MAX(WBUF_MAX, need));
+    uint8_t *nb = krealloc_try(b->wbuf, nc);
+    if (!nb && nc > need) nb = krealloc_try(b->wbuf, nc = need);
+    if (!nb) return -ENOMEM;   /* the old buffer is intact */
+    b->wbuf = nb; b->wcap = nc;
     return 0;
 }
 static int flush_inode(struct btrfs_fs *fs, struct bnode *b) {
     if (!b->wdirty) return 0;
     int r = rewrite_file(fs, b, b->wbuf, b->wsize);
-    if (r < 0) return r;   /* keep the buffer: the old contents are intact on disk and the next flush retries */
-    b->wdirty = false;
+    if (r < 0) {   /* keep the buffer: the old contents are intact on disk and sync/close retry */
+        b->wfails++;
+        b->wretry_at = system_ticks + (2000ull << MIN(b->wfails, 6u));
+        if (b->wfails == 1 || b->wfails == WB_GIVE_UP) kprintf("btrfs: %s: writing back inode %lu failed (%d)%s\n", fs->dev->name, b->ino, r, b->wfails == WB_GIVE_UP ? "; background write-back stopped, data stays buffered until the next sync" : "");
+        return r;
+    }
+    b->wdirty = false; b->wfails = 0;
     kfree(b->wbuf); b->wbuf = NULL; b->wcap = 0;
     return r;
 }
-static int flush_all(struct btrfs_fs *fs, bool only_old) {
+static int flush_all(struct btrfs_fs *fs, int mode) {
     int r = 0;
-    for (int i = 0; i < 256; i++) for (struct bnode *b = fs->inode_cache[i]; b; b = b->hnext)
-        if (b->wdirty && (!only_old || system_ticks - b->wdirty_since > 2000)) { int e = flush_inode(fs, b); if (e < 0) r = e; }
+    for (int i = 0; i < 256; i++) for (struct bnode *b = fs->inode_cache[i]; b; b = b->hnext) {
+        if (!b->wdirty) continue;
+        if (mode == FLUSH_IDLE && (system_ticks - b->wdirty_since <= 2000 || b->wfails >= WB_GIVE_UP || (b->wfails && system_ticks < b->wretry_at))) continue;
+        if (mode == FLUSH_HEALTHY && b->wfails) continue;
+        int e = flush_inode(fs, b); if (e < 0) r = e;
+    }
     return r;
 }
-int btrfs_flush_dirty_files(struct btrfs_fs *fs, bool only_old) { mutex_lock(&fs->lock); btrfs_op_begin(fs); int r = flush_all(fs, only_old); mutex_unlock(&fs->lock); return r; }
 
 static int64_t b_read(struct vnode *v, uint64_t off, void *buf, size_t n) {
     struct bnode *b = (struct bnode *)v; struct btrfs_fs *fs = b->fs;
@@ -260,8 +284,9 @@ static int write_content(struct btrfs_fs *fs, uint64_t ino, const uint8_t *data,
     }
     #define PIECE_ALEN(i) ALIGN_UP(MIN(size - (i) * EXTENT_MAX, (uint64_t)EXTENT_MAX), fs->sectorsize)
     uint64_t npieces = (size + EXTENT_MAX - 1) / EXTENT_MAX, i, done = 0;
-    uint64_t *ext = kmalloc(npieces * sizeof *ext);
-    uint8_t *tmp = kmalloc(EXTENT_MAX);
+    uint64_t *ext = kmalloc_try(npieces * sizeof *ext);
+    uint8_t *tmp = kmalloc_try(EXTENT_MAX);
+    if (!ext || !tmp) { kfree(ext); kfree(tmp); return -ENOMEM; }
     int r = 0;
     for (i = 0; i < npieces; i++) {   /* 1: allocate, write and record the new extents */
         uint64_t off = i * EXTENT_MAX, len = MIN(size - off, (uint64_t)EXTENT_MAX), alen = PIECE_ALEN(i);
@@ -317,7 +342,7 @@ static int64_t b_write(struct vnode *v, uint64_t off, const void *buf, size_t n)
     int r = load_wbuf(fs, b);
     if (r < 0) { mutex_unlock(&fs->lock); return r; }
     uint64_t newsize = MAX(b->wsize, off + n);
-    if (newsize > b->wcap) { uint64_t nc = b->wcap * 2; while (nc < newsize) nc *= 2; b->wbuf = krealloc(b->wbuf, nc); b->wcap = nc; }
+    if ((r = grow_wbuf(b, newsize)) < 0) { mutex_unlock(&fs->lock); return r; }
     if (off > b->wsize) memset(b->wbuf + b->wsize, 0, off - b->wsize);
     memcpy(b->wbuf + off, buf, n);
     b->wsize = newsize;
@@ -334,7 +359,7 @@ static int b_truncate(struct vnode *v, uint64_t size) {
     mutex_lock(&fs->lock); btrfs_op_begin(fs);
     int r = load_wbuf(fs, b);
     if (r < 0) { mutex_unlock(&fs->lock); return r; }
-    if (size > b->wcap) { b->wbuf = krealloc(b->wbuf, size + 4096); b->wcap = size + 4096; }
+    if ((r = grow_wbuf(b, size)) < 0) { mutex_unlock(&fs->lock); return r; }
     if (size > b->wsize) memset(b->wbuf + b->wsize, 0, size - b->wsize);
     if (size != b->wsize) { b->wsize = size; if (!b->wdirty) { b->wdirty = true; b->wdirty_since = system_ticks; } b->vn.size = size; }
     mutex_unlock(&fs->lock);
@@ -395,7 +420,7 @@ static struct vnode *b_create(struct vnode *dirv, const char *name, int type) {
     size_t nl = strlen(name);
     if (nl == 0 || nl > 255) return NULL;
     mutex_lock(&fs->lock); btrfs_op_begin(fs);
-    flush_all(fs, false);
+    flush_all(fs, FLUSH_HEALTHY);
     uint64_t existing;
     if (dir_lookup(fs, dir->ino, name, &existing, NULL) == 0) { mutex_unlock(&fs->lock); return NULL; }
     btrfs_begin(fs);
@@ -409,7 +434,9 @@ static struct vnode *b_create(struct vnode *dirv, const char *name, int type) {
     int r = btrfs_insert_item(fs, &fs->fs_tree, &k, &ii, sizeof ii, NULL);
     if (r == 0) r = add_dir_entry(fs, dir->ino, name, ino, type == VN_DIR ? BTRFS_FT_DIR : BTRFS_FT_REG_FILE, next_dir_index(fs, dir->ino));
     if (r == 0) touch_dir(fs, dir->ino, 2 * nl);
-    btrfs_commit(fs);
+    /* a failed commit keeps the blocks dirty for the next one, and the next sync/close reports it */
+    int cr = btrfs_commit(fs);
+    if (cr < 0) kprintf("btrfs: commit after creating %s failed (%d); will retry\n", name, cr);
     update_space(fs);
     refresh_vnode(dir);
     struct bnode *b = r == 0 ? get_bnode(fs, ino, name) : NULL;
@@ -448,7 +475,7 @@ static int b_unlink(struct vnode *dirv, const char *name) {
     struct bnode *dir = (struct bnode *)dirv; struct btrfs_fs *fs = dir->fs;
     if (fs->readonly) return -EROFS;
     mutex_lock(&fs->lock); btrfs_op_begin(fs);
-    flush_all(fs, false);
+    flush_all(fs, FLUSH_HEALTHY);
     uint64_t ino; uint8_t ftype;
     int r = dir_lookup(fs, dir->ino, name, &ino, &ftype);
     if (r < 0) { mutex_unlock(&fs->lock); return r; }
@@ -503,18 +530,18 @@ static int b_unlink(struct vnode *dirv, const char *name) {
         } else { ii.nlink--; ii.ctime.sec = now_sec(); write_inode(fs, ino, &ii); }
     }
     touch_dir(fs, dir->ino, -2 * (int64_t)strlen(name));
-    btrfs_commit(fs);
+    r = btrfs_commit(fs);
     update_space(fs);
     refresh_vnode(dir);
     mutex_unlock(&fs->lock);
-    return 0;
+    return r < 0 ? r : 0;
 }
 
 static int b_sync(struct vnode *v) {
     struct bnode *b = (struct bnode *)v; struct btrfs_fs *fs = b->fs;
     mutex_lock(&fs->lock); btrfs_op_begin(fs);
     int r = flush_inode(fs, b);
-    if (v == fs->root_vn) { int e = flush_all(fs, false); if (e < 0) r = e; }
+    if (v == fs->root_vn) { int e = flush_all(fs, FLUSH_ALL); if (e < 0) r = e; }
     int c = btrfs_commit(fs); if (c < 0) r = c;
     mutex_unlock(&fs->lock);
     return r;
@@ -546,12 +573,41 @@ struct vnode *btrfs_mount(struct blockdev *dev) {
     return &root->vn;
 }
 
-/* background flusher: writes back dirty files that have been idle for a while */
-static struct btrfs_fs *flush_list[8]; static int nflush;
+/* background flusher: writes back dirty files that have been idle for a while. Volumes leave the
+ * list on btrfs_unmount, or by themselves once their disk is unplugged. */
+#define MAX_FLUSH 16
+static struct btrfs_fs *flush_list[MAX_FLUSH];
+static struct mutex flush_lock = MUTEX_INIT;   /* taken before fs->lock, never while holding it */
+static bool dev_gone(struct blockdev *d) { for (; d; d = d->parent) if (d->removed) return true; return false; }
 static void flusher_thread(void *arg) {
-    for (;;) { thread_sleep_ms(1000); for (int i = 0; i < nflush; i++) btrfs_flush_dirty_files(flush_list[i], true); }
+    for (;;) {
+        thread_sleep_ms(1000);
+        mutex_lock(&flush_lock);
+        for (int i = 0; i < MAX_FLUSH; i++) {
+            struct btrfs_fs *fs = flush_list[i];
+            if (!fs) continue;
+            if (dev_gone(fs->dev)) { flush_list[i] = NULL; continue; }
+            mutex_lock(&fs->lock); btrfs_op_begin(fs); flush_all(fs, FLUSH_IDLE); mutex_unlock(&fs->lock);
+        }
+        mutex_unlock(&flush_lock);
+    }
 }
-void btrfs_register_flusher(struct btrfs_fs *fs) {
-    if (nflush < 8) flush_list[nflush++] = fs;
-    if (nflush == 1) thread_create(kernel_process, "btrfs-flush", flusher_thread, NULL);
+static void btrfs_register_flusher(struct btrfs_fs *fs) {
+    static bool started;
+    mutex_lock(&flush_lock);
+    int i, free_slot = -1;
+    for (i = 0; i < MAX_FLUSH && flush_list[i] != fs; i++) if (!flush_list[i] && free_slot < 0) free_slot = i;
+    if (i == MAX_FLUSH) { if (free_slot >= 0) flush_list[free_slot] = fs; else kprintf("btrfs: %s: no background flusher slot; files are written back on close/sync only\n", fs->dev->name); }
+    if (!started) { started = true; thread_create(kernel_process, "btrfs-flush", flusher_thread, NULL); }
+    mutex_unlock(&flush_lock);
+}
+/* after vfs_unmount (or a failed vfs_mount): final write-back, then leave the flusher. Returns the write-back error. */
+int btrfs_unmount(struct vnode *root) {
+    if (!root || !root->fs_name || strcmp(root->fs_name, "btrfs")) return 0;
+    struct btrfs_fs *fs = root->fs;
+    int r = fs->readonly || dev_gone(fs->dev) ? 0 : b_sync(root);
+    mutex_lock(&flush_lock);
+    for (int i = 0; i < MAX_FLUSH; i++) if (flush_list[i] == fs) flush_list[i] = NULL;
+    mutex_unlock(&flush_lock);
+    return r;
 }

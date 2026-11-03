@@ -96,6 +96,13 @@ static int nvme_rw(struct nvme_ns *ns, uint64_t lba, uint32_t count, void *buf, 
 }
 static int nvme_read(struct blockdev *d, uint64_t lba, uint32_t count, void *buf) { return nvme_rw(d->priv, lba, count, buf, false); }
 static int nvme_write(struct blockdev *d, uint64_t lba, uint32_t count, const void *buf) { return nvme_rw(d->priv, lba, count, (void *)buf, true); }
+/* NVM Flush (opcode 00h): completes once the volatile write cache of the namespace is on the medium */
+static int nvme_flush(struct blockdev *d) {
+    struct nvme_ns *ns = d->priv;
+    struct nvme_cmd cmd = { 0 };
+    cmd.opc = 0x00; cmd.nsid = ns->nsid;
+    return submit(ns->c, &ns->c->io, &cmd, NULL);
+}
 
 static void copy_trim(char *dst, const uint8_t *src, int n) { memcpy(dst, src, n); dst[n] = 0; while (n > 0 && (dst[n - 1] == ' ' || dst[n - 1] == 0)) dst[--n] = 0; }
 
@@ -155,7 +162,7 @@ static void init_ctrl(struct pci_device *pd) {
         snprintf(d->name, sizeof d->name, "nvme%dn%u", nctrls, nsid);
         strlcpy(d->model, c->model, sizeof d->model);
         d->sectors = nsze; d->sector_size = ns->lba_size;
-        d->read = nvme_read; d->write = nvme_write; d->priv = ns; d->bus = "NVMe";
+        d->read = nvme_read; d->write = nvme_write; d->flush = nvme_flush; d->priv = ns; d->bus = "NVMe";
         blockdev_register(d);
     }
     pmm_free_page(V2P(idbuf));

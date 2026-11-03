@@ -45,18 +45,43 @@ static void io_write(uint16_t port, int width, uint64_t v) {
     default: outl(port, v); outl(port + 4, v >> 32); break;
     }
 }
-static uint64_t pci_cfg_read(uint8_t bus, uint8_t dev, uint8_t fn, uint16_t off, int width) {
-    if (off >= 256) return ~0ULL;   /* extended config space needs ECAM */
+/* PCI configuration space: ECAM (MCFG) for every offset when the firmware
+ * provides it, else the legacy 0xCF8 mechanism for the first 256 bytes.
+ * Natural-width chunks, no read-modify-write (RW1C neighbours would be cleared). */
+static uint32_t cfg_rd(volatile uint8_t *e, struct aml_obj *r, uint16_t off, int w) {
+    if (e) return w == 32 ? *(volatile uint32_t *)(e + off) : w == 16 ? *(volatile uint16_t *)(e + off) : e[off];
+    uint32_t v = pci_read32(r->region.bus, r->region.dev, r->region.fn, off & ~3) >> ((off & 3) * 8);
+    return w == 32 ? v : v & ((1u << w) - 1);
+}
+static void cfg_wr(volatile uint8_t *e, struct aml_obj *r, uint16_t off, int w, uint32_t v) {
+    if (e) { if (w == 32) *(volatile uint32_t *)(e + off) = v; else if (w == 16) *(volatile uint16_t *)(e + off) = v; else e[off] = v; }
+    else if (w == 32) pci_write32(r->region.bus, r->region.dev, r->region.fn, off, v);
+    else if (w == 16) pci_write16(r->region.bus, r->region.dev, r->region.fn, off, v);
+    else pci_write8(r->region.bus, r->region.dev, r->region.fn, off, v);
+}
+static volatile uint8_t *cfg_window(struct aml_obj *r, uint64_t off, int width, bool *ok) {
+    uint8_t *bus = acpi_ecam(r->region.seg, r->region.bus);
+    *ok = bus ? off + width / 8 <= 4096 : !r->region.seg && off + width / 8 <= 256;   /* legacy: segment 0 only */
+    return bus ? bus + ((uint32_t)r->region.dev << 15 | (uint32_t)r->region.fn << 12) : NULL;
+}
+static int cfg_chunk(uint64_t off, int left) { return !(off & 3) && left >= 32 ? 32 : !(off & 1) && left >= 16 ? 16 : 8; }
+static uint64_t pci_cfg_read(struct aml_obj *r, uint64_t off, int width) {
+    bool ok; volatile uint8_t *e = cfg_window(r, off, width, &ok);
+    if (!ok) return ~0ULL;
     uint64_t v = 0;
-    for (int done = 0; done < width; done += 8, off++) v |= (uint64_t)((pci_read32(bus, dev, fn, off & ~3) >> ((off & 3) * 8)) & 0xFF) << done;
+    for (int done = 0, w; done < width; done += w, off += w / 8) { w = cfg_chunk(off, width - done); v |= (uint64_t)cfg_rd(e, r, off, w) << done; }
     return v;
 }
-static void pci_cfg_write(uint8_t bus, uint8_t dev, uint8_t fn, uint16_t off, int width, uint64_t v) {
-    for (int done = 0; done < width && off < 256; ) {   /* no dword read-modify-write: RW1C neighbours would be cleared */
-        if (!(off & 3) && width - done >= 32) { pci_write32(bus, dev, fn, off, v >> done); done += 32; off += 4; }
-        else if (!(off & 1) && width - done >= 16) { pci_write16(bus, dev, fn, off, v >> done); done += 16; off += 2; }
-        else { pci_write8(bus, dev, fn, off, v >> done); done += 8; off++; }
-    }
+static void pci_cfg_write(struct aml_obj *r, uint64_t off, int width, uint64_t v) {
+    bool ok; volatile uint8_t *e = cfg_window(r, off, width, &ok);
+    if (!ok) return;
+    for (int done = 0, w; done < width; done += w, off += w / 8) { w = cfg_chunk(off, width - done); cfg_wr(e, r, off, w, v >> done); }
+}
+
+/* _ADR of a PCI device: device in the high word, function in the low one (0xFFFF: all functions, use 0) */
+static void adr_decode(uint64_t adr, uint8_t *dev, uint8_t *fn) {
+    uint32_t d = (adr >> 16) & 0xFFFF, f = adr & 0xFFFF;
+    *dev = d & 0x1F; *fn = f == 0xFFFF ? 0 : f & 7;
 }
 
 /* PCI_Config regions address the device that contains them (as ACPICA
@@ -75,11 +100,13 @@ static void pci_resolve(struct aml_obj *rgn) {
         else if (!is_root && n < 16 && ns_child(d, "_ADR")) chain[n++] = d;
         if (is_root) { root = d; break; }
     }
-    uint64_t bus = 0, adr = 0;
+    uint64_t bus = 0, adr = 0, seg = 0;
     if (root && ns_child(root, "_BBN")) aml_eval_int(root, "_BBN", &bus);
+    if (root && ns_child(root, "_SEG")) aml_eval_int(root, "_SEG", &seg);
+    rgn->region.seg = seg;
     for (int i = n - 1; i >= 0; i--) {   /* devices between the root and the region's device, top down */
         if (aml_eval_int(chain[i], "_ADR", &adr) < 0) break;
-        uint8_t sl = (adr >> 16) & 0x1F, f = adr & 7;
+        uint8_t sl, f; adr_decode(adr, &sl, &f);
         if ((pci_read32(bus, sl, f, 0) & 0xFFFF) == 0xFFFF) break;
         uint8_t ht = (pci_read32(bus, sl, f, 0x0C) >> 16) & 0x7F;
         if (ht != 1 && ht != 2) break;   /* not a PCI-PCI / CardBus bridge: nothing below it is on PCI */
@@ -89,7 +116,7 @@ static void pci_resolve(struct aml_obj *rgn) {
     }
     adr = 0;
     if (dev && ns_child(dev, "_ADR")) aml_eval_int(dev, "_ADR", &adr);
-    rgn->region.bus = bus; rgn->region.dev = (adr >> 16) & 0x1F; rgn->region.fn = adr & 7;
+    rgn->region.bus = bus; adr_decode(adr, &rgn->region.dev, &rgn->region.fn);
 }
 
 /* CMOS bank 0 at 0x70/0x71 (bit 7 of 0x70 is NMI disable: keep it), bank 1 at 0x72/0x73 */
@@ -112,12 +139,25 @@ static void unsupported(struct aml_obj *rgn) {
 static uint8_t ec_read(uint8_t addr);
 static void ec_write(uint8_t addr, uint8_t v);
 
+/* as ACPICA's AE_AML_REGION_LIMIT: an access beyond the region's length is refused */
+static bool in_region(struct aml_obj *rgn, uint64_t off, int width) {
+    uint64_t n = width / 8;
+    if (off <= rgn->region.len && n <= rgn->region.len - off) return true;
+    if (!rgn->region.limit_warned) {
+        rgn->region.limit_warned = true; aml_errors++;
+        char p[96]; if (rgn->region.node) ns_path(rgn->region.node, p, sizeof p); else strlcpy(p, "?", sizeof p);
+        kprintf("acpi: %d-bit access at 0x%lx beyond region %s (0x%lx bytes) refused\n", width, off, p, rgn->region.len);
+    }
+    return false;
+}
+
 uint64_t region_read(struct aml_obj *rgn, uint64_t off, int width) {
+    if (!in_region(rgn, off, width)) return 0;
     uint64_t a = rgn->region.base + off;
     switch (rgn->region.space) {
     case SPACE_MEMORY: return mem_read(a, width);
     case SPACE_IO: return io_read(a, width);
-    case SPACE_PCI: pci_resolve(rgn); return pci_cfg_read(rgn->region.bus, rgn->region.dev, rgn->region.fn, a, width);
+    case SPACE_PCI: pci_resolve(rgn); return pci_cfg_read(rgn, a, width);
     case SPACE_EC: { uint64_t v = 0; for (int i = 0; i < width / 8; i++) v |= (uint64_t)ec_read(a + i) << (8 * i); return v; }
     case SPACE_CMOS: { uint64_t v = 0; for (int i = 0; i < width / 8; i++) v |= cmos_rw(a + i, false, 0) << (8 * i); return v; }
     default: unsupported(rgn); return 0;
@@ -125,11 +165,12 @@ uint64_t region_read(struct aml_obj *rgn, uint64_t off, int width) {
 }
 
 void region_write(struct aml_obj *rgn, uint64_t off, int width, uint64_t v) {
+    if (!in_region(rgn, off, width)) return;
     uint64_t a = rgn->region.base + off;
     switch (rgn->region.space) {
     case SPACE_MEMORY: mem_write(a, width, v); break;
     case SPACE_IO: io_write(a, width, v); break;
-    case SPACE_PCI: pci_resolve(rgn); pci_cfg_write(rgn->region.bus, rgn->region.dev, rgn->region.fn, a, width, v); break;
+    case SPACE_PCI: pci_resolve(rgn); pci_cfg_write(rgn, a, width, v); break;
     case SPACE_EC: for (int i = 0; i < width / 8; i++) ec_write(a + i, v >> (8 * i)); break;
     case SPACE_CMOS: for (int i = 0; i < width / 8; i++) cmos_rw(a + i, true, v >> (8 * i)); break;
     default: unsupported(rgn); break;
@@ -150,9 +191,10 @@ static int access_bits(struct aml_obj *f) {
     case 2: return 16;
     case 3: return 32;
     case 4: return 64;
-    default:   /* AnyAcc / BufferAcc: the smallest aligned unit holding the whole field */
+    default:   /* AnyAcc / BufferAcc: the smallest aligned unit holding the whole field, if the region does */
         for (int w = 8; w <= 32; w *= 2)
-            if (f->field.bit_off / w == (f->field.bit_off + f->field.bit_len - 1) / w) return w;
+            if (f->field.bit_off / w == (f->field.bit_off + f->field.bit_len - 1) / w)
+                return !rgn || (f->field.bit_off / w + 1) * (w / 8) <= rgn->region.len ? w : 8;
         return 8;
     }
 }

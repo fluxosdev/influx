@@ -37,7 +37,8 @@ struct canvas {
     bool owns_px;
 };
 
-struct canvas *canvas_create(int w, int h);
+struct canvas *canvas_create(int w, int h);       /* panics when memory runs out */
+struct canvas *canvas_create_try(int w, int h);   /* NULL when memory runs out */
 void canvas_init(struct canvas *c, uint32_t *px, int w, int h, int stride);
 void canvas_destroy(struct canvas *c);
 void canvas_set_clip(struct canvas *c, struct rect r);

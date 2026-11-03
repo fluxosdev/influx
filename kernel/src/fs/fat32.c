@@ -23,7 +23,9 @@ struct fat {
     struct blockdev *dev;
     uint32_t spc, reserved, nfats, fat_size, root_cluster, total_sectors, nclusters, data_start;
     uint32_t *fat;             /* cached FAT (first copy) */
+    uint8_t *dirty;            /* one bit per FAT sector changed since the last flush */
     bool fat_dirty;
+    uint32_t free_count;       /* free clusters, kept up to date by fat_set */
     uint32_t next_free, gen;   /* gen: bumped whenever a dirent's cluster/size changes */
     char label[12];
     struct mutex lock;
@@ -37,16 +39,32 @@ static int write_sectors(struct fat *f, uint64_t lba, uint32_t n, const void *bu
 #define CLUS_OK(f, c) ((c) >= 2 && (c) < (f)->nclusters + 2)
 static uint64_t cluster_lba(struct fat *f, uint32_t c) { return f->data_start + (uint64_t)(c - 2) * f->spc; }
 static uint32_t fat_get(struct fat *f, uint32_t c) { return CLUS_OK(f, c) ? f->fat[c] & FAT_MASK : EOC; }
-static void fat_set(struct fat *f, uint32_t c, uint32_t v) { if (!CLUS_OK(f, c)) return; f->fat[c] = (f->fat[c] & 0xF0000000) | (v & FAT_MASK); f->fat_dirty = true; }
-static void fat_flush(struct fat *f) {
-    if (!f->fat_dirty) return;
-    for (uint32_t i = 0; i < f->nfats; i++) write_sectors(f, f->reserved + i * f->fat_size, f->fat_size, f->fat);
-    /* keep FSInfo's free cluster count accurate */
-    uint32_t free_c = 0; for (uint32_t c = 2; c < f->nclusters + 2; c++) if (fat_get(f, c) == 0) free_c++;
-    uint8_t sec[512];
-    if (read_sectors(f, 1, 1, sec) == 0 && *(uint32_t *)sec == 0x41615252) { *(uint32_t *)(sec + 488) = free_c; *(uint32_t *)(sec + 492) = f->next_free; write_sectors(f, 1, 1, sec); write_sectors(f, 7, 1, sec); }
-    if (f->root) { f->root->fs_free = (uint64_t)free_c * f->spc * 512; }
+static void fat_set(struct fat *f, uint32_t c, uint32_t v) {
+    if (!CLUS_OK(f, c)) return;
+    uint32_t old = f->fat[c] & FAT_MASK; v &= FAT_MASK;
+    if (!old && v) f->free_count--; else if (old && !v) f->free_count++;
+    f->fat[c] = (f->fat[c] & 0xF0000000) | v;
+    uint32_t s = c / 128; f->dirty[s >> 3] |= 1 << (s & 7); f->fat_dirty = true;
+}
+/* writes only the FAT sectors that changed (to every copy) plus FSInfo; on error they stay dirty for a retry */
+static int fat_flush(struct fat *f) {
+    if (!f->fat_dirty) return 0;
+    int r = 0;
+    for (uint32_t s = 0; s < f->fat_size; ) {
+        if (!(s & 7) && !f->dirty[s >> 3]) { s += 8; continue; }
+        if (!(f->dirty[s >> 3] & (1 << (s & 7)))) { s++; continue; }
+        uint32_t e = s; while (e < f->fat_size && (f->dirty[e >> 3] & (1 << (e & 7)))) e++;
+        for (uint32_t i = 0; i < f->nfats; i++) if (write_sectors(f, f->reserved + (uint64_t)i * f->fat_size + s, e - s, (uint8_t *)f->fat + (uint64_t)s * 512) < 0) r = -EIO;
+        s = e;
+    }
+    if (r < 0) return r;
+    memset(f->dirty, 0, (f->fat_size + 7) / 8);
     f->fat_dirty = false;
+    /* keep FSInfo's free cluster count accurate (advisory: its errors are not fatal) */
+    uint8_t sec[512];
+    if (read_sectors(f, 1, 1, sec) == 0 && *(uint32_t *)sec == 0x41615252) { *(uint32_t *)(sec + 488) = f->free_count; *(uint32_t *)(sec + 492) = f->next_free; write_sectors(f, 1, 1, sec); write_sectors(f, 7, 1, sec); }
+    if (f->root) { f->root->fs_free = (uint64_t)f->free_count * f->spc * 512; }
+    return 0;
 }
 static uint32_t alloc_cluster(struct fat *f, uint32_t prev) {
     for (uint32_t k = 0; k < f->nclusters; k++) {
@@ -61,7 +79,6 @@ static uint32_t alloc_cluster(struct fat *f, uint32_t prev) {
     return 0;
 }
 static void free_chain(struct fat *f, uint32_t c) { while (CLUS_OK(f, c)) { uint32_t n = fat_get(f, c); fat_set(f, c, 0); c = n; } }
-static uint64_t chain_length(struct fat *f, uint32_t c) { uint64_t n = 0; while (c >= 2 && c < EOC && n < f->nclusters) { n++; c = fat_get(f, c); } return n; }
 
 /* ---- names ---- */
 static void make_83(const char *name, uint8_t out[11], bool *needs_lfn) {
@@ -213,7 +230,8 @@ static int64_t read_locked(struct fat *f, struct fnode *fn, uint64_t off, void *
     uint32_t csize = f->spc * 512;
     uint32_t c = fn->cluster; uint64_t skip = off / csize;
     while (skip-- && CLUS_OK(f, c)) c = fat_get(f, c);
-    uint8_t *tmp = kmalloc(csize); size_t done = 0; uint32_t in = off % csize;
+    uint8_t *tmp = kmalloc_try(csize); size_t done = 0; uint32_t in = off % csize;
+    if (!tmp) return -ENOMEM;
     while (done < n && CLUS_OK(f, c)) {
         if (read_sectors(f, cluster_lba(f, c), f->spc, tmp) < 0) break;
         size_t take = MIN(n - done, csize - in);
@@ -239,57 +257,107 @@ static int update_dirent(struct fat *f, struct fnode *fn) {
     fat_time(&e.mdate, &e.mtime); e.adate = e.mdate;
     return dirent_rw(f, fn->dir_cluster, fn->dir_index, &e, true);
 }
-/* whole-file rewrite: the new chain is written and linked from the dirent before the old one is freed */
-static int write_whole(struct fat *f, struct fnode *fn, const uint8_t *data, uint64_t size) {
+/* In-place write: overwrites the existing chain and extends it by appending clusters. The extension is
+ * allocated up front (ENOSPC leaves the file untouched) and filled before the FAT links it; the FAT is
+ * flushed before the dirent's size grows. A crash therefore leaves at worst lost clusters, never a size
+ * that covers unwritten or foreign data. Overwrites of existing bytes are not atomic (no journal).
+ * buf == NULL writes zeros (truncate-extend). Caller holds f->lock and has refreshed fn. */
+static int64_t write_locked(struct fat *f, struct fnode *fn, uint64_t off, const uint8_t *buf, size_t n) {
     if (fn->gone) return -ENOENT;
+    if (fn->vn.type != VN_FILE) return -EISDIR;
+    if (off > 0xFFFFFFFFull || n > 0xFFFFFFFFull - off) return -EFBIG;   /* 32-bit dirent size */
     uint32_t csize = f->spc * 512;
-    uint32_t prev = 0, first = 0, old = fn->cluster; uint64_t old_size = fn->vn.size;
-    uint8_t *tmp = kmalloc(csize);
-    for (uint64_t off = 0; off < size; off += csize) {
-        uint32_t c = alloc_cluster(f, prev);
-        if (!c) { kfree(tmp); free_chain(f, first); return -ENOSPC; }
-        if (!first) first = c;
-        size_t take = MIN((uint64_t)csize, size - off);
-        memcpy(tmp, data + off, take); if (take < csize) memset(tmp + take, 0, csize - take);
-        if (write_sectors(f, cluster_lba(f, c), f->spc, tmp) < 0) { kfree(tmp); free_chain(f, first); return -EIO; }
+    uint64_t old_size = fn->vn.size, end = off + n, new_size = MAX(old_size, end), need = (new_size + csize - 1) / csize;
+    uint64_t have = 0; uint32_t last = 0, old_cluster = fn->cluster;
+    for (uint32_t c = fn->cluster; CLUS_OK(f, c); c = fat_get(f, c)) { if (++have > f->nclusters) return -EIO; last = c; }   /* cyclic chain */
+    uint32_t new_first = 0, prev = 0;
+    for (uint64_t k = have; k < need; k++) {
+        uint32_t c = alloc_cluster(f, prev);   /* detached chain: only linked once its data is on disk */
+        if (!c) { free_chain(f, new_first); return -ENOSPC; }
+        if (!new_first) new_first = c;
         prev = c;
     }
+    uint8_t *tmp = kmalloc_try(csize);
+    if (!tmp) { free_chain(f, new_first); return -ENOMEM; }
+    /* start at the cluster holding old EOF when writing past it: the gap must read back as zeros */
+    uint64_t ci = MIN(old_size, off) / csize; uint32_t c;
+    if (ci < have) { c = fn->cluster; for (uint64_t k = 0; k < ci; k++) c = fat_get(f, c); }
+    else { c = new_first; for (uint64_t k = have; k < ci; k++) c = fat_get(f, c); }
+    int r = 0;
+    for (; ci * csize < end; ci++) {
+        uint64_t cs = ci * csize, keep_end = MIN(cs + csize, old_size);
+        if (!CLUS_OK(f, c)) { r = -EIO; break; }
+        /* old bytes this write doesn't fully cover: read-modify-write; everything past old EOF becomes zero */
+        bool rmw = ci < have && cs < old_size && !(off <= cs && end >= keep_end);
+        if (rmw && read_sectors(f, cluster_lba(f, c), f->spc, tmp) < 0) { r = -EIO; break; }
+        uint64_t z = rmw ? old_size - cs : 0;
+        if (z < csize) memset(tmp + z, 0, csize - z);
+        if (buf) { uint64_t a = MAX(off, cs), b = MIN(end, cs + csize); if (a < b) memcpy(tmp + (a - cs), buf + (a - off), b - a); }
+        if (write_sectors(f, cluster_lba(f, c), f->spc, tmp) < 0) { r = -EIO; break; }
+        c = ci + 1 == have ? new_first : fat_get(f, c);
+    }
     kfree(tmp);
-    fat_flush(f);
-    fn->cluster = first; fn->vn.size = size; fn->vn.mtime = time_unix();
+    if (r < 0) { free_chain(f, new_first); return r; }   /* size unchanged; overwritten bytes stay overwritten */
+    if (new_first) {
+        if (last) fat_set(f, last, new_first); else fn->cluster = new_first;
+        if ((r = fat_flush(f)) < 0) goto unlink_ext;
+    }
+    fn->vn.size = new_size; fn->vn.mtime = time_unix();
+    if ((r = update_dirent(f, fn)) < 0) { fn->vn.size = old_size; goto unlink_ext; }
+    if (new_size != old_size || fn->cluster != old_cluster) { f->gen++; fn->gen = f->gen; }
+    return n;
+unlink_ext:
+    if (new_first) { if (last) fat_set(f, last, EOC); fn->cluster = old_cluster; free_chain(f, new_first); fat_flush(f); }
+    return r;
+}
+/* the dirent shrinks first, then the tail is freed: a crash in between only loses clusters */
+static int shrink_locked(struct fat *f, struct fnode *fn, uint64_t size) {
+    uint32_t csize = f->spc * 512, old_cluster = fn->cluster, last = 0, tail = fn->cluster;
+    uint64_t keep = (size + csize - 1) / csize, old_size = fn->vn.size;
+    if (keep) {
+        last = fn->cluster;
+        for (uint64_t k = 1; k < keep && CLUS_OK(f, last); k++) last = fat_get(f, last);
+        tail = CLUS_OK(f, last) ? fat_get(f, last) : 0;
+    }
+    fn->vn.size = size; fn->vn.mtime = time_unix(); if (!keep) fn->cluster = 0;
     int r = update_dirent(f, fn);
-    if (r < 0) { fn->cluster = old; fn->vn.size = old_size; free_chain(f, first); fat_flush(f); return r; }
+    if (r < 0) { fn->vn.size = old_size; fn->cluster = old_cluster; return r; }
     f->gen++; fn->gen = f->gen;
-    free_chain(f, old);
-    fat_flush(f);
-    return 0;
+    if (CLUS_OK(f, last)) fat_set(f, last, EOC);
+    free_chain(f, tail);
+    return fat_flush(f);
 }
 static int64_t f_write(struct vnode *v, uint64_t off, const void *buf, size_t n) {
     struct fnode *fn = (struct fnode *)v; struct fat *f = fn->fs;
     if (n == 0) return 0;
-    if (off > 64ull << 20 || n > (64ull << 20) - off) return -ENOSPC;
     mutex_lock(&f->lock);
     refresh_fnode(f, fn);
-    uint64_t newsize = MAX(v->size, off + n);
-    uint8_t *content = kzalloc(newsize);
-    if (v->size) read_locked(f, fn, 0, content, v->size);
-    memcpy(content + off, buf, n);
-    int r = write_whole(f, fn, content, newsize);
+    int64_t r = write_locked(f, fn, off, buf, n);
     mutex_unlock(&f->lock);
-    kfree(content);
-    return r < 0 ? r : (int64_t)n;
+    return r;
+}
+/* O_APPEND: EOF is read from the dirent under the lock, so appenders on separate fnodes don't overwrite each other */
+static int64_t f_append(struct vnode *v, const void *buf, size_t n, uint64_t *end) {
+    struct fnode *fn = (struct fnode *)v; struct fat *f = fn->fs;
+    mutex_lock(&f->lock);
+    refresh_fnode(f, fn);
+    uint64_t off = v->size;
+    int64_t r = n ? write_locked(f, fn, off, buf, n) : 0;
+    *end = r > 0 ? off + r : off;
+    mutex_unlock(&f->lock);
+    return r;
 }
 static int f_truncate(struct vnode *v, uint64_t size) {
     struct fnode *fn = (struct fnode *)v; struct fat *f = fn->fs;
-    if (size > 64ull << 20) return -ENOSPC;
+    if (v->type != VN_FILE) return -EISDIR;
+    if (size > 0xFFFFFFFFull) return -EFBIG;
     mutex_lock(&f->lock);
     refresh_fnode(f, fn);
-    if (size == v->size) { mutex_unlock(&f->lock); return 0; }
-    uint8_t *content = kzalloc(size ? size : 1);
-    if (size && v->size) read_locked(f, fn, 0, content, MIN(size, v->size));
-    int r = write_whole(f, fn, content, size);
+    int r = 0;
+    if (fn->gone) r = -ENOENT;
+    else if (size > v->size) { int64_t w = write_locked(f, fn, v->size, NULL, size - v->size); r = w < 0 ? (int)w : 0; }
+    else if (size < v->size) r = shrink_locked(f, fn, size);
     mutex_unlock(&f->lock);
-    kfree(content);
     return r;
 }
 
@@ -407,8 +475,8 @@ static int f_unlink(struct vnode *dirv, const char *name) {
     mutex_unlock(&f->lock);
     return r;
 }
-static int f_sync(struct vnode *v) { struct fnode *n = (struct fnode *)v; mutex_lock(&n->fs->lock); fat_flush(n->fs); mutex_unlock(&n->fs->lock); return 0; }
-static const struct vnode_ops fat_ops = { f_read, f_write, f_truncate, f_lookup, f_readdir, f_create, f_unlink, NULL, f_release, f_sync };
+static int f_sync(struct vnode *v) { struct fnode *n = (struct fnode *)v; mutex_lock(&n->fs->lock); int r = fat_flush(n->fs); if (r == 0) r = blockdev_flush(n->fs->dev); mutex_unlock(&n->fs->lock); return r; }   /* FAT + dirents, then the disk's write cache */
+static const struct vnode_ops fat_ops = { f_read, f_write, f_truncate, f_lookup, f_readdir, f_create, f_unlink, NULL, f_release, f_sync, f_append };
 
 struct vnode *fat32_mount(struct blockdev *d) {
     if (d->sector_size != 512) return NULL;   /* the driver assumes 512-byte sectors throughout */
@@ -429,8 +497,8 @@ struct vnode *fat32_mount(struct blockdev *d) {
     kfree(sec);
     if ((uint64_t)f->fat_size * 512 > 32ull << 20) { kprintf("fat32: %s: FAT too large to cache\n", d->name); kfree(f); return NULL; }
     if (!CLUS_OK(f, f->root_cluster)) { kprintf("fat32: %s: bad root cluster\n", d->name); kfree(f); return NULL; }
-    f->fat = kmalloc(f->fat_size * 512);
-    if (blockdev_read(d, f->reserved, f->fat_size, f->fat) < 0) { kfree(f->fat); kfree(f); return NULL; }
+    f->fat = kmalloc_try((uint64_t)f->fat_size * 512); f->dirty = kzalloc_try((f->fat_size + 7) / 8);
+    if (!f->fat || !f->dirty || blockdev_read(d, f->reserved, f->fat_size, f->fat) < 0) { kprintf("fat32: %s: cannot load the FAT\n", d->name); kfree(f->fat); kfree(f->dirty); kfree(f); return NULL; }
     f->next_free = 2;
     mutex_init(&f->lock);
     struct fnode *root = kzalloc(sizeof *root);
@@ -439,6 +507,7 @@ struct vnode *fat32_mount(struct blockdev *d) {
     root->vn.type = VN_DIR; root->vn.ops = &fat_ops; root->vn.fs = f; root->vn.fs_name = "fat32"; root->vn.refcount = 1; root->vn.mode = 0755;
     f->root = &root->vn;
     uint64_t free_c = 0; for (uint32_t c = 2; c < f->nclusters + 2; c++) if (fat_get(f, c) == 0) free_c++;
+    f->free_count = free_c;
     root->vn.fs_total = (uint64_t)f->nclusters * f->spc * 512; root->vn.fs_free = free_c * f->spc * 512;
     d->fs_type = "fat32";
     kprintf("fat32: %s: '%s' %lu MiB, %u sectors/cluster\n", d->name, f->label, root->vn.fs_total >> 20, f->spc);
@@ -450,6 +519,7 @@ int fat32_format(struct blockdev *d, const char *label) {
     if (d->sector_size != 512) return -EINVAL;
     uint64_t total = d->sectors;
     if (total < 70000) return -ENOSPC;    /* FAT32 needs at least 65525 clusters */
+    if (total > 0xFFFFFFFFull) total = 0xFFFFFFFFull;   /* total32 is 32-bit: only the first 2 TiB can be used */
     uint32_t spc = total < (512ull << 11) ? 1 : total < (8ull << 21) ? 8 : 32;
     uint32_t reserved = 32, nfats = 2;
     uint32_t clusters = (uint32_t)((total - reserved) / spc);
@@ -471,9 +541,15 @@ int fat32_format(struct blockdev *d, const char *label) {
     *(uint32_t *)(sec + 488) = clusters - 1; *(uint32_t *)(sec + 492) = 3; sec[510] = 0x55; sec[511] = 0xAA;
     if (r == 0) r = blockdev_write(d, 1, 1, sec); if (r == 0) r = blockdev_write(d, 7, 1, sec);
     /* FATs */
-    uint32_t *fat = kzalloc(fat_size * 512);
-    fat[0] = 0x0FFFFFF8; fat[1] = 0x0FFFFFFF; fat[2] = 0x0FFFFFFF;
-    for (uint32_t i = 0; i < nfats && r == 0; i++) r = blockdev_write(d, reserved + i * fat_size, fat_size, fat);
+    /* written in chunks: a large volume's FAT is hundreds of MiB */
+    uint32_t chunk = MIN(fat_size, 128u);
+    uint32_t *fat = kzalloc(chunk * 512);
+    for (uint32_t i = 0; i < nfats && r == 0; i++)
+        for (uint32_t s = 0; s < fat_size && r == 0; s += chunk) {
+            if (s == 0) { fat[0] = 0x0FFFFFF8; fat[1] = 0x0FFFFFFF; fat[2] = 0x0FFFFFFF; }
+            r = blockdev_write(d, reserved + (uint64_t)i * fat_size + s, MIN(chunk, fat_size - s), fat);
+            if (s == 0) { fat[0] = fat[1] = fat[2] = 0; }
+        }
     kfree(fat);
     /* root directory cluster (with the volume label entry) + the rest of the reserved area */
     uint8_t *z = kzalloc(spc * 512);

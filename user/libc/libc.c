@@ -66,21 +66,76 @@ unsigned long strtoul(const char *s, char **end, int base) {
 long strtol(const char *s, char **end, int base) { while (isspace(*s)) s++; int neg = 0; if (*s == '-') { neg = 1; s++; } else if (*s == '+') s++; long v = (long)strtoul(s, end, base); return neg ? -v : v; }
 int abs(int v) { return v < 0 ? -v : v; }
 
-/* ---- malloc: simple first-fit free list on top of sbrk ---- */
-struct blk { size_t size; struct blk *next; int free; };
-static struct blk *head;
-void *malloc(size_t n) {
-    n = (n + 15) & ~15UL;
-    for (struct blk *b = head; b; b = b->next) if (b->free && b->size >= n) { b->free = 0; return b + 1; }
-    size_t total = sizeof(struct blk) + n;
-    struct blk *b = sbrk((long)total);
-    if (b == (void *)-1) return NULL;
-    b->size = n; b->free = 0; b->next = head; head = b;
+/* ---- malloc: address-ordered first-fit free list on top of sbrk; free blocks split and coalesce ----
+ * A block is a 16-byte header then the payload; headers and payload sizes are multiples of 16, so every
+ * payload is 16-byte aligned as the SysV ABI requires. Only free blocks are linked. */
+struct blk { size_t size; struct blk *next; };
+#define HDR sizeof(struct blk)
+#define MALLOC_MAX ((size_t)1 << 46)   /* far below anything sbrk could grant; keeps every size sum and long cast exact */
+static struct blk *free_list;
+static char *heap_end;                 /* the break after our last sbrk: a free block ending here can grow in place */
+static void *grow(size_t n) {          /* n new bytes at a 16-byte aligned address; n is a multiple of 16, <= MALLOC_MAX + HDR */
+    char *p = sbrk((long)n);
+    if (p == (void *)-1) return NULL;
+    if (p != heap_end) {               /* first call, or someone else moved the break: align and start a fresh run */
+        size_t pad = -(uintptr_t)p & 15;
+        if (pad) { if (sbrk((long)pad) == (void *)-1) return NULL; p += pad; }
+    }
+    heap_end = p + n;
+    return p;
+}
+/* put b back in address order, merging with the free neighbours it touches */
+static void release(struct blk *b) {
+    struct blk *prev = NULL, *nx = free_list;
+    while (nx && nx < b) { prev = nx; nx = nx->next; }
+    if (nx && (char *)(b + 1) + b->size == (char *)nx) { b->size += HDR + nx->size; b->next = nx->next; } else b->next = nx;
+    if (prev && (char *)(prev + 1) + prev->size == (char *)b) { prev->size += HDR + b->size; prev->next = b->next; }
+    else if (prev) prev->next = b; else free_list = b;
+}
+/* hand out the first n bytes of free block b (linked from *pp); the tail goes back on the list if worth keeping */
+static void *take(struct blk **pp, struct blk *b, size_t n) {
+    if (b->size >= n + HDR + 16) { struct blk *r = (struct blk *)((char *)(b + 1) + n); r->size = b->size - n - HDR; r->next = b->next; *pp = r; b->size = n; }
+    else *pp = b->next;
+    b->next = NULL;
     return b + 1;
 }
-void free(void *p) { if (!p) return; struct blk *b = (struct blk *)p - 1; b->free = 1; }
-void *calloc(size_t a, size_t n) { void *p = malloc(a * n); if (p) memset(p, 0, a * n); return p; }
-void *realloc(void *p, size_t n) { if (!p) return malloc(n); struct blk *b = (struct blk *)p - 1; if (b->size >= n) return p; void *np = malloc(n); if (np) { memcpy(np, p, b->size); free(p); } return np; }
+void *malloc(size_t n) {
+    if (n > MALLOC_MAX) return NULL;
+    n = n ? (n + 15) & ~(size_t)15 : 16;
+    struct blk **pp = &free_list, **lastp = NULL;
+    for (struct blk *b = free_list; b; pp = &b->next, b = b->next) { if (b->size >= n) return take(pp, b, n); lastp = pp; }
+    /* nothing fits: if the highest free block ends at the break, extend it instead of leaving it stranded */
+    if (lastp && (char *)(*lastp + 1) + (*lastp)->size == heap_end && sbrk(0) == heap_end) {
+        struct blk *t = *lastp;
+        if (!grow(n - t->size)) return NULL;
+        t->size = n; return take(lastp, t, n);
+    }
+    struct blk *b = grow(HDR + n);
+    if (!b) return NULL;
+    b->size = n; b->next = NULL;
+    return b + 1;
+}
+void free(void *p) { if (p) release((struct blk *)p - 1); }
+void *calloc(size_t a, size_t n) {
+    if (n && a > MALLOC_MAX / n) return NULL;
+    void *p = malloc(a * n);
+    if (p) memset(p, 0, a * n);
+    return p;
+}
+void *realloc(void *p, size_t n) {
+    if (!p) return malloc(n);
+    if (!n) { free(p); return NULL; }
+    if (n > MALLOC_MAX) return NULL;
+    struct blk *b = (struct blk *)p - 1;
+    size_t want = (n + 15) & ~(size_t)15;
+    if (b->size >= want) {             /* shrink in place, returning a worthwhile tail */
+        if (b->size >= want + HDR + 16) { struct blk *r = (struct blk *)((char *)p + want); r->size = b->size - want - HDR; b->size = want; release(r); }
+        return p;
+    }
+    void *np = malloc(n);
+    if (np) { memcpy(np, p, b->size); free(p); }   /* b->size < n: copy everything the old block held */
+    return np;
+}
 
 /* ---- printf ---- */
 struct out { char *buf; size_t n, pos; };
@@ -132,5 +187,5 @@ int dprintf(int fd, const char *fmt, ...) { va_list ap; va_start(ap, fmt); int r
 int puts(const char *s) { write(1, s, strlen(s)); write(1, "\n", 1); return 0; }
 int putchar(int c) { char ch = (char)c; write(1, &ch, 1); return c; }
 int getchar(void) { unsigned char c; return read(0, &c, 1) == 1 ? c : EOF; }
-char *fgets(char *buf, int n, int fd) { int i = 0; while (i < n - 1) { char c; long r = read(fd, &c, 1); if (r <= 0) break; buf[i++] = c; if (c == '\n') break; } buf[i] = 0; return i ? buf : NULL; }
+char *fgets(char *buf, int n, int fd) { if (n <= 0) return NULL; if (n == 1) { buf[0] = 0; return buf; } int i = 0; while (i < n - 1) { char c; long r = read(fd, &c, 1); if (r <= 0) break; buf[i++] = c; if (c == '\n') break; } buf[i] = 0; return i ? buf : NULL; }
 void perror(const char *s) { fprintf(2, "%s: %s\n", s, strerror(errno)); }

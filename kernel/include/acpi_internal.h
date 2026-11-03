@@ -22,6 +22,7 @@ enum { FIELD_NORMAL, FIELD_INDEX, FIELD_BANK };
 #define SPACE_PCI    2
 #define SPACE_EC     3
 #define SPACE_CMOS   5
+#define SPACE_NONE   0xFF   /* an unusable region (DataTableRegion without its table): every access refused */
 
 struct aml_node;
 struct aml_obj;
@@ -35,7 +36,7 @@ struct aml_obj {
         struct { uint8_t *b; size_t len; } buf;
         struct { struct aml_obj **e; size_t n; } pkg;
         struct { const uint8_t *code; size_t len; uint8_t flags; aml_native_fn native; } method;
-        struct { uint8_t space; uint64_t base, len; struct aml_node *node; bool pci_resolved; uint8_t bus, dev, fn; } region;
+        struct { uint8_t space; uint64_t base, len; struct aml_node *node; bool pci_resolved, limit_warned; uint16_t seg; uint8_t bus, dev, fn; } region;
         struct { int kind; uint8_t flags, attrib; uint64_t bit_off, bit_len; struct aml_node *region, *index, *data, *bank; uint64_t bank_val; } field;
         struct { struct aml_obj *buf; uint64_t bit_off, bit_len; } bfield;
         struct { uint8_t sync; int depth; } mutex;
@@ -156,6 +157,7 @@ extern int nioapics;
 struct acpi_fadt *acpi_fadt(void);
 void *acpi_table_at(int i, char sig[4]);       /* i-th table in the RSDT/XSDT, NULL past the end */
 void *acpi_map_phys(uint64_t phys, size_t len);
+void *acpi_ecam(uint16_t seg, uint8_t bus);    /* the bus's MCFG/ECAM window (1 MiB, mapped on first use) or NULL */
 
 /* arch/pci.c (not in arch.h) */
 uint8_t pci_read8(uint8_t bus, uint8_t slot, uint8_t func, uint8_t off);

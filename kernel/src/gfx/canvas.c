@@ -25,14 +25,21 @@ int isqrt64(uint64_t v) {
     return (int)x;
 }
 
-struct canvas *canvas_create(int w, int h) {
-    w = w < 0 ? 0 : MIN(w, 16384); h = h < 0 ? 0 : MIN(h, 16384);   /* callers don't check for NULL: clamp */
+/* Sizes are clamped. canvas_create panics when the pixels can't be had (its callers write px
+ * directly at the size they asked for); canvas_create_try returns NULL instead, for sizes that
+ * come from user programs or window resizes. */
+static struct canvas *create(int w, int h, bool may_fail) {
+    w = w < 0 ? 0 : MIN(w, 16384); h = h < 0 ? 0 : MIN(h, 16384);
+    size_t bytes = (size_t)w * h * 4;
+    uint32_t *px = may_fail ? kzalloc_try(bytes) : kzalloc(bytes);
+    if (!px) return NULL;
     struct canvas *c = kzalloc(sizeof *c);
-    c->px = kzalloc((size_t)w * h * 4);
-    c->w = w; c->h = h; c->stride = w; c->owns_px = true;
+    c->px = px; c->w = w; c->h = h; c->stride = w; c->owns_px = true;
     canvas_reset_clip(c);
     return c;
 }
+struct canvas *canvas_create(int w, int h) { return create(w, h, false); }
+struct canvas *canvas_create_try(int w, int h) { return create(w, h, true); }
 void canvas_init(struct canvas *c, uint32_t *px, int w, int h, int stride) {
     c->px = px; c->w = w; c->h = h; c->stride = stride; c->owns_px = false;
     canvas_reset_clip(c);
@@ -225,7 +232,7 @@ static inline uint32_t sample_bilinear(const struct canvas *src, int fx, int fy)
 }
 
 void gfx_blit_scaled(struct canvas *dst, int x, int y, int w, int h, const struct canvas *src) {
-    if (w <= 0 || h <= 0) return;
+    if (w <= 0 || h <= 0 || src->w <= 0 || src->h <= 0) return;
     if (w == src->w && h == src->h) { gfx_blit(dst, x, y, src); return; }
     struct rect dr = rect_intersect(rect_make(x, y, w, h), dst->clip);
     if (rect_empty(dr)) return;
@@ -254,6 +261,7 @@ void gfx_blit_tinted(struct canvas *dst, int x, int y, const struct canvas *src,
     }
 }
 void gfx_blit_scaled_tinted(struct canvas *dst, int x, int y, int w, int h, const struct canvas *src, color_t tint) {
+    if (w <= 0 || h <= 0 || src->w <= 0 || src->h <= 0) return;
     struct rect dr = rect_intersect(rect_make(x, y, w, h), dst->clip);
     if (rect_empty(dr)) return;
     int sx_step = (src->w << 16) / w, sy_step = (src->h << 16) / h;

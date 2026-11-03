@@ -130,12 +130,15 @@ int btrfs_mkfs(struct blockdev *d, const char *label) {
     sb->sys_chunk_array_size = sizeof ck + sizeof chunks[0];
     uint32_t c = ~crc32c(~0u, (uint8_t *)sb + BTRFS_CSUM_SIZE, sizeof *sb - BTRFS_CSUM_SIZE);
     memcpy(sb->csum, &c, 4);
-    r = blockdev_write_bytes(d, BTRFS_SUPER_OFFSET, sb, sizeof *sb);
-    /* clear the other superblock mirror slots so stale data is never picked up */
+    /* clear the other superblock mirror slots so stale data is never picked up; the trees must be on the medium before the superblock */
     uint8_t *z = kzalloc(4096);
-    if (0x4000000 + 4096 <= dev_size) blockdev_write_bytes(d, 0x4000000, z, 4096);
-    if (0x4000000000ull + 4096 <= dev_size) blockdev_write_bytes(d, 0x4000000000ull, z, 4096);
+    if (0x4000000 + 4096 <= dev_size) r = blockdev_write_bytes(d, 0x4000000, z, 4096);
+    if (r == 0 && 0x4000000000ull + 4096 <= dev_size) r = blockdev_write_bytes(d, 0x4000000000ull, z, 4096);
+    if (r == 0) r = blockdev_flush(d);
+    if (r == 0) r = blockdev_write_bytes(d, BTRFS_SUPER_OFFSET, sb, sizeof *sb);
+    if (r == 0) r = blockdev_flush(d);
     kfree(z); kfree(sb);
+    if (r < 0) { kprintf("btrfs: formatting %s failed (%d)\n", d->name, r); return r; }
     kprintf("btrfs: formatted %s as '%s' (%lu MiB, chunks: system 4 MiB, metadata %lu MiB, data %lu MiB)\n", d->name, label, dev_size >> 20, meta_size >> 20, data_size >> 20);
     return r;
 }

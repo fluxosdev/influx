@@ -429,6 +429,17 @@ static int delete_item_inner(struct btrfs_fs *fs, struct btrfs_path *p) {
     leaf_delete_raw(fs, leaf, p->slots[0]);
     if (btrfs_nritems(leaf) == 0) {
         if (p->top == 0) return 0;   /* empty root leaf is fine */
+        struct btrfs_tree *tree = p->tree;
+        int l = 1; while (l <= p->top && btrfs_nritems(p->blocks[l]) == 1) l++;
+        if (l > p->top) {
+            /* every node above holds only this leaf: the empty leaf becomes the root (an internal root must not be empty) */
+            uint64_t old[BTRFS_MAX_LEVEL]; int top = p->top;
+            for (int k = 1; k <= top; k++) old[k] = p->blocks[k]->logical;
+            tree->bytenr = leaf->logical; tree->level = 0; tree->generation = hdr(leaf)->generation;
+            persist_root(fs, tree);
+            for (int k = 1; k <= top; k++) btrfs_free_tree_block(fs, old[k], tree->objectid, k);
+            return 0;
+        }
         /* remove from parent, free the block */
         int level = 1;
         for (;;) {
@@ -441,18 +452,20 @@ static int delete_item_inner(struct btrfs_fs *fs, struct btrfs_path *p) {
                     struct btrfs_path q = *p; q.top = p->top;
                     for (int l = level; l < p->top; l++) { if (q.slots[l] != 0) break; btrfs_node_ptr(q.blocks[l + 1], q.slots[l + 1])->key = btrfs_node_ptr(q.blocks[l], 0)->key; btrfs_mark_dirty(fs, q.blocks[l + 1]); }
                 }
-                /* if the root node has a single child, collapse it */
-                if (level == p->top && btrfs_nritems(node) == 1 && p->top > 0) {
-                    struct btrfs_key_ptr *kp = btrfs_node_ptr(node, 0);
-                    struct btrfs_tree *tree = p->tree;
-                    uint64_t old_root = node->logical;
-                    tree->bytenr = kp->blockptr; tree->level = level - 1; tree->generation = kp->generation;
-                    persist_root(fs, tree);
-                    btrfs_free_tree_block(fs, old_root, tree->objectid, level);
-                }
                 break;
             }
             level++;
+        }
+        /* an internal root left with a single child is replaced by it, repeatedly, down to a leaf if need be */
+        while (tree->level > 0) {
+            struct tree_block *root = btrfs_read_block(fs, tree->bytenr);
+            if (!root || btrfs_nritems(root) != 1) break;
+            uint64_t old_root = root->logical, child_bytenr = btrfs_node_ptr(root, 0)->blockptr; int lvl = tree->level;
+            struct tree_block *child = btrfs_read_block(fs, child_bytenr);
+            if (!child || btrfs_level(child) != lvl - 1 || (lvl > 1 && !btrfs_nritems(child))) break;
+            tree->bytenr = child_bytenr; tree->level = lvl - 1; tree->generation = hdr(child)->generation;
+            persist_root(fs, tree);
+            btrfs_free_tree_block(fs, old_root, tree->objectid, lvl);
         }
         return 0;
     }
@@ -898,13 +911,19 @@ int btrfs_commit(struct btrfs_fs *fs) {
     struct tree_block *rt = btrfs_read_block(fs, fs->root_tree.bytenr);
     if (rt) { hdr(rt)->generation = fs->transid; rt->dirty = true; }
     if (fs->sb.chunk_root_generation == fs->transid) { struct tree_block *ct = btrfs_read_block(fs, fs->chunk_tree.bytenr); if (ct) { hdr(ct)->generation = fs->transid; ct->dirty = true; } }
+    /* 1: tree blocks (a block whose write fails stays dirty for the next commit) */
+    int err = 0, nfail = 0;
     for (int i = 0; i < CACHE_BUCKETS; i++) for (struct tree_block *b = fs->cache[i]; b; b = b->hnext) {
         if (!b->dirty) continue;
         uint32_t c = block_csum(fs, b->data);
         memset(b->data, 0, BTRFS_CSUM_SIZE); memcpy(b->data, &c, 4);
-        if (btrfs_write_logical(fs, b->logical, b->data, fs->nodesize) < 0) kprintf("btrfs: write of tree block %lx failed\n", b->logical);
+        int r = btrfs_write_logical(fs, b->logical, b->data, fs->nodesize);
+        if (r < 0) { if (!nfail++) kprintf("btrfs: %s: write of tree block %lx failed (%d)\n", fs->dev->name, b->logical, r); err = r; continue; }
         b->dirty = false;
     }
+    if (err) { kprintf("btrfs: %s: %d tree block write(s) failed, transaction %lu not committed\n", fs->dev->name, nfail, fs->transid); return err; }
+    /* 2: the blocks must be on the medium before a superblock that points at them */
+    if ((err = blockdev_flush(fs->dev)) < 0) { kprintf("btrfs: %s: cache flush failed (%d), transaction %lu not committed\n", fs->dev->name, err, fs->transid); return err; }
     fs->sb.generation = fs->transid;
     fs->sb.root_level = fs->root_tree.level; fs->sb.root = fs->root_tree.bytenr;
     fs->sb.chunk_root_generation = fs->sb.chunk_root_generation;
@@ -921,16 +940,22 @@ int btrfs_commit(struct btrfs_fs *fs) {
     bk->total_bytes = fs->sb.total_bytes; bk->bytes_used = fs->sb.bytes_used; bk->num_devices = fs->sb.num_devices;
     uint32_t c = super_csum(&fs->sb);
     memset(fs->sb.csum, 0, BTRFS_CSUM_SIZE); memcpy(fs->sb.csum, &c, 4);
+    /* 3: superblock copies, 4: flush them. Any failure leaves dirty_super set so the next commit rewrites them. */
     uint64_t dev_bytes = fs->dev->sectors * fs->dev->sector_size;
     static const uint64_t supers[3] = { 0x10000, 0x4000000, 0x4000000000ULL };
     for (int i = 0; i < 3; i++) {
         if (supers[i] + 4096 > dev_bytes) break;
         fs->sb.bytenr = supers[i];
         c = super_csum(&fs->sb); memset(fs->sb.csum, 0, BTRFS_CSUM_SIZE); memcpy(fs->sb.csum, &c, 4);
-        blockdev_write_bytes(fs->dev, supers[i], &fs->sb, sizeof fs->sb);
+        int r = blockdev_write_bytes(fs->dev, supers[i], &fs->sb, sizeof fs->sb);
+        if (r < 0) { kprintf("btrfs: %s: superblock write at %lx failed (%d)\n", fs->dev->name, supers[i], r); err = r; }
     }
     fs->sb.bytenr = 0x10000;
-    fs->dirty_super = false; fs->any_dirty = false;
+    c = super_csum(&fs->sb); memset(fs->sb.csum, 0, BTRFS_CSUM_SIZE); memcpy(fs->sb.csum, &c, 4);
+    if (!err && (err = blockdev_flush(fs->dev)) < 0) kprintf("btrfs: %s: cache flush after the superblock failed (%d)\n", fs->dev->name, err);
+    fs->any_dirty = false;
+    if (err) return err;
+    fs->dirty_super = false;
     fs->transid = fs->sb.generation + 1;
     return 0;
 }

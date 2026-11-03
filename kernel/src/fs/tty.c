@@ -90,6 +90,7 @@ void tty_input(struct tty *t, const char *s, size_t n) {
 
 int64_t tty_read(struct tty *t, void *buf, size_t n) {
     char *out = buf; size_t got = 0;
+    if (n == 0) return 0;   /* read(fd, buf, 0) must not block (and must not consume a pending EOF) */
     spin_lock(&t->lock);
     for (;;) {
         if (t->closed) { spin_unlock(&t->lock); return 0; }

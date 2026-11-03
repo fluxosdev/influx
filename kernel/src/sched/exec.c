@@ -15,6 +15,11 @@ struct elf64_phdr { uint32_t type, flags; uint64_t offset, vaddr, paddr, filesz,
 #define USER_LIMIT (USER_STACK_TOP - USER_STACK_SIZE - PAGE_SIZE)   /* image and heap stay below the stack and its guard page */
 #define USER_BRK_MAX (1ULL << 32)                                    /* per-process sbrk heap */
 #define PMM_RESERVE_PAGES 4096                                       /* left for the kernel when mapping user memory */
+#define USER_PROCS_MAX 64                                            /* live (unreaped) user processes */
+#define USER_WIN_BYTES_MAX (64ULL << 20)                             /* window pixels per user process */
+#ifndef EAGAIN
+#define EAGAIN 11
+#endif
 
 struct syscall_frame { uint64_t rax, r9, r8, r10, rdx, rsi, rdi, r15, r14, r13, r12, rbp, rbx, rflags, rip, rsp; };
 
@@ -69,6 +74,7 @@ int process_spawn(const char *path, int argc, char **argv, struct file *stdio[3]
         if (ph->filesz > ph->memsz || ph->vaddr < PAGE_SIZE || ph->vaddr >= USER_LIMIT || ph->memsz > USER_LIMIT - ph->vaddr ||
             ph->offset > size || ph->filesz > size - ph->offset) { kfree(data); return -ENOEXEC; }
     }
+    if (process_user_count() >= USER_PROCS_MAX) { kfree(data); return -EAGAIN; }
     struct process *p = process_create(vfs_basename(path), true);
     strlcpy(p->cwd, cwd ? cwd : "/", sizeof p->cwd);
     uint64_t brk = 0;
@@ -102,9 +108,9 @@ int process_spawn(const char *path, int argc, char **argv, struct file *stdio[3]
     thread_create_user(p, p->name, entry, sp);
     return p->pid;
 nomem:
-    /* no thread ever ran: mark it exited and reap it here */
+    /* no thread ever ran: mark it exited (waking anyone already waiting) and reap it here */
     kfree(data);
-    p->exited = true;
+    process_mark_exited(p);
     process_wait(p->pid, NULL);
     return -ENOMEM;
 }
@@ -137,7 +143,7 @@ static int64_t do_syscall(struct syscall_frame *f) {
     case SYS_WRITE: { struct file *fl = fd_get(p, a1); if (!fl) return -EBADF; if (!user_range_ok(p, a2, a3)) return -EINVAL; return vfs_write(fl, (void *)a2, a3); }
     case SYS_READ: { struct file *fl = fd_get(p, a1); if (!fl) return -EBADF; if (!user_range_ok(p, a2, a3)) return -EINVAL; return vfs_read(fl, (void *)a2, a3); }
     case SYS_OPEN: { char path[PATH_MAX]; if (copy_user_string(p, a1, path, sizeof path) < 0) return -EINVAL; struct file *fl; int r = vfs_open_rel(p->cwd, path, (int)a2, &fl); if (r < 0) return r; return fd_alloc(p, fl); }
-    case SYS_CLOSE: { struct file *fl = fd_get(p, a1); if (!fl) return -EBADF; p->fds[a1] = NULL; vfs_close(fl); return 0; }
+    case SYS_CLOSE: { struct file *fl = fd_get(p, a1); if (!fl) return -EBADF; p->fds[a1] = NULL; return vfs_close(fl); }   /* reports a failed flush (e.g. btrfs out of space) */
     case SYS_LSEEK: { struct file *fl = fd_get(p, a1); if (!fl) return -EBADF; return vfs_seek(fl, (int64_t)a2, (int)a3); }
     case SYS_GETPID: return p->pid;
     case SYS_SBRK: { int64_t incr = (int64_t)a1; uint64_t old = p->brk;
@@ -147,19 +153,20 @@ static int64_t do_syscall(struct syscall_frame *f) {
     case SYS_SLEEP: thread_sleep_ms(a1); return 0;
     case SYS_YIELD: thread_yield(); return 0;
     case SYS_GETCWD: { size_t l = strlen(p->cwd) + 1; if (a2 < l || !user_range_ok(p, a1, l)) return -EINVAL; memcpy((void *)a1, p->cwd, l); return 0; }
-    case SYS_CHDIR: { char path[PATH_MAX], norm[PATH_MAX]; if (copy_user_string(p, a1, path, sizeof path) < 0) return -EINVAL; vfs_normalize(p->cwd, path, norm, sizeof norm); struct stat st; if (vfs_stat(norm, &st) < 0) return -ENOENT; if (st.type != VN_DIR) return -ENOTDIR; strlcpy(p->cwd, norm, sizeof p->cwd); return 0; }
+    case SYS_CHDIR: { char path[PATH_MAX], norm[PATH_MAX]; if (copy_user_string(p, a1, path, sizeof path) < 0) return -EINVAL; int nr = vfs_normalize(p->cwd, path, norm, sizeof norm); if (nr < 0) return nr; struct stat st; if (vfs_stat(norm, &st) < 0) return -ENOENT; if (st.type != VN_DIR) return -ENOTDIR; strlcpy(p->cwd, norm, sizeof p->cwd); return 0; }
     case SYS_READDIR: { struct file *fl = fd_get(p, a1); if (!fl) return -EBADF; if (!user_range_ok(p, a3, sizeof(struct user_dirent))) return -EINVAL; struct dirent d; int r = vfs_readdir(fl->vn, (int)a2, &d); if (r < 0) return r == -1 ? 0 : r; struct user_dirent *ud = (void *)a3; strlcpy(ud->name, d.name, sizeof ud->name); ud->type = d.type; ud->size = d.size; ud->mtime = d.mtime; return 1; }
     case SYS_STAT: { char path[PATH_MAX]; if (copy_user_string(p, a1, path, sizeof path) < 0) return -EINVAL; if (!user_range_ok(p, a2, sizeof(struct user_stat))) return -EINVAL; struct stat st; int r = vfs_stat_rel(p->cwd, path, &st); if (r < 0) return r; struct user_stat *us = (void *)a2; us->type = st.type; us->mode = st.mode; us->size = st.size; us->mtime = st.mtime; us->ino = st.ino; return 0; }
     case SYS_FSTAT: { struct file *fl = fd_get(p, a1); if (!fl) return -EBADF; if (!user_range_ok(p, a2, sizeof(struct user_stat))) return -EINVAL; struct user_stat *us = (void *)a2; us->type = fl->vn->type; us->mode = fl->vn->mode; us->size = fl->vn->size; us->mtime = fl->vn->mtime; us->ino = fl->vn->ino; return 0; }
-    case SYS_MKDIR: { char path[PATH_MAX], norm[PATH_MAX]; if (copy_user_string(p, a1, path, sizeof path) < 0) return -EINVAL; vfs_normalize(p->cwd, path, norm, sizeof norm); return vfs_mkdir(norm); }
-    case SYS_UNLINK: { char path[PATH_MAX], norm[PATH_MAX]; if (copy_user_string(p, a1, path, sizeof path) < 0) return -EINVAL; vfs_normalize(p->cwd, path, norm, sizeof norm); return vfs_unlink(norm); }
-    case SYS_RENAME: { char a[PATH_MAX], b[PATH_MAX], na[PATH_MAX], nb[PATH_MAX]; if (copy_user_string(p, a1, a, sizeof a) < 0 || copy_user_string(p, a2, b, sizeof b) < 0) return -EINVAL; vfs_normalize(p->cwd, a, na, sizeof na); vfs_normalize(p->cwd, b, nb, sizeof nb); return vfs_rename(na, nb); }
+    case SYS_MKDIR: { char path[PATH_MAX], norm[PATH_MAX]; if (copy_user_string(p, a1, path, sizeof path) < 0) return -EINVAL; int nr = vfs_normalize(p->cwd, path, norm, sizeof norm); if (nr < 0) return nr; return vfs_mkdir(norm); }
+    case SYS_UNLINK: { char path[PATH_MAX], norm[PATH_MAX]; if (copy_user_string(p, a1, path, sizeof path) < 0) return -EINVAL; int nr = vfs_normalize(p->cwd, path, norm, sizeof norm); if (nr < 0) return nr; return vfs_unlink(norm); }
+    case SYS_RENAME: { char a[PATH_MAX], b[PATH_MAX], na[PATH_MAX], nb[PATH_MAX]; if (copy_user_string(p, a1, a, sizeof a) < 0 || copy_user_string(p, a2, b, sizeof b) < 0) return -EINVAL; int nr = vfs_normalize(p->cwd, a, na, sizeof na); if (nr == 0) nr = vfs_normalize(p->cwd, b, nb, sizeof nb); if (nr < 0) return nr; return vfs_rename(na, nb); }
     case SYS_SPAWN: {
         char path[PATH_MAX]; if (copy_user_string(p, a1, path, sizeof path) < 0) return -EINVAL;
         char *argv[64]; int argc = 0;
         if (a2) { for (; argc < 63; argc++) { if (!user_range_ok(p, a2 + argc * 8, 8)) break; uint64_t ptr = ((uint64_t *)a2)[argc]; if (!ptr) break; char buf[1024]; if (copy_user_string(p, ptr, buf, sizeof buf) < 0) break; argv[argc] = strdup(buf); } }
         if (argc == 0) argv[argc++] = strdup(path);
-        char full[PATH_MAX]; if (strchr(path, '/')) vfs_normalize(p->cwd, path, full, sizeof full); else snprintf(full, sizeof full, "/bin/%s", path);
+        char full[PATH_MAX]; int nr = 0; if (strchr(path, '/')) nr = vfs_normalize(p->cwd, path, full, sizeof full); else snprintf(full, sizeof full, "/bin/%s", path);
+        if (nr < 0) { for (int i = 0; i < argc; i++) kfree(argv[i]); return nr; }
         int r = process_spawn(full, argc, argv, p->fds, p->cwd);
         for (int i = 0; i < argc; i++) kfree(argv[i]);
         return r; }
@@ -167,7 +174,10 @@ static int64_t do_syscall(struct syscall_frame *f) {
     case SYS_UNAME: { if (!user_range_ok(p, a1, sizeof(struct user_utsname))) return -EINVAL; struct user_utsname *u = (void *)a1; strcpy(u->sysname, "inFlux"); strlcpy(u->nodename, system_hostname, sizeof u->nodename); strcpy(u->release, INFLUX_VERSION); strcpy(u->version, "#1 preemptive multithreaded"); strcpy(u->machine, "x86_64"); return 0; }
     case SYS_TIME: return time_unix();
     case SYS_UPTIME: return system_ticks;
-    case SYS_IOCTL: { struct file *fl = fd_get(p, a1); if (!fl) return -EBADF; if (!fl->vn->ops->ioctl) return -ENOTTY_; if (a2 == 2 && !user_range_ok(p, a3, 8)) return -EINVAL; return fl->vn->ops->ioctl(fl->vn, (int)a2, (void *)a3); }
+    case SYS_IOCTL: { struct file *fl = fd_get(p, a1); if (!fl) return -EBADF; if (!fl->vn->ops->ioctl) return -ENOTTY_; if (a2 == 2 && !user_range_ok(p, a3, 8)) return -EINVAL;
+        /* tty foreground pid: Ctrl-C and closing the terminal kill it, so only another user process (or none) */
+        if (a2 == 3 && (int)a3) { procs_lock(); struct process *tp = process_find((int)a3); bool ok = tp && tp->is_user && !tp->exited; procs_unlock(); if (!ok) return -EACCES; }
+        return fl->vn->ops->ioctl(fl->vn, (int)a2, (void *)a3); }
     case SYS_DUP2: { struct file *fl = fd_get(p, a1); if (!fl || a2 >= MAX_FDS) return -EBADF; if (a1 == a2) return a2; struct file *nf = vfs_dup(fl); if (p->fds[a2]) vfs_close(p->fds[a2]); p->fds[a2] = nf; return a2; }
     case SYS_PIPE: { if (!user_range_ok(p, a1, 8)) return -EINVAL; struct file *r, *w; pipe_create(&r, &w); int fr = fd_alloc(p, r); if (fr < 0) { vfs_close(w); return -ENOMEM; } int fw = fd_alloc(p, w); if (fw < 0) { p->fds[fr] = NULL; vfs_close(r); return -ENOMEM; } ((int *)a1)[0] = fr; ((int *)a1)[1] = fw; return 0; }
     case SYS_KILL: { procs_lock(); struct process *tp = process_find((int)a1); int r = !tp ? -ESRCH : !tp->is_user ? -EACCES : 0; procs_unlock(); if (r) return r; return process_kill((int)a1, (int)a2) ? 0 : -ESRCH; }
@@ -177,9 +187,12 @@ static int64_t do_syscall(struct syscall_frame *f) {
     case SYS_WIN_CREATE: {
         char title[128]; if (copy_user_string(p, a3, title, sizeof title) < 0) strcpy(title, p->name);
         int w = (int)a1, h = (int)a2; if (w < 64 || h < 48 || w > 4096 || h > 4096) return -EINVAL;
-        int slot = -1; for (int i = 0; i < 8; i++) if (!p->uwin[i]) { slot = i; break; }
-        if (slot < 0) return -ENOMEM;
-        struct window *win = window_create(title, w, h, WIN_STANDARD);
+        int slot = -1; uint64_t used = 0, need = (uint64_t)w * h * 4;
+        for (int i = 0; i < 8; i++) if (!p->uwin[i]) { if (slot < 0) slot = i; } else used += (uint64_t)MAX(p->uwin[i]->frame.w, 0) * MAX(p->uwin[i]->frame.h, 0) * 4;
+        /* the canvas is one contiguous allocation: keep it well clear of exhausting memory */
+        if (slot < 0 || used + need > USER_WIN_BYTES_MAX || need > pmm_free_bytes() / 4) return -ENOMEM;
+        struct window *win = window_create_try(title, w, h, WIN_STANDARD);
+        if (!win) return -ENOMEM;   /* no contiguous memory for the canvas */
         win->flags |= WIN_NO_CTRL_ALIAS;
         p->uwin[slot] = win;
         window_show(win);
@@ -223,7 +236,7 @@ extern void syscall_entry(void);
 void syscall_init_cpu(void) {
     wrmsr(0xC0000081, ((uint64_t)0x13 << 48) | ((uint64_t)KERNEL_CS << 32));   /* STAR */
     wrmsr(0xC0000082, (uint64_t)syscall_entry);                                /* LSTAR */
-    wrmsr(0xC0000084, 0x700);                                                  /* SFMASK: clear IF, TF, DF */
+    wrmsr(0xC0000084, 0x47700);                                                /* SFMASK: clear IF, TF, DF, IOPL, NT, AC */
 }
 
 void syscall_init(void) { kprintf("syscall: fast system calls enabled on %d CPUs\n", cpu_count); }

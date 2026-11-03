@@ -10,6 +10,7 @@ struct udp_dgram { uint32_t src; uint16_t sport; uint16_t len; uint8_t *data; };
 struct udp_sock {
     bool used;
     uint16_t port;
+    struct netif *n;            /* only datagrams that arrive on this adapter; NULL = any */
     struct udp_dgram q[UDP_QUEUE];
     int head, count;
     struct semaphore sem;
@@ -17,30 +18,34 @@ struct udp_sock {
 static struct udp_sock socks[32];
 static uint16_t next_ephemeral = 49152;
 
-static struct udp_sock *find_port(uint16_t port) {
-    for (size_t i = 0; i < ARRAY_LEN(socks); i++) if (socks[i].used && socks[i].port == port) return &socks[i];
+/* the socket that takes port on adapter n (n = NULL: any socket on the port). Bindings never overlap:
+ * a port is either bound once for all adapters or once per adapter. */
+static struct udp_sock *find_port(uint16_t port, struct netif *n) {
+    for (size_t i = 0; i < ARRAY_LEN(socks); i++)
+        if (socks[i].used && socks[i].port == port && (!n || !socks[i].n || socks[i].n == n)) return &socks[i];
     return NULL;
 }
 
-struct udp_sock *udp_open(uint16_t port) {
+struct udp_sock *udp_open_if(uint16_t port, struct netif *n) {
     mutex_lock(&net_lock);
     if (!port) {
         for (int tries = 0; tries < 16384; tries++) {
             uint16_t p = next_ephemeral++;
             if (next_ephemeral < 49152) next_ephemeral = 49152;
-            if (!find_port(p)) { port = p; break; }
+            if (!find_port(p, NULL)) { port = p; break; }
         }
-    } else if (find_port(port)) { mutex_unlock(&net_lock); return NULL; }
+    } else if (find_port(port, n)) { mutex_unlock(&net_lock); return NULL; }
     struct udp_sock *s = NULL;
     for (size_t i = 0; i < ARRAY_LEN(socks); i++) if (!socks[i].used) { s = &socks[i]; break; }
     if (s && port) {
         memset(s, 0, sizeof *s);
-        s->used = true; s->port = port;
+        s->used = true; s->port = port; s->n = n;
         sem_init(&s->sem, 0);
     } else s = NULL;
     mutex_unlock(&net_lock);
     return s;
 }
+struct udp_sock *udp_open(uint16_t port) { return udp_open_if(port, NULL); }
 
 void udp_close(struct udp_sock *s) {
     if (!s) return;
@@ -59,12 +64,13 @@ void udp_input(struct netif *n, uint32_t src, uint32_t dst, const uint8_t *pkt, 
         uint32_t sum = ip_pseudo_sum(src, dst, IP_PROTO_UDP, ulen);
         if (net_checksum(pkt, ulen, sum) != 0) { n->rx_errors++; return; }
     }
-    struct udp_sock *s = find_port(ntohs(h->dport));
+    struct udp_sock *s = find_port(ntohs(h->dport), n);
     if (!s) return;
     if (s->count == UDP_QUEUE) { n->rx_dropped++; return; }
     struct udp_dgram *d = &s->q[(s->head + s->count) % UDP_QUEUE];
     d->src = src; d->sport = ntohs(h->sport); d->len = ulen - sizeof *h;
-    d->data = kmalloc(d->len ? d->len : 1);
+    d->data = kmalloc_try(d->len ? d->len : 1);
+    if (!d->data) { n->rx_dropped++; return; }
     memcpy(d->data, pkt + sizeof *h, d->len);
     s->count++;
     sem_post(&s->sem);

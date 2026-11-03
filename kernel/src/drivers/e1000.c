@@ -194,6 +194,7 @@ struct em {
     uint8_t *rx_buf, *tx_buf;
     uint64_t rx_buf_phys, tx_buf_phys;
     unsigned rx_next, tx_tail;
+    uint64_t tx_full_since;       /* time_ms() the transmit ring was first seen full, 0 = not full */
     bool rx_discard;              /* dropping the rest of an oversized frame */
     bool irq;
     volatile uint32_t icr_pending;
@@ -255,10 +256,21 @@ static bool mdic(struct em *e, int phy, int reg, bool write, uint16_t *val) {
     }
     return false;
 }
-/* a PHY register, paged on the PCH's HV-style PHY (pages >= 768 live at address 1) */
+/* a PHY register, paged on the PCH's HV-style PHY. The rule of Linux's __e1000_{read,write}_phy_reg_hv:
+ * pages 0 and >= 768 select the page (768 as 0) by writing page << 5 to register 31 at MDIO address 1
+ * (e1000_set_page_igp; only needed for registers above 15), then access the register at address 1 for
+ * pages >= 768 and the PHY's own address (2) otherwise; pages 1..767 are not paged in at all but reached
+ * through the vendor debug window at address 2 (e1000_access_phy_debug_regs_hv: offset & 0x3F into
+ * register 16, data through 17 on the 82577-style PHYs, I217 included); page 800 (wake-up) is not supported. */
+#define HV_DEBUG_ADDR_REG 16
 static bool phy_rw(struct em *e, uint32_t preg, bool write, uint16_t *val) {
     int page = preg >> 5, reg = preg & 0x1F, addr = e->phy_addr;
-    if (e->type == EM_PCH_LPT && page) {
+    if (e->type == EM_PCH_LPT) {
+        if (page == 800) return false;
+        if (page > 0 && page < 768) {
+            uint16_t a = (uint16_t)(preg & 0x3F);
+            return mdic(e, 2, HV_DEBUG_ADDR_REG, true, &a) && mdic(e, 2, HV_DEBUG_ADDR_REG + 1, write, val);
+        }
         if (page >= 768) addr = 1;
         uint16_t sel = (uint16_t)((page == 768 ? 0 : page) << 5);
         if (reg > 0xF && !mdic(e, 1, PHY_PAGE_SELECT, true, &sel)) return false;
@@ -469,7 +481,7 @@ static void em_setup_rings(struct em *e) {
     wr(e, E_TDLEN, NTX * sizeof(struct tx_desc));
     wr(e, E_TDH, 0); wr(e, E_TDT, 0);
     wr(e, E_TIDV, 0);
-    e->rx_next = 0; e->tx_tail = 0; e->rx_discard = false;
+    e->rx_next = 0; e->tx_tail = 0; e->tx_full_since = 0; e->rx_discard = false;
     wr(e, E_TIPG, TIPG_COPPER);
     wr(e, E_TCTL, TCTL_EN | TCTL_PSP | TCTL_CT | TCTL_COLD | TCTL_RTLC);
     wr(e, E_RCTL, RCTL_EN | RCTL_BAM | RCTL_SECRC);   /* 2048-byte buffers, unicast to us and broadcast */
@@ -477,12 +489,41 @@ static void em_setup_rings(struct em *e) {
 }
 
 /* ---- data path (called with net_lock held) ---- */
+/* Discards whatever is queued for transmission and restarts the transmit unit on an empty ring: without
+ * a link the MAC stops fetching descriptors, and frames queued meanwhile may never complete. */
+static void em_tx_reset(struct em *e, const char *why) {
+    unsigned pending = 0;
+    for (unsigned i = 0; i < NTX; i++) if (!(e->tx[i].status & TXD_DD)) pending++;
+    e->tx_full_since = 0;
+    if (!pending) return;
+    uint32_t tctl = rd(e, E_TCTL);
+    wr(e, E_TCTL, tctl & ~TCTL_EN); flush(e);
+    udelay(100);                                  /* let a descriptor fetch in flight finish */
+    for (unsigned i = 0; i < NTX; i++) { memset(&e->tx[i], 0, sizeof e->tx[i]); e->tx[i].status = TXD_DD; }
+    __atomic_thread_fence(__ATOMIC_SEQ_CST);
+    wr(e, E_TDH, 0); wr(e, E_TDT, 0);             /* only while the transmitter is disabled */
+    e->tx_tail = 0;
+    wr(e, E_TCTL, tctl | TCTL_EN); flush(e);
+    e->netif.tx_errors += pending;
+    kprintf("%s: %s: dropped %u queued frames, transmit ring reset\n", e->netif.name, why, pending);
+}
+
 static int em_send(struct netif *n, const void *frame, size_t len) {
     struct em *e = n->priv;
     if (len > ETH_FRAME_MAX) { n->tx_errors++; return -EINVAL; }
+    /* One descriptor always stays free: moving TDT onto the descriptor the hardware is still working on
+     * would make TDT == TDH, which it reads as an empty ring, and the queued frames would never go out.
+     * A full ring means the transmitter is behind or stalled: drop the frame rather than wait under
+     * net_lock, and reset the ring if it has not drained for two seconds (link loss, a hung unit). */
     volatile struct tx_desc *d = &e->tx[e->tx_tail];
-    for (int i = 0; i < 200000 && !(d->status & TXD_DD); i++) pause();
-    if (!(d->status & TXD_DD)) { n->tx_errors++; return -EBUSY; }
+    if (!(d->status & TXD_DD) || !(e->tx[(e->tx_tail + 1) % NTX].status & TXD_DD)) {
+        uint64_t now = time_ms();
+        if (!e->tx_full_since) e->tx_full_since = now;
+        else if (now - e->tx_full_since >= 2000) em_tx_reset(e, "transmit stalled");
+        n->tx_errors++;
+        return -EBUSY;
+    }
+    e->tx_full_since = 0;
     memcpy(e->tx_buf + (size_t)e->tx_tail * BUFSZ, frame, len);
     d->addr = e->tx_buf_phys + (uint64_t)e->tx_tail * BUFSZ;
     d->len = (uint16_t)len;
@@ -499,7 +540,11 @@ static int em_send(struct netif *n, const void *frame, size_t len) {
 static int em_poll(struct netif *n) {
     struct em *e = n->priv;
     uint32_t icr = e->irq ? __atomic_exchange_n(&e->icr_pending, 0, __ATOMIC_ACQ_REL) : rd(e, E_ICR);
-    if (icr & ICR_LSC) em_report_link(e, false);
+    if (icr & ICR_LSC) {
+        bool was_up = e->link_up;
+        em_report_link(e, false);
+        if (!was_up && e->link_up) em_tx_reset(e, "link up");   /* frames stranded while the link was down */
+    }
     if (icr & ICR_RXO) n->rx_dropped++;
     int count = 0;
     int last = -1;

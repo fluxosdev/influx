@@ -12,6 +12,7 @@ int fat32_format(struct blockdev *d, const char *label);
 struct vnode *fat32_mount(struct blockdev *d);
 struct vnode *btrfs_mount(struct blockdev *d);
 int btrfs_mkfs(struct blockdev *d, const char *label);
+int btrfs_unmount(struct vnode *root);
 
 struct gpt_header { char sig[8]; uint32_t rev, hdr_size, crc, res; uint64_t cur_lba, backup_lba, first_usable, last_usable; uint8_t guid[16]; uint64_t part_lba; uint32_t nparts, part_size, parts_crc; } PACKED;
 struct gpt_entry { uint8_t type[16], guid[16]; uint64_t first, last, attrs; uint16_t name[36]; } PACKED;
@@ -94,12 +95,14 @@ static int copy_file(const char *src, const char *dst) {
 }
 static int copy_tree(const char *src, const char *dst) {
     struct stat st; if (vfs_stat(src, &st) < 0) return -ENOENT;
-    if (st.type != VN_DIR) return copy_file(src, dst);
-    vfs_mkdir(dst);
+    if (st.type != VN_DIR) { int r = copy_file(src, dst); if (r < 0) kprintf("install: copying %s failed (%d)\n", src, r); return r; }
+    int r = vfs_mkdir(dst);
+    if (r < 0 && r != -EEXIST) { kprintf("install: creating %s failed (%d)\n", dst, r); return r; }
     struct vnode *d = vfs_lookup(src); if (!d) return -ENOENT;
-    struct dirent de; int r = 0;
+    struct dirent de; r = 0;
     for (int i = 0; vfs_readdir(d, i, &de) == 0 && r == 0; i++) {
-        char a[PATH_MAX], b[PATH_MAX]; snprintf(a, sizeof a, "%s/%s", src, de.name); snprintf(b, sizeof b, "%s/%s", dst, de.name);
+        char a[PATH_MAX], b[PATH_MAX];
+        if ((size_t)snprintf(a, sizeof a, "%s/%s", src, de.name) >= sizeof a || (size_t)snprintf(b, sizeof b, "%s/%s", dst, de.name) >= sizeof b) { r = -ENAMETOOLONG; break; }
         r = copy_tree(a, b);
     }
     vnode_unref(d);
@@ -117,7 +120,7 @@ int install_run(struct blockdev *disk, install_progress_fn progress, void *ctx) 
     #define STEP(pct, ...) do { snprintf(msg, sizeof msg, __VA_ARGS__); kprintf("install: %s\n", msg); if (progress) progress(ctx, pct, msg); } while (0)
     if (disk->sector_size != 512) { STEP(100, "%s has %u-byte sectors; only 512-byte sector disks are supported", disk->name, disk->sector_size); return -EINVAL; }
     /* never install onto a disk that is currently mounted */
-    for (int i = 0; i < blockdev_count(); i++) { struct blockdev *b = blockdev_at(i); if (b && (b == disk || b->parent == disk) && b->fs_type) { for (int m = 0; m < vfs_mount_count(); m++) { char mp[PATH_MAX]; struct vnode *r = vfs_mount_at(m, mp, sizeof mp); if (r && r->priv == b) { STEP(0, "%s is mounted at %s; unmounting", b->name, mp); vfs_unmount(mp); } } } }
+    for (int i = 0; i < blockdev_count(); i++) { struct blockdev *b = blockdev_at(i); if (b && (b == disk || b->parent == disk) && b->fs_type) { for (int m = 0; m < vfs_mount_count(); m++) { char mp[PATH_MAX]; struct vnode *r = vfs_mount_at(m, mp, sizeof mp); if (r && r->priv == b) { STEP(0, "%s is mounted at %s; unmounting", b->name, mp); if (vfs_unmount(mp) == 0) { btrfs_unmount(r); m--; } } } } }
     STEP(2, "Writing GPT partition table to %s", disk->name);
     int r = write_gpt(disk, progress, ctx);
     if (r < 0) { STEP(100, "Partitioning failed (%d)", r); return r; }
@@ -138,7 +141,8 @@ int install_run(struct blockdev *disk, install_progress_fn progress, void *ctx) 
     vfs_mkdir("/mnt");
     if ((r = vfs_mount("/mnt/.install-esp", esp_root)) < 0) { STEP(100, "Cannot mount the new EFI partition (%d)", r); return r; }
     STEP(28, "Copying bootloader");
-    vfs_mkdir("/mnt/.install-esp/EFI"); vfs_mkdir("/mnt/.install-esp/EFI/BOOT"); vfs_mkdir("/mnt/.install-esp/boot");
+    static const char *const esp_dirs[] = { "/mnt/.install-esp/EFI", "/mnt/.install-esp/EFI/BOOT", "/mnt/.install-esp/boot" };
+    for (int i = 0; i < 3; i++) if ((r = vfs_mkdir(esp_dirs[i])) < 0 && r != -EEXIST) { STEP(100, "Creating %s failed (%d)", esp_dirs[i], r); vfs_unmount("/mnt/.install-esp"); return r; }
     r = copy_file("/boot/limine/BOOTX64.EFI", "/mnt/.install-esp/EFI/BOOT/BOOTX64.EFI");
     if (r == 0) r = copy_file("/boot/limine/BOOTIA32.EFI", "/mnt/.install-esp/EFI/BOOT/BOOTIA32.EFI");
     if (r == 0) r = copy_file("/boot/limine/limine-bios.sys", "/mnt/.install-esp/limine-bios.sys");
@@ -150,20 +154,26 @@ int install_run(struct blockdev *disk, install_progress_fn progress, void *ctx) 
     STEP(66, "Writing bootloader configuration");
     const char *conf = "timeout: 3\ndefault_entry: 1\n\n/inFlux\n    protocol: limine\n    path: boot():/boot/influx.elf\n    module_path: boot():/boot/initrd.tar\n    module_string: initrd\n";
     r = vfs_write_file("/mnt/.install-esp/limine.conf", conf, strlen(conf));
+    if (r < 0) { STEP(100, "Writing limine.conf failed (%d)", r); vfs_unmount("/mnt/.install-esp"); return r; }
+    if (esp_root->ops->sync && (r = esp_root->ops->sync(esp_root)) < 0) { STEP(100, "Writing the EFI partition failed (%d)", r); vfs_unmount("/mnt/.install-esp"); return r; }
     vfs_unmount("/mnt/.install-esp");
-    if (r < 0) { STEP(100, "Writing limine.conf failed (%d)", r); return r; }
     /* root volume contents */
     struct vnode *root_vn = btrfs_mount(rootp);
     if (!root_vn) { STEP(100, "Cannot mount the new root volume"); return -EIO; }
-    if ((r = vfs_mount("/mnt/.install-root", root_vn)) < 0) { STEP(100, "Cannot mount the new root volume (%d)", r); return r; }
+    if ((r = vfs_mount("/mnt/.install-root", root_vn)) < 0) { STEP(100, "Cannot mount the new root volume (%d)", r); btrfs_unmount(root_vn); return r; }
     STEP(74, "Creating home directory");
     r = vfs_write_file("/mnt/.install-root/.influx_root", "inFlux root volume\n", 19);
-    if (r == 0) r = copy_tree("/home/flux", "/mnt/.install-root/flux");
-    vfs_sync();
+    if (r < 0) STEP(100, "Writing the root volume marker failed (%d)", r);
+    else if ((r = copy_tree("/home/flux", "/mnt/.install-root/flux")) < 0) STEP(100, "Copying the home directory failed (%d)", r);
+    /* write-back errors of buffered btrfs data only show up here: sync the whole volume and check */
+    int s = root_vn->ops->sync(root_vn);
     vfs_unmount("/mnt/.install-root");
-    if (r < 0) { STEP(100, "Populating the root volume failed (%d)", r); return r; }
+    int s2 = btrfs_unmount(root_vn);
+    if (r == 0 && (s < 0 || s2 < 0)) { r = s < 0 ? s : s2; STEP(100, "Writing the root volume failed (%d)", r); }
+    if (r < 0) return r;
     STEP(90, "Installing BIOS boot code");
     if ((r = bios_install(disk, LBA_BIOS_START)) < 0) { STEP(100, "BIOS boot install failed (%d)", r); return r; }
+    if ((r = blockdev_flush(disk)) < 0) { STEP(100, "Flushing the disk cache failed (%d)", r); return r; }
     blockdev_rescan(disk);
     STEP(100, "Installation complete. Remove the installation medium and restart.");
     return 0;

@@ -286,7 +286,7 @@ static int ehci_submit(struct usb_xfer *x) {
     }
     for (uint32_t off = 0; r == 0 && (off < x->len || (!x->len && !q->control && !q->nq)); ) {
         uint32_t c = MIN(x->len - off, 5 * 4096 - ((phys + off) & 0xFFF));
-        if (off + c < x->len) c -= c % x->ep->mps;   /* only the last qTD may end in a short packet */
+        if (off + c < x->len) c -= c % (x->ep->mps ? x->ep->mps : 8);   /* only the last qTD may end in a short packet */
         if (q->nq >= MAXQTD - 1 || !qtd_new(e, q, phys + off, c, pid, 1, true)) r = -ENOMEM;
         off += c;
     }

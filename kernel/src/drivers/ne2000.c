@@ -10,8 +10,10 @@
  * PCI cards are interrupt driven (INTx routed through ACPI _PRT): the handler
  * masks the card and wakes the network thread, which drains the ring and
  * unmasks it again. The handler touches only ISR and IMR, which live in
- * register page 0, so the code that switches to page 1 runs with interrupts
- * off. ISA cards, and PCI cards whose line cannot be routed, are polled.
+ * register page 0; the code that switches to page 1 holds page_lock, and so
+ * does the handler (which may run on another CPU), so it never reads CURR or
+ * writes MAR7 by mistake. ISA cards, and PCI cards whose line cannot be
+ * routed, are polled.
  */
 #include "net.h"
 #include "arch.h"
@@ -85,7 +87,7 @@ struct ne2000 {
     int idle_polls;
     bool irq;             /* interrupt driven */
     uint64_t irqs;
-    spinlock_t page_lock; /* held while register page 1 is selected */
+    spinlock_t page_lock; /* held while register page 1 is selected, and by ne_irq */
     uint8_t rxbuf[ETH_FRAME_MAX + 64] ALIGNED(8);
     uint8_t txbuf[ETH_FRAME_MAX + 64] ALIGNED(8);
 };
@@ -193,8 +195,11 @@ static uint8_t ne_curr(struct ne2000 *ne) {
 /* interrupt context: quiet the card until the network thread has drained it */
 static void ne_irq(struct regs *r, void *ctx) {
     struct ne2000 *ne = ctx;
-    if (!(ne_in(ne, NE_ISR) & IMR_BITS)) return;   /* shared line, not us */
-    ne_out(ne, NE_IMR, 0);
+    spin_lock(&ne->page_lock);                     /* another CPU may have page 1 selected */
+    bool ours = ne_in(ne, NE_ISR) & IMR_BITS;
+    if (ours) ne_out(ne, NE_IMR, 0);
+    spin_unlock(&ne->page_lock);
+    if (!ours) return;                             /* shared line, not us */
     ne->irqs++;
     net_kick();
 }

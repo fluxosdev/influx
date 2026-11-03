@@ -73,8 +73,11 @@ static bool exchange(struct udp_sock *s, struct netif *n, struct dhcp_msg *m, si
     for (int attempt = 0; attempt < 4; attempt++) {
         udp_sendto_if(s, n, 0, 0xFFFFFFFF, 67, m, len);
         uint64_t deadline = time_ms() + timeout_ms;
-        while (time_ms() < deadline) {
-            int r = udp_recvfrom(s, buf, sizeof buf, NULL, NULL, deadline - time_ms());
+        for (;;) {
+            /* signed and checked here: a negative timeout would make udp_recvfrom wait forever */
+            int64_t left = (int64_t)(deadline - time_ms());
+            if (left <= 0) break;
+            int r = udp_recvfrom(s, buf, sizeof buf, NULL, NULL, (int)left);
             if (r < 0) break;
             if (parse(buf, r, xid, n->mac, l) && (l->type == want || l->type == DHCP_NAK)) return l->type == want;
         }
@@ -83,7 +86,8 @@ static bool exchange(struct udp_sock *s, struct netif *n, struct dhcp_msg *m, si
 }
 
 int dhcp_configure(struct netif *n, int timeout_ms) {
-    struct udp_sock *s = udp_open(68);
+    /* bound to this adapter, so every adapter can run its own client on port 68 */
+    struct udp_sock *s = udp_open_if(68, n);
     if (!s) return -EADDRINUSE;
     struct dhcp_msg *m = kmalloc(sizeof *m);
     uint32_t xid = (uint32_t)rdtsc() ^ ((uint32_t)n->mac[5] << 24);
@@ -115,9 +119,13 @@ int dhcp_configure(struct netif *n, int timeout_ms) {
 
 static void dhcp_thread(void *arg) {
     struct netif *n = arg;
-    for (int attempt = 0; attempt < 3; attempt++) {
+    for (int attempt = 0, busy = 0; attempt < 3;) {
         if (n->configured) return;
-        if (dhcp_configure(n, 8000) == 0) return;
+        int r = dhcp_configure(n, 8000);
+        if (r == 0) return;
+        /* port 68 on this adapter taken (the shell's dhcp command is running): wait for it rather than give up */
+        if (r == -EADDRINUSE && ++busy < 30) { thread_sleep_ms(1000); continue; }
+        attempt++;
     }
     kprintf("%s: no DHCP server answered; configure the adapter with ifconfig\n", n->name);
 }

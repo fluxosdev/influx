@@ -21,7 +21,7 @@ struct prdt_entry { uint32_t dba, dbau, res0; uint32_t dbc : 22, res1 : 9, i : 1
 struct cmd_table { uint8_t cfis[64], acmd[16], res[48]; struct prdt_entry prdt[16]; } PACKED;
 struct fis_h2d { uint8_t type, pmport : 4, res0 : 3, c : 1, command, featurel, lba0, lba1, lba2, device, lba3, lba4, lba5, featureh, countl, counth, icc, control, res1[4]; } PACKED;
 
-struct ahci_port { volatile struct hba_port *regs; struct cmd_header *clb; struct cmd_table *ctb; uint8_t *fb; int index; bool failed; };
+struct ahci_port { volatile struct hba_port *regs; struct cmd_header *clb; struct cmd_table *ctb; uint8_t *fb; int index; bool failed; uint32_t ss; uint8_t flush_cmd; };
 static volatile struct hba_mem *hba;
 
 #define PORT_CMD_ST  (1 << 0)
@@ -32,6 +32,7 @@ static volatile struct hba_mem *hba;
 #define ATA_WRITE_DMA_EXT 0x35
 #define ATA_IDENTIFY      0xEC
 #define ATA_FLUSH_EXT     0xEA
+#define ATA_FLUSH         0xE7
 
 static void port_stop(volatile struct hba_port *p) {
     p->cmd &= ~PORT_CMD_ST;
@@ -71,7 +72,7 @@ static int ahci_cmd(struct ahci_port *ap, uint8_t cmd, uint64_t lba, uint16_t co
     struct cmd_table *t = ap->ctb;
     memset(t, 0, sizeof *t);
     int nprd = 0;
-    uint64_t phys = V2P(buf);
+    uint64_t phys = buf ? V2P(buf) : 0;
     size_t left = bytes;
     while (left && nprd < 16) {
         size_t chunk = MIN(left, (size_t)(4 * 1024 * 1024 - 4096));
@@ -105,9 +106,9 @@ static int ahci_read(struct blockdev *d, uint64_t lba, uint32_t count, void *buf
     struct ahci_port *ap = d->priv; uint8_t *out = buf;
     while (count) {
         uint32_t n = MIN(count, 128u);
-        int r = ahci_cmd(ap, ATA_READ_DMA_EXT, lba, n, out, n * 512, false);
+        int r = ahci_cmd(ap, ATA_READ_DMA_EXT, lba, n, out, (size_t)n * ap->ss, false);
         if (r < 0) return r;
-        lba += n; out += n * 512; count -= n;
+        lba += n; out += (size_t)n * ap->ss; count -= n;
     }
     return 0;
 }
@@ -115,12 +116,14 @@ static int ahci_write(struct blockdev *d, uint64_t lba, uint32_t count, const vo
     struct ahci_port *ap = d->priv; const uint8_t *in = buf;
     while (count) {
         uint32_t n = MIN(count, 128u);
-        int r = ahci_cmd(ap, ATA_WRITE_DMA_EXT, lba, n, (void *)in, n * 512, true);
+        int r = ahci_cmd(ap, ATA_WRITE_DMA_EXT, lba, n, (void *)in, (size_t)n * ap->ss, true);
         if (r < 0) return r;
-        lba += n; in += n * 512; count -= n;
+        lba += n; in += (size_t)n * ap->ss; count -= n;
     }
     return 0;
 }
+/* non-data command: returns once the drive has written its volatile cache to the medium */
+static int ahci_flush(struct blockdev *d) { struct ahci_port *ap = d->priv; return ahci_cmd(ap, ap->flush_cmd, 0, 0, NULL, 0, false); }
 
 static void ata_string(const uint16_t *w, int words, char *out) {
     for (int i = 0; i < words; i++) { out[i * 2] = w[i] >> 8; out[i * 2 + 1] = w[i] & 0xFF; }
@@ -150,8 +153,14 @@ static void init_port(int i) {
     ata_string(id + 27, 20, d->model);
     uint64_t sectors = *(uint64_t *)(id + 100);
     if (!sectors) sectors = *(uint32_t *)(id + 60);
-    d->sectors = sectors; d->sector_size = 512;
-    d->read = ahci_read; d->write = ahci_write; d->priv = ap; d->bus = "SATA";
+    /* word 106 (valid when bits 15:14 = 01): bit 12 = logical sector longer than 256 words, size in words 117-118 */
+    uint32_t ss = 512;
+    if ((id[106] & 0xC000) == 0x4000 && (id[106] & (1 << 12))) ss = (id[117] | (uint32_t)id[118] << 16) * 2;
+    if (ss < 512 || ss > 65536 || (ss & (ss - 1))) { kprintf("ahci: port %d (%s): logical sector size %u not supported, disk ignored\n", i, d->model, ss); kfree(id); kfree(d); return; }
+    ap->ss = ss;
+    ap->flush_cmd = (id[83] & 0xC000) == 0x4000 && (id[83] & (1 << 13)) ? ATA_FLUSH_EXT : ATA_FLUSH;
+    d->sectors = sectors; d->sector_size = ss;
+    d->read = ahci_read; d->write = ahci_write; d->flush = ahci_flush; d->priv = ap; d->bus = "SATA";
     kfree(id);
     blockdev_register(d);
 }

@@ -116,10 +116,13 @@ int dns_resolve(const char *name, uint32_t *ip, int timeout_ms, volatile bool *c
         if (cancel && *cancel) { r = -ECANCELED; break; }
         udp_sendto(s, server, 53, q, qlen);
         uint64_t try_end = MIN(deadline, time_ms() + per_try);
-        while (time_ms() < try_end) {
+        for (;;) {
             if (cancel && *cancel) { r = -ECANCELED; break; }
+            /* signed and checked here: a negative timeout would make udp_recvfrom wait forever */
+            int64_t left = (int64_t)(try_end - time_ms());
+            if (left <= 0) break;
             uint32_t from; uint16_t port;
-            int got = udp_recvfrom(s, reply, sizeof reply, &from, &port, MIN(100, (int)(try_end - time_ms())));
+            int got = udp_recvfrom(s, reply, sizeof reply, &from, &port, (int)MIN(left, 100));
             if (got < 0) continue;
             if (from != server || port != 53) continue;
             uint32_t ttl = 0;

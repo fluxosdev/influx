@@ -1,5 +1,7 @@
 .section .text
-/* void context_switch(uint64_t *old_rsp, uint64_t new_rsp) */
+/* void context_switch(uint64_t *old_rsp, uint64_t new_rsp)
+ * RFLAGS is per thread too: a flag left over from one thread (NT, AC) must
+ * not reach another's iretq. Callers have interrupts off, so IF is 0 in both. */
 .global context_switch
 context_switch:
     pushq %rbp
@@ -8,8 +10,10 @@ context_switch:
     pushq %r13
     pushq %r14
     pushq %r15
+    pushfq
     movq %rsp, (%rdi)
     movq %rsi, %rsp
+    popfq
     popq %r15
     popq %r14
     popq %r13

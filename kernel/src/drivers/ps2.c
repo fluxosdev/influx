@@ -127,9 +127,14 @@ static void mouse_irq(struct regs *r, void *ctx) {
     }
 }
 
+/* drain the output buffer; bounded, since a missing controller reads as 0xFF (always "full") */
+static void ps2_flush(void) { for (int i = 0; i < 64 && (inb(0x64) & 1); i++) inb(0x60); }
+
 void ps2_init(void) {
+    /* legacy-free boards have no 8042: the status port floats to 0xFF */
+    if (inb(0x64) == 0xFF) { kprintf("ps2: no controller (status reads 0xFF), skipping\n"); return; }
     ps2_cmd(0xAD); ps2_cmd(0xA7);          /* disable both ports */
-    while (inb(0x64) & 1) inb(0x60);      /* flush */
+    ps2_flush();
     ps2_cmd(0x20); uint8_t cfg = ps2_read_data();
     cfg |= 0x03;                          /* enable IRQ1 + IRQ12 */
     cfg &= ~0x30;                         /* clocks on */
@@ -146,7 +151,7 @@ void ps2_init(void) {
     mouse_cmd(0xF3); mouse_cmd(100);     /* sample rate */
     mouse_cmd(0xE8); mouse_cmd(2);       /* resolution 4 counts/mm */
     mouse_cmd(0xF4);                     /* enable streaming */
-    while (inb(0x64) & 1) inb(0x60);
+    ps2_flush();
     irq_register(IRQ_BASE + IRQ_KEYBOARD, keyboard_irq, NULL);
     irq_register(IRQ_BASE + IRQ_MOUSE, mouse_irq, NULL);
     ioapic_route_irq(IRQ_KEYBOARD, IRQ_BASE + IRQ_KEYBOARD);

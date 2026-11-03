@@ -14,7 +14,7 @@ struct cbw { uint32_t sig, tag, len; uint8_t flags, lun, cblen, cb[16]; } PACKED
 struct csw { uint32_t sig, tag, residue; uint8_t status; } PACKED;
 
 struct msc;
-struct msc_lun { struct msc *m; int lun; struct blockdev *bd; };
+struct msc_lun { struct msc *m; int lun; struct blockdev *bd; bool no_sync; };
 struct msc {
     struct usb_device *dev;
     struct usb_endpoint *in, *out;
@@ -110,6 +110,27 @@ static int msc_io(struct blockdev *d, uint64_t lba, uint32_t count, void *buf, b
 }
 static int msc_read(struct blockdev *d, uint64_t lba, uint32_t count, void *buf) { return msc_io(d, lba, count, buf, false); }
 static int msc_write(struct blockdev *d, uint64_t lba, uint32_t count, const void *buf) { return msc_io(d, lba, count, (void *)buf, true); }
+/* SYNCHRONIZE CACHE (10) over the whole LUN. Many sticks have no write cache and reject it: ILLEGAL
+ * REQUEST (or a failure without sense data) means unsupported, which counts as success from then on. */
+static int msc_flush(struct blockdev *d) {
+    struct msc_lun *l = d->priv;
+    struct msc *m = l->m;
+    if (l->no_sync) return 0;
+    int r = 0;
+    mutex_lock(&m->lock);
+    for (int tries = 0; tries < 3; tries++) {
+        if (m->gone) { r = -ENODEV; break; }
+        uint8_t cb[10] = { 0x35 };
+        r = bot_cmd(m, l->lun, cb, 10, NULL, 0, false, 30000);
+        if (r != -EIO) break;
+        int sense = request_sense(m, l->lun);
+        if (sense < 0) break;
+        if ((sense >> 16) == 5 || (sense >> 16) == 0) { l->no_sync = true; r = 0; kprintf("usb-storage: %s: SYNCHRONIZE CACHE not supported (sense %06x)\n", d->name, sense); break; }
+        if ((sense >> 16) != 6 && (sense >> 16) != 2) { kprintf("usb-storage: %s: SYNCHRONIZE CACHE failed, sense %06x\n", d->name, sense); break; }   /* only retry unit attention / not ready */
+    }
+    mutex_unlock(&m->lock);
+    return r < 0 ? (r == -ENODEV ? r : -EIO) : 0;
+}
 
 static void trim(char *s) { int n = strlen(s); while (n && s[n - 1] == ' ') s[--n] = 0; }
 
@@ -168,7 +189,7 @@ static void lun_init(struct msc *m, int lun) {
     blockdev_alloc_name("sd", d->name, sizeof d->name);
     strlcpy(d->model, model, sizeof d->model);
     d->sectors = blocks; d->sector_size = bs;
-    d->read = msc_read; d->write = msc_write; d->priv = l; d->bus = "USB";
+    d->read = msc_read; d->write = msc_write; d->flush = msc_flush; d->priv = l; d->bus = "USB";
     l->bd = d;
     blockdev_register(d);   /* reads the partition table through msc_io, which takes m->lock */
     storage_mount(d);

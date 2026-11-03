@@ -10,7 +10,9 @@ static const uint32_t bucket_sizes[NBUCKETS] = { 32, 64, 128, 256, 512, 1024, 20
 #define HDR_MAGIC 0x4B48
 #define LARGE_MAGIC 0x4C47
 
-struct hdr { uint16_t magic; uint8_t bucket; uint8_t pad; uint16_t pid; uint16_t pad2; uint32_t size; uint32_t npages; };
+struct hdr { uint16_t magic; uint8_t bucket; uint8_t pad; int32_t pid; uint32_t size; uint32_t npages; };   /* 16 bytes */
+_Static_assert(sizeof(struct hdr) == 16, "heap header must keep 16-byte alignment");
+#define KMALLOC_MAX (1UL << 31)   /* size is stored in 32 bits */
 struct freeblk { struct freeblk *next; };
 
 static struct freeblk *freelist[NBUCKETS];
@@ -30,8 +32,9 @@ static void account(int pid, int64_t delta) {
     procs_unlock();
 }
 
-static void refill(int b) {
-    uint64_t phys = pmm_alloc_pages(SLAB_PAGES);
+static bool refill(int b, bool may_fail) {
+    uint64_t phys = may_fail ? pmm_alloc_pages_try(SLAB_PAGES) : pmm_alloc_pages(SLAB_PAGES);
+    if (!phys) return false;
     total_bytes += SLAB_PAGES * PAGE_SIZE;
     uint8_t *base = P2V(phys);
     uint32_t stride = bucket_sizes[b];
@@ -40,15 +43,18 @@ static void refill(int b) {
         f->next = freelist[b];
         freelist[b] = f;
     }
+    return true;
 }
 
-void *kmalloc(size_t n) {
+static void *alloc(size_t n, bool may_fail) {
     if (n == 0) n = 1;
+    if (n > KMALLOC_MAX) { if (may_fail) return NULL; panic("kmalloc: %zu bytes is too large", n); }
     size_t need = n + sizeof(struct hdr);
     int pid = current_thread && current_thread->proc ? current_thread->proc->pid : 0;
     if (need > bucket_sizes[NBUCKETS - 1]) {
         size_t pages = PAGE_ALIGN_UP(need) / PAGE_SIZE;
-        uint64_t phys = pmm_alloc_pages(pages);
+        uint64_t phys = may_fail ? pmm_alloc_pages_try(pages) : pmm_alloc_pages(pages);
+        if (!phys) return NULL;
         struct hdr *h = P2V(phys);
         h->magic = LARGE_MAGIC; h->npages = pages; h->size = n; h->pid = pid;
         spin_lock(&lock); used_bytes += pages * PAGE_SIZE; total_bytes += pages * PAGE_SIZE; spin_unlock(&lock);
@@ -58,7 +64,7 @@ void *kmalloc(size_t n) {
     int b = 0;
     while (bucket_sizes[b] < need) b++;
     spin_lock(&lock);
-    if (!freelist[b]) refill(b);
+    if (!freelist[b] && !refill(b, may_fail)) { spin_unlock(&lock); return NULL; }
     struct freeblk *f = freelist[b];
     freelist[b] = f->next;
     used_bytes += bucket_sizes[b];
@@ -92,18 +98,24 @@ void kfree(void *p) {
     spin_unlock(&lock);
 }
 
+void *kmalloc(size_t n) { return alloc(n, false); }
+void *kmalloc_try(size_t n) { return alloc(n, true); }
 void *kzalloc(size_t n) { void *p = kmalloc(n); if (p) memset(p, 0, n); return p; }
-void *kcalloc(size_t a, size_t b) { return kzalloc(a * b); }
-void *krealloc(void *p, size_t n) {
-    if (!p) return kmalloc(n);
+void *kzalloc_try(size_t n) { void *p = kmalloc_try(n); if (p) memset(p, 0, n); return p; }
+void *kcalloc(size_t a, size_t b) { if (b && a > SIZE_MAX / b) panic("kcalloc: %zu x %zu overflows", a, b); return kzalloc(a * b); }
+static void *realloc_impl(void *p, size_t n, bool may_fail) {
+    if (!p) return alloc(n, may_fail);
     struct hdr *h = (struct hdr *)p - 1;
     size_t cap = h->magic == LARGE_MAGIC ? h->npages * PAGE_SIZE - sizeof(struct hdr) : bucket_sizes[h->bucket] - sizeof(struct hdr);
     if (n <= cap) { h->size = n; return p; }
-    void *np = kmalloc(n);
+    void *np = alloc(n, may_fail);
+    if (!np) return NULL;   /* the old block is untouched */
     memcpy(np, p, h->size < n ? h->size : n);
     kfree(p);
     return np;
 }
+void *krealloc(void *p, size_t n) { return realloc_impl(p, n, false); }
+void *krealloc_try(void *p, size_t n) { return realloc_impl(p, n, true); }
 char *kstrdup(const char *s) { return strdup(s); }
 uint64_t heap_used_bytes(void) { return used_bytes; }
 uint64_t heap_total_bytes(void) { return total_bytes; }

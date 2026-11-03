@@ -16,6 +16,7 @@ static LIST_HEAD(sleep_list);
 static LIST_HEAD(all_threads);
 static LIST_HEAD(all_processes);
 static int next_tid = 1, next_pid = 1;
+static int user_procs;   /* user processes created and not yet freed */
 /* sched_lock: the run queue, the sleep list, wait queues and thread state.
  * schedule() holds it across context_switch and the thread switched to drops
  * it (finish_switch), so no other CPU can pick a thread up before its
@@ -127,12 +128,13 @@ static struct thread *alloc_thread(struct process *p, const char *name) {
     *(uint64_t *)t->kstack_base = STACK_CANARY;
     t->state = THREAD_READY;
     t->slice = TIME_SLICE;
-    /* initial frame consumed by context_switch: 6 callee-saved regs + return address.
+    /* initial frame consumed by context_switch: rflags, 6 callee-saved regs + return address.
      * Start 8 bytes below the top so the trampoline runs with the SysV stack
      * alignment a 'call' would have produced (SSE code relies on it). */
     uint64_t *sp = (uint64_t *)(t->kstack_top - 8);
     *--sp = (uint64_t)thread_trampoline;
     for (int i = 0; i < 6; i++) *--sp = 0;
+    *--sp = 0x2;   /* rflags: IF off until the trampoline's sti, NT/AC clear */
     t->rsp = (uint64_t)sp;
     t->fpu = fpu_state_alloc(&t->fpu_mem);     /* sane initial FPU/SSE/AVX state */
     list_init(&t->sched_link);
@@ -178,6 +180,8 @@ struct process *process_create(const char *name, bool user) {
     list_init(&p->threads);
     waitq_init(&p->exit_wq);
     p->parent = current_thread ? current_thread->proc : NULL;
+    p->ppid = p->parent ? p->parent->pid : 0;
+    if (user) __atomic_fetch_add(&user_procs, 1, __ATOMIC_RELAXED);
     procs_lock();
     list_add_tail(&p->all_link, &all_processes);
     procs_unlock();
@@ -342,19 +346,34 @@ void thread_sleep_ms(uint64_t ms) {
 
 bool thread_should_exit(void) { return current_thread->kill_pending; }
 
+/* p is ready to reap: wake anyone in process_wait() on it */
+void process_mark_exited(struct process *p) {
+    spin_lock(&exit_lock);
+    p->exited = true;
+    waitq_wake_all(&p->exit_wq);
+    spin_unlock(&exit_lock);
+}
+int process_user_count(void) { return __atomic_load_n(&user_procs, __ATOMIC_RELAXED); }
+
 /* The last thread out releases the process's resources (which may block),
  * leaves its address space and only then, with every other thread already
  * unlinked, marks it exited: from there the reaper on another CPU may free
- * the page tables and the process. */
+ * the page tables and the process. So once a thread is unlinked it must not
+ * be preempted (a tick would requeue it, and its next schedule-in would
+ * load the freed page tables): interrupts stay off from there to the zombie
+ * state, and it is already off the process's address space. */
 void thread_exit(int code) {
     struct thread *t = current_thread;
     struct process *p = t->proc;
     t->exit_code = code;
+    uint64_t f = irq_save();
+    vmm_switch(vmm_kernel_pml4());
     procs_lock();
     bool last = --p->nthreads == 0 && p != kernel_process;
     if (!last) { list_del(&t->all_link); list_del(&t->proc_link); }
-    procs_unlock();
+    procs_unlock();   /* interrupts stay off: they were when it saved them */
     if (last) {
+        irq_restore(f);   /* still linked: may block, and be preempted (which reloads p's page tables) */
         if (!p->exit_code) p->exit_code = code;
         for (int i = 0; i < MAX_FDS; i++) if (p->fds[i]) { vfs_close(p->fds[i]); p->fds[i] = NULL; }
         process_close_windows(p);
@@ -364,12 +383,8 @@ void thread_exit(int code) {
         list_del(&t->all_link);
         list_del(&t->proc_link);
         procs_unlock();
-        spin_lock(&exit_lock);
-        p->exited = true;
-        waitq_wake_all(&p->exit_wq);
-        spin_unlock(&exit_lock);
+        process_mark_exited(p);
     }
-    cli();
     spin_acquire(&sched_lock);
     t->state = THREAD_ZOMBIE;
     spin_release(&sched_lock);
@@ -429,15 +444,16 @@ static void process_free(struct process *p) {
     list_del(&p->all_link);
     procs_unlock();
     if (p->pml4) vmm_free_pml4(p->pml4);
+    if (p->is_user) __atomic_fetch_sub(&user_procs, 1, __ATOMIC_RELAXED);
     kfree(p);
 }
 
-/* Only one caller may claim (and free) a process; user processes may only reap user processes. */
+/* Only one caller may claim (and free) a process; user processes may only reap their own children. */
 int process_wait(int pid, int *status) {
     struct process *self = current_thread->proc;
     procs_lock();
     struct process *p = find_locked(pid);
-    bool ok = p && p != kernel_process && p != self && !p->reaping && (!self->is_user || p->is_user);
+    bool ok = p && p != kernel_process && p != self && !p->reaping && (!self->is_user || (p->is_user && p->ppid == self->pid));
     if (ok) p->reaping = true;
     procs_unlock();
     if (!ok) return -1;

@@ -50,7 +50,8 @@ void pmm_init(void) {
     kprintf("pmm: %lu MiB usable, bitmap %lu KiB at %lx\n", (uint64_t)(total_pages * PAGE_SIZE / (1024 * 1024)), (uint64_t)(bm_size / 1024), bm_phys);
 }
 
-uint64_t pmm_alloc_pages(size_t count) {
+/* 0 when no contiguous run of 'count' free pages exists (page 0 is never handed out) */
+uint64_t pmm_alloc_pages_try(size_t count) {
     if (!count) return 0;
     spin_lock(&lock);
     for (int pass = 0; pass < 2; pass++) {
@@ -70,7 +71,13 @@ uint64_t pmm_alloc_pages(size_t count) {
         }
     }
     spin_unlock(&lock);
-    panic("pmm: out of memory (%zu pages requested, %lu free)", count, free_pages);
+    return 0;
+}
+uint64_t pmm_alloc_pages(size_t count) {
+    if (!count) return 0;
+    uint64_t phys = pmm_alloc_pages_try(count);
+    if (!phys) panic("pmm: out of memory (%zu pages requested, %lu free)", count, free_pages);
+    return phys;
 }
 uint64_t pmm_alloc_page(void) { return pmm_alloc_pages(1); }
 

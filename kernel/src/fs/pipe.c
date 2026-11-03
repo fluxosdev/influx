@@ -8,6 +8,7 @@ struct pipe { char *buf; int head, tail, count; spinlock_t lock; struct waitq rd
 
 static int64_t pipe_read(struct vnode *v, uint64_t off, void *buf, size_t n) {
     struct pipe *p = v->priv; char *out = buf; size_t got = 0;
+    if (n == 0) return 0;   /* read(fd, buf, 0) must not block */
     spin_lock(&p->lock);
     while (p->count == 0 && p->writers > 0 && !thread_should_exit()) waitq_wait(&p->rd_wq, &p->lock);
     while (got < n && p->count > 0) { out[got++] = p->buf[p->head]; p->head = (p->head + 1) % PIPE_SIZE; p->count--; }

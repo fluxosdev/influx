@@ -296,8 +296,10 @@ static void store_named(struct state *s, struct aml_node *node, struct aml_obj *
     case AML_BUFFER: {   /* in place, so buffer fields created on it keep working */
         struct aml_obj *b = obj_to_buffer(v);
         if (!b) { fail(s, "cannot store a %s into a Buffer", obj_type_name(v->type)); break; }
-        memset(cur->buf.b, 0, cur->buf.len);
-        memcpy(cur->buf.b, b->buf.b, MIN(b->buf.len, cur->buf.len));
+        if (b != cur) {   /* storing a buffer into itself: already there (zeroing first would lose it) */
+            memset(cur->buf.b, 0, cur->buf.len);
+            memcpy(cur->buf.b, b->buf.b, MIN(b->buf.len, cur->buf.len));
+        }
         obj_put(b);
         break;
     }
@@ -374,7 +376,12 @@ static void store_raw(struct state *s, struct aml_obj *t, struct aml_obj *val) {
     case REF_NULL: return;
     case REF_DEBUG: debug_print(val); return;
     case REF_ARG:
-        if (*t->ref.slot && (*t->ref.slot)->type == AML_REFERENCE) { store(s, *t->ref.slot, val); return; }
+        if (*t->ref.slot && (*t->ref.slot)->type == AML_REFERENCE) {   /* through the reference the Arg holds */
+            static int hops;   /* bounded like aml_value_of: Arg0 = RefOf(Arg0) makes a cycle */
+            if (hops >= 8) { fail(s, "reference chain too long (a reference cycle?)"); return; }
+            hops++; store(s, *t->ref.slot, val); hops--;
+            return;
+        }
         /* fallthrough */
     case REF_LOCAL: { struct aml_obj *c = obj_copy(val); obj_put(*t->ref.slot); *t->ref.slot = c; return; }
     case REF_NAMED: store_named(s, t->ref.node, val, false); return;
@@ -745,7 +752,7 @@ static struct aml_obj *op_load(struct state *s) {
     struct aml_node *node = resolve(s, &n, true);
     struct aml_obj *t = parse_target(s);
     bool ok = false;
-    if (node && node->obj && node->obj->type == AML_REGION && node->obj->region.space == SPACE_MEMORY) {
+    if (node && node->obj && node->obj->type == AML_REGION && node->obj->region.space == SPACE_MEMORY && node->obj->region.len >= 36) {
         uint64_t base = node->obj->region.base;
         uint32_t *hdr = acpi_map_phys(base, 36);
         uint32_t len = hdr[1];
@@ -880,6 +887,122 @@ static struct aml_obj *eval(struct state *s) {
  * MAX_DEPTH bounds the stack (about 200 bytes a level) whatever the nesting */
 static struct aml_obj *eval2(struct state *s) { depth++; struct aml_obj *r = eval(s); depth--; return r; }
 
+/* ---- resynchronising after a failed term at table load ----
+ * As ACPICA, a term that fails while a table loads is skipped and loading
+ * goes on with the next one. A failure can leave the position anywhere in
+ * the term, so its end is found by re-parsing it from its start without
+ * executing anything. A method call takes as many arguments as the method
+ * declares, so a name in argument position must resolve; anything this
+ * cannot size (unresolved name, unknown opcode) gives up and the caller
+ * skips the rest of the enclosing block instead. */
+struct skip { const uint8_t *p, *end; struct aml_node *scope; int depth; };
+static bool sk_bytes(struct skip *k, size_t n) { if ((size_t)(k->end - k->p) < n) return false; k->p += n; return true; }
+static bool sk_pkg(struct skip *k) {   /* at a PkgLength: to the end of what it covers */
+    const uint8_t *start = k->p;
+    if (k->p >= k->end) return false;
+    int n = *k->p >> 6;
+    if (k->end - k->p < n + 1) return false;
+    uint32_t len = n ? *k->p & 0x0F : *k->p & 0x3F;
+    for (int i = 0; i < n; i++) len |= (uint32_t)k->p[1 + i] << (4 + 8 * i);
+    if (len < (uint32_t)n + 1 || len > (size_t)(k->end - start)) return false;
+    k->p = start + len;
+    return true;
+}
+static bool sk_name(struct skip *k, struct name *n) {
+    n->root = false; n->up = 0;
+    if (k->p < k->end && *k->p == '\\') { n->root = true; k->p++; }
+    else while (k->p < k->end && *k->p == '^') { n->up++; k->p++; }
+    if (k->p >= k->end) return false;
+    uint8_t c = *k->p;
+    if (c == 0x00) { n->nseg = 0; k->p++; }
+    else if (c == 0x2E) { n->nseg = 2; k->p++; }
+    else if (c == 0x2F) { if (k->end - k->p < 2) return false; n->nseg = k->p[1]; k->p += 2; }
+    else if (name_lead(c)) n->nseg = 1;
+    else return false;
+    n->segs = k->p;
+    return sk_bytes(k, (size_t)n->nseg * 4);
+}
+static bool sk_term(struct skip *k);
+static bool sk_args(struct skip *k, int n) { while (n-- > 0) if (!sk_term(k)) return false; return true; }
+static bool sk_super(struct skip *k) {   /* SuperName / Target: a plain name here is not a call */
+    struct name n;
+    if (k->p < k->end && *k->p == 0x00) { k->p++; return true; }
+    if (k->p < k->end && name_start(*k->p)) return sk_name(k, &n);
+    return sk_term(k);
+}
+static bool sk_ext(struct skip *k) {
+    struct name n;
+    if (k->p >= k->end) return false;
+    switch (*k->p++) {
+    case 0x30: case 0x31: case 0x33: return true;                                     /* Revision, Debug, Timer */
+    case 0x01: return sk_name(k, &n) && sk_bytes(k, 1);                               /* Mutex */
+    case 0x02: return sk_name(k, &n);                                                 /* Event */
+    case 0x12: return sk_super(k) && sk_super(k);                                     /* CondRefOf */
+    case 0x13: return sk_args(k, 3) && sk_name(k, &n);                                /* CreateField */
+    case 0x80: return sk_name(k, &n) && sk_bytes(k, 1) && sk_args(k, 2);              /* OperationRegion */
+    case 0x88: return sk_name(k, &n) && sk_args(k, 3);                                /* DataTableRegion */
+    case 0x81: case 0x82: case 0x83: case 0x84: case 0x85: case 0x86: case 0x87: return sk_pkg(k);
+    case 0x21: case 0x22: return sk_term(k);                                          /* Stall, Sleep */
+    case 0x24: case 0x26: case 0x27: case 0x2A: return sk_super(k);                   /* Signal, Reset, Release, Unload */
+    case 0x23: return sk_super(k) && sk_bytes(k, 2);                                  /* Acquire */
+    case 0x25: return sk_super(k) && sk_term(k);                                      /* Wait */
+    case 0x28: case 0x29: return sk_term(k) && sk_super(k);                           /* FromBCD, ToBCD */
+    case 0x32: return sk_bytes(k, 5) && sk_term(k);                                   /* Fatal */
+    case 0x1F: return sk_args(k, 6);                                                  /* LoadTable */
+    case 0x20: return sk_name(k, &n) && sk_super(k);                                  /* Load */
+    }
+    return false;
+}
+static bool sk_op(struct skip *k, uint8_t op) {
+    struct name n;
+    switch (op) {
+    case 0x00: case 0x01: case 0xFF: case 0xA3: case 0xCC: case 0xA5: case 0x9F: return true;
+    case 0x0A: return sk_bytes(k, 1);
+    case 0x0B: return sk_bytes(k, 2);
+    case 0x0C: return sk_bytes(k, 4);
+    case 0x0E: return sk_bytes(k, 8);
+    case 0x0D: while (k->p < k->end && *k->p) k->p++; return sk_bytes(k, 1);
+    case 0x10: case 0x11: case 0x12: case 0x13: case 0x14: case 0xA0: case 0xA1: case 0xA2: return sk_pkg(k);
+    case 0x08: return sk_name(k, &n) && sk_term(k);                                   /* Name */
+    case 0x06: return sk_name(k, &n) && sk_name(k, &n);                               /* Alias */
+    case 0x15: return sk_name(k, &n) && sk_bytes(k, 2);                               /* External */
+    case 0x8A: case 0x8B: case 0x8C: case 0x8D: case 0x8F: return sk_args(k, 2) && sk_name(k, &n);
+    case 0x70: case 0x9D: case 0x80: case 0x81: case 0x82: case 0x96: case 0x97: case 0x98: case 0x99: return sk_term(k) && sk_super(k);
+    case 0x71: case 0x75: case 0x76: case 0x87: case 0x8E: return sk_super(k);
+    case 0x86: return sk_super(k) && sk_term(k);                                      /* Notify */
+    case 0x72: case 0x73: case 0x74: case 0x77: case 0x79: case 0x7A: case 0x7B: case 0x7C: case 0x7D:
+    case 0x7E: case 0x7F: case 0x84: case 0x85: case 0x88: case 0x9C: return sk_args(k, 2) && sk_super(k);
+    case 0x78: return sk_args(k, 2) && sk_super(k) && sk_super(k);                    /* Divide */
+    case 0x9E: return sk_args(k, 3) && sk_super(k);                                   /* Mid */
+    case 0x83: case 0x92: case 0xA4: return sk_term(k);                               /* DerefOf, LNot, Return */
+    case 0x90: case 0x91: case 0x93: case 0x94: case 0x95: return sk_args(k, 2);
+    case 0x89: return sk_term(k) && sk_bytes(k, 1) && sk_term(k) && sk_bytes(k, 1) && sk_args(k, 2);   /* Match */
+    case 0x5B: return sk_ext(k);
+    }
+    return false;
+}
+static __attribute__((noinline)) int sk_argc(struct skip *k) {   /* a name in argument position: -1 if it does not resolve */
+    struct name n; struct state t = { .scope = k->scope };
+    struct aml_node *node = sk_name(k, &n) ? resolve(&t, &n, true) : NULL;
+    return !node ? -1 : node->obj && node->obj->type == AML_METHOD ? node->obj->method.flags & 7 : 0;
+}
+static bool sk_term(struct skip *k) {
+    if (k->p >= k->end || k->depth >= 32) return false;
+    uint8_t op = *k->p;
+    bool ok;
+    k->depth++;
+    if (name_start(op)) { int argc = sk_argc(k); ok = argc >= 0 && sk_args(k, argc); }   /* a method call takes its arguments */
+    else { k->p++; ok = (op >= 0x60 && op <= 0x6E) || sk_op(k, op); }
+    k->depth--;
+    return ok;
+}
+/* the end of the term at start, or NULL if it cannot be determined */
+static const uint8_t *term_end(struct state *s, const uint8_t *start, const uint8_t *end) {
+    struct skip k = { start, end, s->scope, 0 };
+    return sk_term(&k) && k.p > start && k.p <= end ? k.p : NULL;
+}
+static const uint8_t *load_base;   /* the table being loaded, for offsets in messages */
+
 /* ---- definitions ---- */
 static void run_block(struct state *s, struct aml_node *scope, const uint8_t *end) {
     struct aml_node *saved = s->scope;
@@ -969,18 +1092,26 @@ static void def_region(struct state *s, bool data_table) {
     if (data_table) {   /* DataTableRegion(name, signature, OEM ID, OEM table ID) */
         struct aml_obj *a[3];
         for (int i = 0; i < 3; i++) a[i] = eval_value(s);
-        char sig[5];
-        for (int i = 0; s->status == ST_OK && a[0]->type == AML_STRING && acpi_table_at(i, sig); i++) {
+        char sig[5]; bool found = false;
+        for (int i = 0; s->status == ST_OK && a[0]->type == AML_STRING && a[0]->str.len >= 4 && acpi_table_at(i, sig); i++) {
             const uint8_t *tbl = acpi_table_at(i, sig);
             if (memcmp(sig, a[0]->str.s, 4)) continue;
             r->region.space = SPACE_MEMORY; r->region.base = V2P(tbl); r->region.len = *(const uint32_t *)(tbl + 4);
+            found = true;
             break;
         }
+        /* no such table: a region of length 0, so every access to its fields is refused */
+        if (!found && s->status == ST_OK) { char b[64]; name_str(&n, b, sizeof b); kprintf("acpi: DataTableRegion %s: table not found, unusable\n", b); r->region.space = SPACE_NONE; }
         for (int i = 0; i < 3; i++) obj_put(a[i]);
     } else {
         r->region.space = u8(s);
         r->region.base = eval_int(s);
         r->region.len = eval_int(s);
+        if (r->region.base + r->region.len < r->region.base) {   /* wraps: unusable, as a missing data table */
+            char b[64]; name_str(&n, b, sizeof b);
+            kprintf("acpi: OperationRegion %s [0x%lx + 0x%lx] wraps around, unusable\n", b, r->region.base, r->region.len);
+            r->region.len = 0;
+        }
     }
     bool existed;
     struct aml_node *node = s->status == ST_OK ? create_node(s, &n, &existed) : NULL;
@@ -989,6 +1120,7 @@ static void def_region(struct state *s, bool data_table) {
     node->obj = r;
 }
 
+#define FIELD_MAX_BITS (1u << 23)   /* 1 MiB: field_read buffers the whole field */
 static void parse_field_list(struct state *s, const uint8_t *end, struct aml_obj *tmpl) {
     uint64_t bit = 0;
     uint8_t flags = tmpl->field.flags, attrib = 0;
@@ -1006,6 +1138,11 @@ static void parse_field_list(struct state *s, const uint8_t *end, struct aml_obj
             struct name n = { false, 0, 1, s->p };
             s->p += 4;
             uint32_t len = pkglen(s);
+            if (s->status != ST_OK) return;
+            if (len > FIELD_MAX_BITS) { kprintf("acpi: field %.4s of %u bits ignored\n", (const char *)n.segs, len); bit += len; continue; }
+            struct aml_node *rn = tmpl->field.kind != FIELD_INDEX ? ns_resolve_alias(tmpl->field.region) : NULL;
+            if (rn && rn->obj && rn->obj->type == AML_REGION && (bit + len + 7) / 8 > rn->obj->region.len)   /* accesses will be refused */
+                kprintf("acpi: field %.4s [bit %lu + %u] lies beyond its %lu-byte region %.4s\n", (const char *)n.segs, bit, len, rn->obj->region.len, rn->name);
             bool existed;
             struct aml_node *node = create_node(s, &n, &existed);
             if (node && !(existed && node->obj)) {
@@ -1199,7 +1336,14 @@ static void exec_term(struct state *s) {
 static void exec_list(struct state *s, const uint8_t *end) {
     const uint8_t *saved = s->end;
     if (end < s->end) s->end = end;
-    while (s->p < end && s->status == ST_OK) exec_term(s);
+    while (s->p < s->end && s->status == ST_OK) {
+        const uint8_t *start = s->p;
+        exec_term(s);
+        if (s->status != ST_ERROR || s->f) continue;   /* in a method, an error aborts it */
+        const uint8_t *next = term_end(s, start, s->end);   /* table load: skip just the failed term */
+        if (!next) { kprintf("acpi: %s: cannot size the failed term at 0x%lx, skipping the rest of its block\n", load_what, (uint64_t)(start - load_base)); break; }
+        s->p = next; s->status = ST_OK;
+    }
     s->end = saved;
 }
 
@@ -1217,18 +1361,21 @@ int aml_load_table(const void *table, size_t len, const char *what) {
     uint8_t *copy = kmalloc(len);   /* methods point into it: kept forever */
     memcpy(copy, table, len);
     if (nloaded < loaded_cap) { loaded[nloaded].copy = copy; loaded[nloaded].len = len; nloaded++; }
-    const char *saved = load_what;
-    load_what = what;
-    int before = aml_errors;
+    const char *saved = load_what; const uint8_t *saved_base = load_base;
+    load_what = what; load_base = copy;
     struct state s = { .p = copy + 36, .end = copy + len, .scope = aml_root };
     while (s.p < s.end) {
+        const uint8_t *start = s.p;
         exec_term(&s);
-        if (s.status == ST_ERROR) { kprintf("acpi: %s: giving up at offset 0x%lx\n", what, (uint64_t)(s.p - copy)); break; }
-        s.status = ST_OK;   /* a stray Return/Break at table level */
+        if (s.status == ST_OK) continue;
+        /* a failed term (as in exec_list), or a stray Return/Break that may have stopped inside one */
+        const uint8_t *next = term_end(&s, start, s.end);
+        if (!next) { kprintf("acpi: %s: cannot size the term at 0x%lx, giving up\n", what, (uint64_t)(start - copy)); break; }
+        s.p = next; s.status = ST_OK;
     }
-    load_what = saved;
+    load_what = saved; load_base = saved_base;
     aml_unlock();
-    return aml_errors > before && s.status == ST_ERROR ? -EIO : 0;
+    return s.status == ST_ERROR ? -EIO : 0;
 }
 
 int aml_eval(struct aml_node *n, struct aml_obj **args, int argc, struct aml_obj **result) {

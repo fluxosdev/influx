@@ -99,6 +99,8 @@ int64_t icmp_ping(uint32_t dst, uint16_t seq, size_t payload, int timeout_ms, in
 struct udp_sock;
 void udp_input(struct netif *n, uint32_t src, uint32_t dst, const uint8_t *pkt, size_t len);
 struct udp_sock *udp_open(uint16_t port);    /* 0 = ephemeral */
+/* receives only what arrives on adapter n (NULL = any); a port can be bound once per adapter */
+struct udp_sock *udp_open_if(uint16_t port, struct netif *n);
 int udp_sendto(struct udp_sock *s, uint32_t dst, uint16_t port, const void *data, size_t len);
 int udp_sendto_if(struct udp_sock *s, struct netif *n, uint32_t src, uint32_t dst, uint16_t port, const void *data, size_t len);
 int udp_recvfrom(struct udp_sock *s, void *buf, size_t len, uint32_t *src, uint16_t *sport, int timeout_ms);

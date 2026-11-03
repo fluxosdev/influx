@@ -159,15 +159,17 @@ void wm_broadcast(int type) {
 bool clock_24h = false;
 
 /* ---------------------------------------------------------------- windows API */
-struct window *window_create(const char *title, int cw, int ch, int flags) {
+static struct window *create_window(const char *title, int cw, int ch, int flags, bool may_fail) {
+    int top = (flags & WIN_FULL_TITLE) ? TITLEBAR_H : 0;
+    struct canvas *canvas = may_fail ? canvas_create_try(cw, ch + top) : canvas_create(cw, ch + top);
+    if (!canvas) return NULL;
     struct window *w = kzalloc(sizeof *w);
-    w->id = next_win_id++;
+    w->id = __atomic_fetch_add(&next_win_id, 1, __ATOMIC_RELAXED);
     strlcpy(w->title, title, sizeof w->title);
     w->flags = flags & ~(WIN_VISIBLE | WIN_MINIMIZED);
     if (flags & WIN_DIALOG) w->flags = (w->flags & ~WIN_RESIZABLE & ~WIN_MINIMIZABLE) | WIN_CLOSABLE | WIN_DIALOG;
-    int top = (w->flags & WIN_FULL_TITLE) ? TITLEBAR_H : 0;
     w->frame = rect_make(0, 0, cw, ch + top);
-    w->canvas = canvas_create(cw, ch + top);
+    w->canvas = canvas;
     gfx_fill(w->canvas, theme.bg);
     mutex_init(&w->lock);
     sem_init(&w->evq_sem, 0);
@@ -192,6 +194,8 @@ struct window *window_create(const char *title, int cw, int ch, int flags) {
     mutex_unlock(&wm_lock);
     return w;
 }
+struct window *window_create(const char *title, int cw, int ch, int flags) { return create_window(title, cw, ch, flags, false); }
+struct window *window_create_try(const char *title, int cw, int ch, int flags) { return create_window(title, cw, ch, flags, true); }
 
 static void close_menu(void);
 static void set_focus_locked(struct window *w) {
@@ -275,9 +279,10 @@ static void resize_locked(struct window *w, int cw, int ch) {
     if (cw < w->min_w) cw = w->min_w;
     if (ch < w->min_h) ch = w->min_h;
     if (cw == w->frame.w && ch == w->frame.h) return;
+    struct canvas *nc = canvas_create_try(cw, ch);
+    if (!nc) return;   /* out of (contiguous) memory: keep the current size */
     damage_add(win_shadow_rect(w));
     mutex_lock(&w->lock);
-    struct canvas *nc = canvas_create(cw, ch);
     gfx_fill(nc, theme.bg);
     gfx_blit_opaque(nc, 0, 0, w->canvas);
     canvas_destroy(w->canvas);

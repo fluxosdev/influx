@@ -36,8 +36,7 @@ void input_push(const struct input_event *ev) {
             queue[last].dx += ev->dx; queue[last].dy += ev->dy; queue[last].buttons = ev->buttons;
             queue[last].x = ev->x; queue[last].y = ev->y;
             spin_unlock(&qlock);
-            sem_post(&qsem);
-            return;
+            return;   /* merged into an event that is already counted: no post */
         }
     }
     queue[qtail] = *ev;

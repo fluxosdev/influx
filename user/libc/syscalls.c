@@ -48,6 +48,7 @@ int isatty(int fd) { int wh[2]; return syscall3(SYS_IOCTL, fd, 2, (long)wh) == 0
 static int win_wh[8][2];
 int win_create(int w, int h, const char *title) { int r = (int)ret(syscall3(SYS_WIN_CREATE, w, h, (long)title)); if (r >= 0 && r < 8) { win_wh[r][0] = w; win_wh[r][1] = h; } return r; }
 int win_present(int id, const uint32_t *px) { int ok = id >= 0 && id < 8; return (int)ret(syscall4(SYS_WIN_PRESENT, id, (long)px, ok ? win_wh[id][0] : 0, ok ? win_wh[id][1] : 0)); }
+int win_present_size(int id, const uint32_t *px, int w, int h) { if (w <= 0 || h <= 0) { errno = 22; return -1; } return (int)ret(syscall4(SYS_WIN_PRESENT, id, (long)px, w, h)); }
 int win_event(int id, struct win_event *ev, int timeout_ms) { int r = (int)syscall3(SYS_WIN_EVENT, id, (long)ev, timeout_ms); if (r == 1 && ev->type == WEV_RESIZE && id >= 0 && id < 8 && ev->w > 0 && ev->h > 0) { win_wh[id][0] = ev->w; win_wh[id][1] = ev->h; } return r; }
 int win_destroy(int id) { return (int)ret(syscall1(SYS_WIN_DESTROY, id)); }
 int win_set_title(int id, const char *t) { return (int)ret(syscall2(SYS_WIN_TITLE, id, (long)t)); }

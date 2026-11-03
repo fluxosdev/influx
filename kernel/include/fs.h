@@ -40,6 +40,9 @@ struct vnode_ops {
     int (*ioctl)(struct vnode *v, int cmd, void *arg);
     void (*release)(struct vnode *v);
     int (*sync)(struct vnode *v);
+    /* optional: write at the current end of file, atomically with respect to other writers (O_APPEND);
+     * *end receives the offset just past the written data */
+    int64_t (*append)(struct vnode *v, const void *buf, size_t n, uint64_t *end);
 };
 
 struct vnode {
@@ -76,7 +79,7 @@ int64_t vfs_write(struct file *f, const void *buf, size_t n);
 int64_t vfs_pread(struct vnode *v, uint64_t off, void *buf, size_t n);
 int64_t vfs_pwrite(struct vnode *v, uint64_t off, const void *buf, size_t n);
 int64_t vfs_seek(struct file *f, int64_t off, int whence);
-void vfs_close(struct file *f);
+int vfs_close(struct file *f);                              /* returns the sync error, if any; f is released regardless */
 struct file *vfs_dup(struct file *f);
 int vfs_stat(const char *path, struct stat *st);
 int vfs_stat_rel(const char *cwd, const char *path, struct stat *st);
@@ -85,9 +88,9 @@ int vfs_mkdir(const char *path);
 int vfs_create(const char *path);
 int vfs_unlink(const char *path);
 int vfs_rename(const char *oldp, const char *newp);
-int vfs_truncate(struct vnode *v, uint64_t size);
+int vfs_truncate(struct vnode *v, uint64_t size);           /* regular files only */
 int vfs_sync(void);
-void vfs_normalize(const char *cwd, const char *path, char *out, size_t n);
+int vfs_normalize(const char *cwd, const char *path, char *out, size_t n);   /* 0, -ENOENT (empty path) or -ENAMETOOLONG; out is "" on error */
 int vfs_read_file(const char *path, void **data, size_t *size);   /* kmalloc'd, NUL terminated */
 int vfs_write_file(const char *path, const void *data, size_t size);
 const char *vfs_basename(const char *path);
@@ -118,6 +121,7 @@ struct vnode *devfs_add(const char *name, int type, const struct vnode_ops *ops,
 #define EROFS    30
 #define ENOTEMPTY 39
 #define ENOSYS   38
+#define ENAMETOOLONG 36
 #define ENOEXEC  8
 #define ENOTTY_  25
 #define ECHILD   10

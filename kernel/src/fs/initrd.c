@@ -16,6 +16,7 @@ void initrd_unpack(const void *tar, size_t size, const char *dest) {
         const struct tar_hdr *h = (const struct tar_hdr *)p;
         if (h->name[0] == 0) break;
         uint64_t fsize = octal(h->size, 12);
+        if (fsize > (uint64_t)(end - p) - 512) { kprintf("initrd: entry '%.100s' runs past the archive end\n", h->name); break; }
         char path[PATH_MAX];
         char name[256];
         if (h->prefix[0]) snprintf(name, sizeof name, "%.155s/%.100s", h->prefix, h->name);
@@ -33,7 +34,9 @@ void initrd_unpack(const void *tar, size_t size, const char *dest) {
                 files++;
             }
         }
-        p += 512 + ALIGN_UP(fsize, 512);
+        uint64_t adv = 512 + ALIGN_UP(fsize, 512);
+        if (adv > (uint64_t)(end - p)) break;   /* last entry's padding is missing */
+        p += adv;
     }
     kprintf("initrd: unpacked %d files, %d directories\n", files, dirs);
 }

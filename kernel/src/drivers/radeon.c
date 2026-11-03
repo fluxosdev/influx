@@ -258,7 +258,9 @@ void radeon_cursor_upload(struct radeon *r) {
     wreg(r, crtc_reg(r, D1CUR_UPDATE), CURSOR_UPDATE_LOCK);
     wreg(r, crtc_reg(r, D1CUR_SURFACE_ADDRESS), (uint32_t)(r->fb_start_gpu + r->cursor_off));
     wreg(r, crtc_reg(r, D1CUR_SIZE), (63u << 16) | 63u);
-    wreg(r, crtc_reg(r, D1CUR_HOT_SPOT), ((uint32_t)r->cursor_hot_x << 16) | (uint32_t)r->cursor_hot_y);
+    /* HOT_SPOT is the image origin used for clipping at the top/left edge, not the pointer hot spot:
+     * callers already pass the image's top-left to move_cursor (as for i915) */
+    wreg(r, crtc_reg(r, D1CUR_HOT_SPOT), 0);
     wreg(r, crtc_reg(r, D1CUR_CONTROL), CURSOR_EN | (CURSOR_MODE_ARGB_PREMUL << CURSOR_MODE_SHIFT));
     wreg(r, crtc_reg(r, D1CUR_UPDATE), 0);
 }
@@ -278,8 +280,12 @@ static bool radeon_set_cursor(struct gpu_device *g, const uint32_t *argb, int w,
 }
 static void radeon_move_cursor(struct gpu_device *g, int x, int y, bool visible) {
     struct radeon *r = g->priv;
-    if (x < 0) x = 0; if (y < 0) y = 0;
+    /* partly off the top/left edge: position at 0 and start the image further in (as Linux's avivo code) */
+    int xo = 0, yo = 0;
+    if (x < 0) { xo = MIN(-x, 63); x = 0; }
+    if (y < 0) { yo = MIN(-y, 63); y = 0; }
     wreg(r, crtc_reg(r, D1CUR_UPDATE), CURSOR_UPDATE_LOCK);
+    wreg(r, crtc_reg(r, D1CUR_HOT_SPOT), ((uint32_t)xo << 16) | (uint32_t)yo);
     wreg(r, crtc_reg(r, D1CUR_POSITION), ((uint32_t)x << 16) | (uint32_t)y);
     wreg(r, crtc_reg(r, D1CUR_CONTROL), (visible ? CURSOR_EN : 0) | (CURSOR_MODE_ARGB_PREMUL << CURSOR_MODE_SHIFT));
     wreg(r, crtc_reg(r, D1CUR_UPDATE), 0);

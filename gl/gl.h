@@ -294,11 +294,11 @@ typedef unsigned int GLbitfield;
 
 /* ---- context management (the "EGL" of inFlux) ---- */
 typedef struct gl_context GLcontext;
-GLcontext *glxCreateContext(int width, int height);      /* software framebuffer of width*height ARGB pixels */
-void glxDestroyContext(GLcontext *ctx);
-void glxMakeCurrent(GLcontext *ctx);
+GLcontext *glxCreateContext(int width, int height);      /* software framebuffer of width*height ARGB pixels (each 1..8192); NULL on failure */
+void glxDestroyContext(GLcontext *ctx);                  /* also stops it being current anywhere */
+int glxMakeCurrent(GLcontext *ctx);                      /* current for the calling thread (kernel: per thread); 0 on failure */
 uint32_t *glxGetPixels(GLcontext *ctx);                  /* row-major, top row first, stride == width; alpha is the GL destination alpha */
-void glxSetRendererName(const char *name);               /* reported through glGetString(GL_RENDERER) */
+void glxSetRendererName(GLcontext *ctx, const char *name); /* reported through glGetString(GL_RENDERER) while ctx is current */
 int glxGetWidth(GLcontext *ctx);
 int glxGetHeight(GLcontext *ctx);
 

@@ -7,6 +7,7 @@
 
 struct vnode *btrfs_mount(struct blockdev *d);
 struct vnode *fat32_mount(struct blockdev *d);
+int btrfs_unmount(struct vnode *root);   /* final write-back, leaves the background flusher */
 
 void drivers_init(void) { gpu_init(); audio_init(); }
 
@@ -36,7 +37,7 @@ static void mount_one(struct blockdev *d) {
         vnode_unref(marker);
     }
     if (vfs_mount(mp, root) == 0) root->priv = d;
-    else kprintf("storage: mounting %s on %s failed\n", d->name, mp);
+    else { kprintf("storage: mounting %s on %s failed\n", d->name, mp); btrfs_unmount(root); }
 }
 
 /* a whole disk with partitions mounts each partition, otherwise the disk itself */
@@ -60,6 +61,7 @@ void storage_unmount(struct blockdev *d) {
         if (root && on_disk(root->priv, d) && strcmp(mp, "/")) {
             kprintf("storage: unmounting %s (%s removed)\n", mp, d->name);
             vfs_unmount(mp);
+            btrfs_unmount(root);   /* no-op for other filesystems */
             if (!strncmp(mp, "/mnt/", 5)) vfs_unlink(mp);
             continue;
         }

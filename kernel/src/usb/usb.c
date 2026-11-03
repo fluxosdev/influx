@@ -129,12 +129,16 @@ void usb_buf_free(struct usb_device *d, void *p) {
     else kfree(p);
 }
 
-static void parse_ep(struct usb_endpoint *ep, const uint8_t *p) {
+/* false for descriptors we cannot use: endpoint number 0 or another control
+ * endpoint would alias the default pipe (EHCI QH 0, xHCI DCI 0/1), and a max
+ * packet size of 0 cannot carry anything (EHCI splits transfers by it) */
+static bool parse_ep(struct usb_endpoint *ep, const uint8_t *p) {
     const struct usb_endpoint_desc *ed = (const void *)p;
     memset(ep, 0, sizeof *ep);
     ep->addr = ed->bEndpointAddress; ep->type = ed->bmAttributes & 3;
     ep->mps = ed->wMaxPacketSize & 0x7FF; ep->mult = (ed->wMaxPacketSize >> 11) & 3;
     ep->interval = ed->bInterval;
+    return (ep->addr & 0xF) && ep->type != USB_EP_CONTROL && ep->mps;
 }
 
 struct usb_endpoint *usb_ep_by_addr(struct usb_interface *i, uint8_t addr) {
@@ -156,7 +160,7 @@ int usb_set_interface(struct usb_interface *i, int alt) {
         if (p[1] == USB_DT_INTERFACE && p[0] >= 9) {
             if (found == 1) break;
             if (p[2] == i->num && p[3] == alt) found = 1;
-        } else if (found && p[1] == USB_DT_ENDPOINT && p[0] >= 7 && n < USB_MAX_EP) parse_ep(last = &eps[n++], p);
+        } else if (found && p[1] == USB_DT_ENDPOINT && p[0] >= 7) last = n < USB_MAX_EP && parse_ep(&eps[n], p) ? &eps[n++] : NULL;
         else if (found && p[1] == USB_DT_SS_EP_COMP && p[0] >= 6 && last) last->burst = p[2];
         off += p[0];
     }
@@ -226,7 +230,7 @@ static void parse_config(struct usb_device *d) {
             }
         } else if (p[1] == USB_DT_ENDPOINT && p[0] >= 7 && cur) {
             const struct usb_endpoint_desc *ed = (const void *)p;
-            if (cur->nep < USB_MAX_EP) parse_ep(last_ep = &cur->ep[cur->nep++], (const uint8_t *)ed);
+            last_ep = cur->nep < USB_MAX_EP && parse_ep(&cur->ep[cur->nep], (const uint8_t *)ed) ? &cur->ep[cur->nep++] : NULL;
         } else if (p[1] == USB_DT_SS_EP_COMP && p[0] >= 6 && last_ep) {
             last_ep->burst = p[2];
         }

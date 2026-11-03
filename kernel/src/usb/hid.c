@@ -18,6 +18,8 @@ struct hid_dev {
     uint8_t *buf;
     bool kbd;
     volatile bool stalled;
+    volatile int fails;            /* recoveries since the last good report: sets the retry backoff */
+    uint64_t retry_at;
     /* keyboard */
     uint8_t prev[8];
     /* pointer */
@@ -135,7 +137,7 @@ static int32_t field_get(const uint8_t *r, uint32_t len, const struct hid_field 
         if ((uint32_t)(bit >> 3) >= len) break;
         v |= (uint32_t)((r[bit >> 3] >> (bit & 7)) & 1) << i;
     }
-    if (f->lmin < 0 && f->size < 32 && (v & (1u << (f->size - 1)))) v |= ~0u << f->size;   /* sign extend */
+    if (f->lmin < 0 && f->size > 0 && f->size < 32 && (v & (1u << (f->size - 1)))) v |= ~0u << f->size;   /* sign extend */
     return (int32_t)v;
 }
 
@@ -176,8 +178,8 @@ static void mouse_report(struct hid_dev *h, const uint8_t *r, uint32_t len) {
 /* Walk the report descriptor for the first report with X and Y on the
  * generic desktop page, plus its buttons 1-3 and wheel. */
 static bool parse_report(struct hid_dev *h, const uint8_t *d, int n) {
-    uint32_t page = 0, rsize = 0, rcount = 0, rid = 0;
-    int32_t lmin = 0, lmax = 0;
+    struct hid_global { uint32_t page, rsize, rcount, rid; int32_t lmin, lmax; } g = { 0 }, stack[4];
+    int sp = 0;
     uint32_t usages[16]; int nusage = 0; uint32_t umin = 0, umax = 0; bool range = false;
     int offs[256] = { 0 };   /* bit offset so far in each report ID's input report */
     struct hid_field f[6]; int frid[6]; bool frel[6];   /* btn1-3, x, y, wheel */
@@ -192,28 +194,32 @@ static bool parse_report(struct hid_dev *h, const uint8_t *d, int n) {
         int32_t sv = sz == 1 ? (int8_t)v : sz == 2 ? (int16_t)v : (int32_t)v;
         i += 1 + sz;
         switch (b & 0xFC) {
-        case 0x04: page = v; break;
-        case 0x14: lmin = sv; break;
-        case 0x24: lmax = lmin < 0 ? sv : (int32_t)v; break;
-        case 0x74: rsize = v; break;
-        case 0x84: rid = v & 0xFF; break;
-        case 0x94: rcount = v; break;
-        case 0x08: if (nusage < 16) usages[nusage++] = sz == 4 ? v : page << 16 | v; break;
-        case 0x18: umin = sz == 4 ? v : page << 16 | v; range = true; break;
-        case 0x28: umax = sz == 4 ? v : page << 16 | v; break;
-        case 0x80:   /* Input */
-            for (uint32_t k = 0; k < rcount && rcount <= 256; k++) {
+        case 0x04: g.page = v; break;
+        case 0x14: g.lmin = sv; break;
+        case 0x24: g.lmax = g.lmin < 0 ? sv : (int32_t)v; break;
+        case 0x74: g.rsize = v; break;
+        case 0x84: g.rid = v & 0xFF; break;
+        case 0x94: g.rcount = v; break;
+        case 0xA4: if (sp < 4) stack[sp++] = g; break;   /* Push / Pop of the global state: too deep or nothing pushed is ignored */
+        case 0xB4: if (sp > 0) g = stack[--sp]; break;
+        case 0x08: if (nusage < 16) usages[nusage++] = sz == 4 ? v : g.page << 16 | v; break;
+        case 0x18: umin = sz == 4 ? v : g.page << 16 | v; range = true; break;
+        case 0x28: umax = sz == 4 ? v : g.page << 16 | v; break;
+        case 0x80: {   /* Input */
+            uint32_t rsize = g.rsize, rid = g.rid;
+            for (uint32_t k = 0; k < g.rcount && g.rcount <= 256; k++) {
                 uint32_t u = range ? umin + k : k < (uint32_t)nusage ? usages[k] : nusage ? usages[nusage - 1] : 0;
                 if (range && umin + k > umax) u = 0;
                 int idx = -1;
                 if (u >= 0x90001 && u <= 0x90003) idx = u - 0x90001;
                 else if (u == 0x10030) idx = 3; else if (u == 0x10031) idx = 4; else if (u == 0x10038) idx = 5;
-                if (idx >= 0 && !(v & 1) && !f[idx].present && rsize <= 32) {
-                    f[idx] = (struct hid_field){ offs[rid], rsize, lmin, lmax, true };
+                if (idx >= 0 && !(v & 1) && !f[idx].present && rsize >= 1 && rsize <= 32) {
+                    f[idx] = (struct hid_field){ offs[rid], rsize, g.lmin, g.lmax, true };
                     frid[idx] = rid; frel[idx] = (v & 4) != 0;
                 }
-                offs[rid] += rsize;
+                offs[rid] = (int)MIN((uint64_t)offs[rid] + rsize, 1u << 24);   /* no overflow on absurd sizes */
             }
+        }
             __attribute__((fallthrough));
         case 0x90: case 0xB0: case 0xA0: case 0xC0:   /* every main item ends the local state */
             nusage = 0; range = false; umin = umax = 0;
@@ -241,6 +247,7 @@ static void hid_done(struct usb_xfer *x) {
     struct hid_dev *h = x->ctx;
     if (x->status == -ENODEV || x->dev->gone) return;
     if (x->status < 0) { h->stalled = true; sem_post(&work_sem); return; }   /* endpoint halted: the worker resets it */
+    h->fails = 0;
     if (h->kbd) kbd_report(h, h->buf, x->actual); else mouse_report(h, h->buf, x->actual);
     usb_submit(x);
 }
@@ -251,29 +258,44 @@ static void set_leds(struct hid_dev *h) {
 }
 
 static void worker(void *arg) {
+    uint64_t retry = 0;   /* earliest pending endpoint recovery retry, 0 for none */
     for (;;) {
         spin_lock(&rep_lock);
         int u = rep_usage; uint64_t next = rep_next;
         spin_unlock(&rep_lock);
         uint64_t now = time_ms();
+        uint64_t wake = u ? next : now + 1000;
+        if (retry && retry < wake) wake = retry;
         if (u && now >= next) {
             /* pushed under the lock, so a release seen meanwhile cannot be followed by a stale press */
             spin_lock(&rep_lock);
             if (rep_usage == u) { key_event(u, true, rep_mods); rep_next = now + 33; }
             spin_unlock(&rep_lock);
-        } else sem_wait_timeout(&work_sem, u ? next - now : 1000);
+        } else if (wake > now) sem_wait_timeout(&work_sem, wake - now);
         if (leds_dirty) {
             leds_dirty = false;
             mutex_lock(&hid_lock);
             for (struct hid_dev *h = devs; h; h = h->next) if (h->kbd && !h->dev->gone) set_leds(h);
             mutex_unlock(&hid_lock);
         }
+        /* Clear the halt and resubmit. A failed attempt (or a transfer that
+         * fails again before a good report) stays marked and is retried
+         * after 100, 200, 400, then every 500 ms until it works or the device
+         * is gone, without the worker spinning on it. */
+        retry = 0; now = time_ms();
         mutex_lock(&hid_lock);
         for (struct hid_dev *h = devs; h; h = h->next) {
             if (!h->stalled || h->dev->gone) continue;
-            h->stalled = false;
-            if (usb_clear_halt(h->dev, h->ep) < 0) continue;
-            usb_submit(&h->xfer);
+            if (h->fails && now < h->retry_at) { if (!retry || h->retry_at < retry) retry = h->retry_at; continue; }
+            int nf = MIN(h->fails + 1, 4);
+            h->fails = nf;
+            h->retry_at = now + MIN(100u << (nf - 1), 500u);
+            if (usb_clear_halt(h->dev, h->ep) == 0) {
+                h->stalled = false;   /* before the submit: the completion may set it again */
+                if (usb_submit(&h->xfer) == 0) continue;
+                h->stalled = true;
+            }
+            if (!retry || h->retry_at < retry) retry = h->retry_at;
         }
         mutex_unlock(&hid_lock);
     }

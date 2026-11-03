@@ -194,9 +194,13 @@ int arp_output(struct netif *n, uint32_t hop, const void *pkt, size_t len) {
         for (int i = 1; i < ARP_PENDING; i++) if (arp_waiting[i].t < slot->t) slot = &arp_waiting[i];
         kfree(slot->pkt);
     }
-    slot->pkt = kmalloc(len);
-    memcpy(slot->pkt, pkt, len);
-    slot->len = len; slot->hop = hop; slot->n = n; slot->t = time_ms(); slot->used = true;
+    slot->used = false;
+    slot->pkt = kmalloc_try(len);
+    int r = 0;
+    if (slot->pkt) {
+        memcpy(slot->pkt, pkt, len);
+        slot->len = len; slot->hop = hop; slot->n = n; slot->t = time_ms(); slot->used = true;
+    } else { n->tx_errors++; r = -ENOMEM; }   /* drop the packet, but still ask for the address */
     uint64_t now = time_ms();
     if (!e) { e = arp_slot(hop); e->first_req = now; e->n = n; e->updated = now; }
     if (!e->last_req || now - e->last_req >= ARP_RETRY_MS / 5) {
@@ -204,7 +208,7 @@ int arp_output(struct netif *n, uint32_t hop, const void *pkt, size_t len) {
         arp_send(n, 1, zero, hop, eth_broadcast);
         e->last_req = now;
     }
-    return 0;
+    return r;
 }
 
 void arp_timer(void) {

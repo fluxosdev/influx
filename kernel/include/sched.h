@@ -49,7 +49,8 @@ struct process {
     bool is_user;
     struct list_head threads;
     struct list_head all_link;
-    struct process *parent;
+    struct process *parent;       /* may dangle once the parent is reaped: compare ppid instead */
+    int ppid;                     /* creator's pid (0: none) */
     struct file *fds[MAX_FDS];
     char cwd[256];
     uint64_t brk_start, brk;
@@ -96,6 +97,8 @@ struct process *process_find(int pid);
 void procs_lock(void);
 void procs_unlock(void);
 int process_wait(int pid, int *status);
+void process_mark_exited(struct process *p);   /* every thread gone: ready to reap */
+int process_user_count(void);         /* user processes not yet reaped */
 bool process_kill(int pid, int sig);
 int process_list(struct process **out, int max);
 int thread_list(struct thread **out, int max);

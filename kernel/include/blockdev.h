@@ -10,6 +10,7 @@ struct blockdev {
     struct blockdev *parent;
     int (*read)(struct blockdev *d, uint64_t lba, uint32_t count, void *buf);
     int (*write)(struct blockdev *d, uint64_t lba, uint32_t count, const void *buf);
+    int (*flush)(struct blockdev *d);   /* write back the device's volatile cache; NULL: nothing to flush */
     void *priv;
     const char *fs_type;
     const char *bus;                 /* "SATA" / "NVMe" / "USB" */
@@ -28,6 +29,7 @@ struct blockdev *blockdev_at(int i);
 struct blockdev *blockdev_find(const char *name);
 int blockdev_read(struct blockdev *d, uint64_t lba, uint32_t count, void *buf);
 int blockdev_write(struct blockdev *d, uint64_t lba, uint32_t count, const void *buf);
+int blockdev_flush(struct blockdev *d);   /* make completed writes durable (partitions flush the whole disk) */
 int blockdev_read_bytes(struct blockdev *d, uint64_t off, void *buf, size_t n);
 int blockdev_write_bytes(struct blockdev *d, uint64_t off, const void *buf, size_t n);
 void ahci_init(void);

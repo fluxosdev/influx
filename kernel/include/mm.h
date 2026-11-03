@@ -3,7 +3,8 @@
 
 /* Physical memory manager */
 void pmm_init(void);
-uint64_t pmm_alloc_pages(size_t count);     /* physical address, contiguous, zeroed */
+uint64_t pmm_alloc_pages(size_t count);     /* physical address, contiguous, zeroed; panics when none */
+uint64_t pmm_alloc_pages_try(size_t count); /* same, but 0 when no contiguous run is free */
 uint64_t pmm_alloc_page(void);
 uint64_t pmm_alloc_pages_low(size_t count); /* below 4 GiB, zeroed; 0 if none */
 void pmm_free_pages(uint64_t phys, size_t count);
@@ -42,6 +43,11 @@ void *kzalloc(size_t n);
 void *kcalloc(size_t a, size_t b);
 void *krealloc(void *p, size_t n);
 void kfree(void *p);
+/* _try variants return NULL instead of panicking when memory (contiguous for large blocks) runs out;
+ * use them for any size that comes from user input, disk contents or the network */
+void *kmalloc_try(size_t n);
+void *kzalloc_try(size_t n);
+void *krealloc_try(void *p, size_t n);   /* NULL leaves p allocated and unchanged */
 char *kstrdup(const char *s);
 uint64_t heap_used_bytes(void);
 uint64_t heap_total_bytes(void);

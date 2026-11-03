@@ -20,6 +20,7 @@ enum { WEV_NONE = 0, WEV_MOUSE_MOVE, WEV_MOUSE_DOWN, WEV_MOUSE_UP, WEV_MOUSE_SCR
 struct win_event { int32_t type, x, y, button, buttons, scroll, key; uint32_t ch; int32_t mods, cmd, w, h; };
 int win_create(int w, int h, const char *title);                 /* returns a window id */
 int win_present(int id, const uint32_t *argb_pixels);            /* w*h pixels, 0xAARRGGBB */
+int win_present_size(int id, const uint32_t *argb_pixels, int w, int h);   /* a w*h buffer (w, h <= 4096); the window shows its top-left part */
 int win_event(int id, struct win_event *ev, int timeout_ms);     /* 1 = event, 0 = timeout */
 int win_destroy(int id);
 int win_set_title(int id, const char *title);

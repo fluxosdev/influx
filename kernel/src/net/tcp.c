@@ -105,8 +105,10 @@ static void ooo_clear(struct tcp_conn *c) {
 static void ooo_store(struct tcp_conn *c, uint32_t seq, const uint8_t *data, size_t len, bool fin) {
     if (c->nooo == TCP_OOO_MAX || seq - c->rcv_nxt >= c->rcv_wnd_max) return;
     for (int i = 0; i < c->nooo; i++) if (c->ooo[i].seq == seq && c->ooo[i].len >= len) return;
+    uint8_t *copy = kmalloc_try(len ? len : 1);
+    if (!copy) return;   /* dropped: the peer retransmits it */
     c->ooo[c->nooo].seq = seq; c->ooo[c->nooo].len = len; c->ooo[c->nooo].fin = fin;
-    c->ooo[c->nooo].data = kmalloc(len ? len : 1);
+    c->ooo[c->nooo].data = copy;
     memcpy(c->ooo[c->nooo].data, data, len);
     c->nooo++;
 }
@@ -278,7 +280,13 @@ void tcp_input(struct netif *n, uint32_t src, uint32_t dst, const uint8_t *pkt, 
         }
         wake(c);
     }
-    if (SEQ_LEQ(c->snd_una, ack)) c->snd_wnd = win;
+    if (SEQ_LEQ(c->snd_una, ack)) {
+        c->snd_wnd = win;
+        /* the peer answered a zero-window probe (or otherwise ACKed while its window stays closed): it is
+         * alive, so keep probing for as long as it keeps answering (RFC 9293 3.8.6.1); the probes only
+         * count towards giving up while nothing comes back */
+        if (!win && (c->slen || c->snd_max != c->snd_una)) c->retries = 0;
+    }
 
     bool receiving = c->state == TCP_ESTABLISHED || c->state == TCP_FIN_WAIT_1 || c->state == TCP_FIN_WAIT_2;
     if (SEQ_GT(seq, c->rcv_nxt)) {
@@ -353,9 +361,12 @@ struct tcp_conn *tcp_connect(uint32_t ip, uint16_t port, int timeout_ms, volatil
     int slot = -1;
     for (size_t i = 0; i < ARRAY_LEN(conns); i++) if (!conns[i]) { slot = i; break; }
     if (slot < 0) { mutex_unlock(&net_lock); *err = EBUSY; return NULL; }
-    struct tcp_conn *c = kzalloc(sizeof *c);
-    c->sbuf = kmalloc(TCP_SBUF);
-    c->rbuf = kmalloc(TCP_RBUF);
+    struct tcp_conn *c = kzalloc_try(sizeof *c);
+    if (c) { c->sbuf = kmalloc_try(TCP_SBUF); c->rbuf = kmalloc_try(TCP_RBUF); }
+    if (!c || !c->sbuf || !c->rbuf) {
+        if (c) { kfree(c->sbuf); kfree(c->rbuf); kfree(c); }
+        mutex_unlock(&net_lock); *err = ENOMEM; return NULL;
+    }
     sem_init(&c->sem, 0);
     c->lip = n->ip; c->rip = ip; c->rport = port;
     c->rcv_wnd_max = n->rx_window ? MIN((uint32_t)TCP_RBUF, MAX(n->rx_window, (uint32_t)TCP_MSS)) : TCP_RBUF;

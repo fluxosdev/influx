@@ -1,22 +1,35 @@
 #include "arch.h"
 #include "acpi_internal.h"
 #include "io.h"
+#include "spinlock.h"
 #include "string.h"
 
 static struct pci_device devices[64];
 static int ndev;
 
+/* 0xCF8 selects the register 0xCFC then reads or writes: one pair at a time,
+ * machine wide (other CPUs, and interrupt handlers on this one) */
+static spinlock_t cfg_lock = SPINLOCK_INIT;
 static inline void cfg_addr(uint8_t bus, uint8_t slot, uint8_t func, uint8_t off) {
+    spin_lock(&cfg_lock);
     outl(0xCF8, 0x80000000u | ((uint32_t)bus << 16) | ((uint32_t)slot << 11) | ((uint32_t)func << 8) | (off & 0xFC));
 }
-uint32_t pci_read32(uint8_t bus, uint8_t slot, uint8_t func, uint8_t off) { cfg_addr(bus, slot, func, off); return inl(0xCFC); }
-void pci_write32(uint8_t bus, uint8_t slot, uint8_t func, uint8_t off, uint32_t v) { cfg_addr(bus, slot, func, off); outl(0xCFC, v); }
+static inline void cfg_done(void) { spin_unlock(&cfg_lock); }
+uint32_t pci_read32(uint8_t bus, uint8_t slot, uint8_t func, uint8_t off) { cfg_addr(bus, slot, func, off); uint32_t v = inl(0xCFC); cfg_done(); return v; }
+void pci_write32(uint8_t bus, uint8_t slot, uint8_t func, uint8_t off, uint32_t v) { cfg_addr(bus, slot, func, off); outl(0xCFC, v); cfg_done(); }
 /* narrow writes go out narrow: a read-modify-write of the dword would write
  * back (and so clear) RW1C bits next to the target, e.g. Status after Command */
-uint16_t pci_read16(uint8_t bus, uint8_t slot, uint8_t func, uint8_t off) { cfg_addr(bus, slot, func, off); return inw(0xCFC + (off & 2)); }
-void pci_write16(uint8_t bus, uint8_t slot, uint8_t func, uint8_t off, uint16_t v) { cfg_addr(bus, slot, func, off); outw(0xCFC + (off & 2), v); }
-uint8_t pci_read8(uint8_t bus, uint8_t slot, uint8_t func, uint8_t off) { cfg_addr(bus, slot, func, off); return inb(0xCFC + (off & 3)); }
-void pci_write8(uint8_t bus, uint8_t slot, uint8_t func, uint8_t off, uint8_t v) { cfg_addr(bus, slot, func, off); outb(0xCFC + (off & 3), v); }
+uint16_t pci_read16(uint8_t bus, uint8_t slot, uint8_t func, uint8_t off) { cfg_addr(bus, slot, func, off); uint16_t v = inw(0xCFC + (off & 2)); cfg_done(); return v; }
+void pci_write16(uint8_t bus, uint8_t slot, uint8_t func, uint8_t off, uint16_t v) { cfg_addr(bus, slot, func, off); outw(0xCFC + (off & 2), v); cfg_done(); }
+uint8_t pci_read8(uint8_t bus, uint8_t slot, uint8_t func, uint8_t off) { cfg_addr(bus, slot, func, off); uint8_t v = inb(0xCFC + (off & 3)); cfg_done(); return v; }
+void pci_write8(uint8_t bus, uint8_t slot, uint8_t func, uint8_t off, uint8_t v) { cfg_addr(bus, slot, func, off); outb(0xCFC + (off & 3), v); cfg_done(); }
+/* read-modify-write of a 16-bit register as one step against other updaters */
+static void pci_update16(uint8_t bus, uint8_t slot, uint8_t func, uint8_t off, uint16_t clear, uint16_t set) {
+    cfg_addr(bus, slot, func, off);
+    uint16_t v = inw(0xCFC + (off & 2));
+    outw(0xCFC + (off & 2), (v & ~clear) | set);
+    cfg_done();
+}
 
 static void probe(uint8_t bus, uint8_t slot, uint8_t func) {
     uint32_t id = pci_read32(bus, slot, func, 0);
@@ -64,10 +77,7 @@ int pci_device_count(void) { return ndev; }
 struct pci_device *pci_device_at(int i) { return i >= 0 && i < ndev ? &devices[i] : NULL; }
 
 void pci_enable_bus_master(struct pci_device *d) {
-    uint16_t cmd = pci_read16(d->bus, d->slot, d->func, 4);
-    cmd |= (1 << 2) | (1 << 1) | (1 << 0);   /* bus master, memory, io */
-    cmd &= ~(1 << 10);                        /* enable INTx */
-    pci_write16(d->bus, d->slot, d->func, 4, cmd);
+    pci_update16(d->bus, d->slot, d->func, 4, 1 << 10, (1 << 2) | (1 << 1) | (1 << 0));   /* INTx on; bus master, memory, io */
 }
 
 uint8_t pci_find_cap(struct pci_device *d, uint8_t id) {
@@ -129,7 +139,7 @@ bool pci_irq_install(struct pci_device *d, irq_handler_t h, void *ctx, bool allo
         if (ctl & (1 << 7)) { pci_write32(d->bus, d->slot, d->func, msi + 8, 0); pci_write16(d->bus, d->slot, d->func, msi + 12, pi->vector); }
         else pci_write16(d->bus, d->slot, d->func, msi + 8, pi->vector);
         pci_write16(d->bus, d->slot, d->func, msi + 2, (ctl & ~(7 << 4)) | 1);   /* one vector, enabled */
-        pci_write16(d->bus, d->slot, d->func, 4, pci_read16(d->bus, d->slot, d->func, 4) | (1 << 10));   /* INTx off */
+        pci_update16(d->bus, d->slot, d->func, 4, 0, 1 << 10);   /* INTx off */
         snprintf(how, how_len, "MSI, vector 0x%x", pi->vector);
         return true;
     }

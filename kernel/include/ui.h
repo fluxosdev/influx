@@ -79,6 +79,7 @@ struct window {
 };
 
 struct window *window_create(const char *title, int w, int h, int flags);
+struct window *window_create_try(const char *title, int w, int h, int flags);   /* NULL when the canvas can't be allocated */
 void window_destroy(struct window *w);
 void window_show(struct window *w);
 struct canvas *window_begin_draw(struct window *w);

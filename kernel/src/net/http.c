@@ -172,7 +172,7 @@ static bool buf_append(struct buf *b, const void *p, size_t n) {
     if (b->len + n + 1 > b->cap) {
         size_t nc = b->cap ? b->cap * 2 : 16384;
         while (nc < b->len + n + 1) nc *= 2;
-        uint8_t *nd = krealloc(b->d, nc);
+        uint8_t *nd = krealloc_try(b->d, nc);   /* sizes come from the network: fail, do not panic */
         if (!nd) return false;
         b->d = nd; b->cap = nc;
     }
@@ -289,7 +289,15 @@ static int fetch_once(const struct http_request *req, const char *url, const cha
             set_error(resp, "Receiving the response failed: %s.", strerr((int)-n));
             break;
         }
-        if (n == 0) { complete = header_end != 0; if (!complete) { result = -EPROTO; set_error(resp, "The server closed the connection without sending a response."); } break; }
+        if (n == 0) {
+            /* end of stream: complete only for a body delimited by the close itself (no length, not chunked);
+             * a declared length or a chunked body cut short is a truncated response */
+            if (!header_end) { result = -EPROTO; set_error(resp, "The server closed the connection without sending a response."); }
+            else if (!no_body && (chunked_enc ? ch.state != 4 : content_length >= 0 && raw.len - header_end < (size_t)content_length)) {
+                result = -EPROTO; set_error(resp, "The connection closed before the response was complete.");
+            } else complete = true;
+            break;
+        }
         if (!buf_append(&raw, tmp, n)) { result = -ENOMEM; set_error(resp, "The page is too large."); break; }
         wire += n;
         while (!header_end && !result) {
