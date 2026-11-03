@@ -187,6 +187,7 @@ int64_t vfs_pwrite(struct vnode *v, uint64_t off, const void *buf, size_t n) {
     return v->ops->write(v, off, buf, n);
 }
 int64_t vfs_read(struct file *f, void *buf, size_t n) {
+    if ((f->flags & O_ACCMODE) == O_WRONLY) return -EBADF;
     if (f->vn->type == VN_DIR) return -EISDIR;
     int64_t r = vfs_pread(f->vn, f->pos, buf, n);
     if (r > 0) f->pos += r;
@@ -293,7 +294,13 @@ int vfs_read_file(const char *path, void **data, size_t *size) {
     char *buf = sz != (size_t)-1 ? kmalloc_try(sz + 1) : NULL;   /* size comes from disk */
     if (!buf) { vfs_close(f); return -ENOMEM; }
     size_t got = 0;
-    while (got < sz) { int64_t n = vfs_read(f, buf + got, sz - got); if (n <= 0) break; got += n; }
+    while (got < sz) {
+        int64_t n = vfs_read(f, buf + got, sz - got);
+        /* A whole-file copy must not turn a failed or incomplete read into
+         * success: rename would then delete the only complete copy. */
+        if (n <= 0) { kfree(buf); vfs_close(f); return n < 0 ? (int)n : -EIO; }
+        got += n;
+    }
     buf[got] = 0;
     vfs_close(f);
     *data = buf; if (size) *size = got;

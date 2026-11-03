@@ -411,23 +411,46 @@ static int rewrite_file(struct btrfs_fs *fs, struct bnode *b, const uint8_t *con
     return r;
 }
 
+/* fs->lock held and the whole-file buffer loaded. */
+static int64_t write_buffered(struct bnode *b, uint64_t off, const void *buf, size_t n) {
+    if (off > WBUF_MAX || n > WBUF_MAX - off) return -EFBIG;
+    uint64_t newsize = MAX(b->wsize, off + n);
+    int r = grow_wbuf(b, newsize);
+    if (r < 0) return r;
+    if (off > b->wsize) memset(b->wbuf + b->wsize, 0, off - b->wsize);
+    memcpy(b->wbuf + off, buf, n);
+    b->wsize = newsize;
+    if (!b->wdirty) { b->wdirty = true; b->wdirty_since = system_ticks; }
+    b->vn.size = newsize; b->vn.mtime = now_sec();
+    return (int64_t)n;
+}
+
 static int64_t b_write(struct vnode *v, uint64_t off, const void *buf, size_t n) {
     struct bnode *b = (struct bnode *)v; struct btrfs_fs *fs = b->fs;
     if (fs->readonly) return -EROFS;
     if (n == 0) return 0;
     if (off > WBUF_MAX || n > WBUF_MAX - off) return -EFBIG;
     mutex_lock(&fs->lock); btrfs_op_begin(fs);
-    int r = load_wbuf(fs, b);
-    if (r < 0) { mutex_unlock(&fs->lock); return r; }
-    uint64_t newsize = MAX(b->wsize, off + n);
-    if ((r = grow_wbuf(b, newsize)) < 0) { mutex_unlock(&fs->lock); return r; }
-    if (off > b->wsize) memset(b->wbuf + b->wsize, 0, off - b->wsize);
-    memcpy(b->wbuf + off, buf, n);
-    b->wsize = newsize;
-    if (!b->wdirty) { b->wdirty = true; b->wdirty_since = system_ticks; }
-    b->vn.size = newsize; b->vn.mtime = now_sec();
+    int64_t r = load_wbuf(fs, b);
+    if (r == 0) r = write_buffered(b, off, buf, n);
     mutex_unlock(&fs->lock);
-    return (int64_t)n;
+    return r;
+}
+
+static int64_t b_append(struct vnode *v, const void *buf, size_t n, uint64_t *end) {
+    struct bnode *b = (struct bnode *)v; struct btrfs_fs *fs = b->fs;
+    if (fs->readonly) return -EROFS;
+    mutex_lock(&fs->lock); btrfs_op_begin(fs);
+    int64_t r = n ? load_wbuf(fs, b) : 0;
+    if (r == 0) {
+        /* Choose EOF under the same lock as the write, after loading any
+         * existing data. Another appender cannot reuse this offset. */
+        uint64_t off = n ? b->wsize : v->size;
+        r = n ? write_buffered(b, off, buf, n) : 0;
+        *end = r > 0 ? off + r : off;
+    }
+    mutex_unlock(&fs->lock);
+    return r;
 }
 
 static int b_truncate(struct vnode *v, uint64_t size) {
@@ -642,7 +665,7 @@ static int b_sync(struct vnode *v) {
 }
 static void b_release(struct vnode *v) { /* inodes stay cached */ }
 
-static const struct vnode_ops btrfs_ops = { b_read, b_write, b_truncate, b_lookup, b_readdir, b_create, b_unlink, NULL, b_release, b_sync };
+static const struct vnode_ops btrfs_ops = { b_read, b_write, b_truncate, b_lookup, b_readdir, b_create, b_unlink, NULL, b_release, b_sync, b_append };
 
 static uint64_t find_highest_ino(struct btrfs_fs *fs) {
     struct btrfs_key k = { BTRFS_LAST_FREE_OBJECTID, 0, 0 };

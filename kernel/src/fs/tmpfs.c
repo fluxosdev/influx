@@ -61,6 +61,7 @@ static int64_t t_read(struct vnode *v, uint64_t off, void *buf, size_t n) {
 /* caller holds t->lock */
 static int64_t write_locked(struct tnode *t, uint64_t off, const void *buf, size_t n) {
     struct vnode *v = &t->vn;
+    if (n == 0) return 0;
     if (off > TMPFS_FILE_MAX || n > TMPFS_FILE_MAX - off) return -EFBIG;
     int r = grow(t, off + n); if (r < 0) return r;
     if (off > v->size) memset(t->data + v->size, 0, off - v->size);
