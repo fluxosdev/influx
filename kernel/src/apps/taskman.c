@@ -45,7 +45,7 @@ static int cmp_rows(const struct prow *a, const struct prow *b, int col) {
 
 static void refresh(struct tm_app *t) {
     sched_sample_cpu();
-    uint64_t irqf = irq_save();   /* the reaper can't free a process while we copy it (single CPU) */
+    procs_lock();   /* the reaper can't free a process while we copy it */
     struct process *list[64]; int n = process_list(list, 64);
     t->nrows = 0; t->total_threads = 0;
     for (int i = 0; i < n; i++) {
@@ -58,7 +58,7 @@ static void refresh(struct tm_app *t) {
         if (p->pid == 1) r->cpu = 0;   /* kernel: idle thread would dominate */
         t->total_threads += r->threads;
     }
-    irq_restore(irqf);
+    procs_unlock();
     for (int i = 1; i < t->nrows; i++) { struct prow k = t->rows[i]; int j = i - 1; while (j >= 0) { int c = cmp_rows(&t->rows[j], &k, t->sort_col); if (t->sort_desc) c = -c; if (c <= 0) break; t->rows[j + 1] = t->rows[j]; j--; } t->rows[j + 1] = k; }
     t->cpu_hist[t->hist_pos] = 100 - sched_idle_percent();
     t->hist_pos = (t->hist_pos + 1) % HIST;
@@ -144,7 +144,15 @@ static void draw(struct tm_app *t) {
     char buf[64];
     int lx = gx + gw + 16;
     snprintf(buf, sizeof buf, "CPU  %d%%", cur); font_draw(c, font_ui_semibold, lx, gy, theme.text, buf);
-    snprintf(buf, sizeof buf, "Idle: %d%%", 100 - cur); font_draw(c, font_ui_small, lx, gy + 20, theme.text_secondary, buf);
+    /* one small meter per core */
+    int fh = font_height(font_ui_semibold), cx = lx + font_text_width(font_ui_semibold, "CPU  100%") + 10;
+    for (int i = 0; i < cpu_count && i < 32; i++) {
+        int mh = fh, x = cx + i * (cpu_count > 16 ? 4 : 7), fill = sched_cpu_load(i) * mh / 100;
+        int mw = cpu_count > 16 ? 3 : 5;
+        gfx_fill_rect(c, x, gy, mw, mh, theme.dark ? RGB(0x3A, 0x3A, 0x3E) : RGB(0xDD, 0xDD, 0xE0));
+        if (fill > 0) gfx_fill_rect(c, x, gy + mh - fill, mw, fill, theme.accent);
+    }
+    snprintf(buf, sizeof buf, "Idle: %d%%   %d core%s", 100 - cur, cpu_count, cpu_count == 1 ? "" : "s"); font_draw(c, font_ui_small, lx, gy + 20, theme.text_secondary, buf);
     snprintf(buf, sizeof buf, "Context switches: %lu", sched_context_switches); font_draw(c, font_ui_small, lx, gy + 36, theme.text_secondary, buf);
     uint64_t s = system_ticks / 1000;
     snprintf(buf, sizeof buf, "Uptime: %lu:%02lu:%02lu", s / 3600, (s / 60) % 60, s % 60); font_draw(c, font_ui_small, lx, gy + 52, theme.text_secondary, buf);
@@ -172,12 +180,12 @@ static void force_quit(struct tm_app *t) {
 static void process_info(struct tm_app *t) {
     struct prow *r = NULL; for (int i = 0; i < t->nrows; i++) if (t->rows[i].pid == t->selected_pid) r = &t->rows[i];
     if (!r) return;
-    uint64_t irqf = irq_save();
+    procs_lock();
     struct process *p = process_find(r->pid);
     char mem[32]; format_mem(r->mem, mem, sizeof mem);
     char msg[400]; int o = snprintf(msg, sizeof msg, "%s\n\nPID: %d\nType: %s\nThreads: %d\nMemory: %s\nCPU: %d%%", r->name, r->pid, r->user ? "User process" : "Kernel process", r->threads, mem, r->cpu);
     if (p) { struct thread *th; list_for_each_entry(th, &p->threads, proc_link) if (o < (int)sizeof msg - 40) o += snprintf(msg + o, sizeof msg - o, "\n  thread %d “%s”: %lu ms", th->tid, th->name, th->cpu_ticks); if (p->is_user == false && p->cwd[0] && o < (int)sizeof msg) o += snprintf(msg + o, sizeof msg - o, "\nWorking directory: %s", p->cwd); }
-    irq_restore(irqf);
+    procs_unlock();
     dialog_message("Process Info", msg);
 }
 

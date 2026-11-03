@@ -2,6 +2,7 @@
 #include "string.h"
 #include "io.h"
 #include "spinlock.h"
+#include "arch.h"
 #include <limine.h>
 
 extern volatile struct limine_memmap_request memmap_request;
@@ -41,20 +42,30 @@ static void map_2m(uint64_t pml4, uint64_t virt, uint64_t phys, uint64_t flags) 
     t[(virt >> 21) & 0x1FF] = phys | flags | PTE_HUGE | PTE_PRESENT;
 }
 
+/* Replacing or removing a present mapping must reach every CPU's TLB. User
+ * processes are single-threaded and every CR3 load flushes their entries,
+ * but the other CPUs may hold stale (global) kernel-half entries. */
+static void flush_after(uint64_t virt, uint64_t pages, bool was_present) {
+    if (was_present && virt >= 0xFFFF800000000000ULL) tlb_shootdown(virt, pages);
+    else tlb_flush_local(virt, pages);
+}
+
 void vmm_map(uint64_t pml4, uint64_t virt, uint64_t phys, uint64_t flags) {
     spin_lock(&lock);
     uint64_t *pte = walk(pml4, virt, true, flags & PTE_USER);
+    bool was = *pte & PTE_PRESENT;
     *pte = (phys & PTE_ADDR_MASK) | flags | PTE_PRESENT;
     spin_unlock(&lock);
-    invlpg(virt);
+    flush_after(virt, 1, was);
 }
 
 void vmm_unmap(uint64_t pml4, uint64_t virt) {
     spin_lock(&lock);
     uint64_t *pte = walk(pml4, virt, false, 0);
+    bool was = pte && (*pte & PTE_PRESENT);
     if (pte) *pte = 0;
     spin_unlock(&lock);
-    invlpg(virt);
+    flush_after(virt, 1, was);
 }
 
 uint64_t vmm_get_phys(uint64_t pml4, uint64_t virt) {
@@ -156,6 +167,7 @@ void *vmm_map_mmio(uint64_t phys, size_t size) { return map_mmio(phys, size, PTE
 void *vmm_map_wc(uint64_t phys, size_t size) { return map_mmio(phys, size, PTE_PWT); }
 static void *map_mmio(uint64_t phys, size_t size, uint64_t cache_bits) {
     uint64_t start = PAGE_ALIGN_DOWN(phys), end = PAGE_ALIGN_UP(phys + size);
+    bool changed = false;   /* replaced a live translation (HHDM RAM, a split 2 MiB page) */
     for (uint64_t p = start; p < end; p += PAGE_SIZE) {
         /* If the HHDM already covers this via a 2 MiB page, remap that 2 MiB
          * region with 4 KiB uncached pages. */
@@ -169,6 +181,7 @@ static void *map_mmio(uint64_t phys, size_t size, uint64_t cache_bits) {
         uint64_t *pdee = &table_of(*pde)[(v >> 21) & 0x1FF];
         if (!(*pdee & PTE_PRESENT)) *pdee = pmm_alloc_page() | PTE_PRESENT | PTE_WRITE;
         if (*pdee & PTE_HUGE) {
+            changed = true;
             uint64_t base = *pdee & PTE_ADDR_MASK & ~0x1FFFFFULL;
             uint64_t pt = pmm_alloc_page();
             uint64_t *ptt = table_of(pt);
@@ -176,9 +189,11 @@ static void *map_mmio(uint64_t phys, size_t size, uint64_t cache_bits) {
             *pdee = pt | PTE_PRESENT | PTE_WRITE;
         }
         uint64_t *pte = &table_of(*pdee)[(v >> 12) & 0x1FF];
-        *pte = p | PTE_PRESENT | PTE_WRITE | PTE_GLOBAL | cache_bits | PTE_NX;
+        uint64_t nv = p | PTE_PRESENT | PTE_WRITE | PTE_GLOBAL | cache_bits | PTE_NX;
+        if ((*pte & PTE_PRESENT) && *pte != nv) changed = true;
+        *pte = nv;
         spin_unlock(&lock);
-        invlpg(v);
     }
+    flush_after(hhdm_offset + start, (end - start) / PAGE_SIZE, changed);
     return P2V(phys);
 }

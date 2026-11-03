@@ -1,12 +1,13 @@
 .section .text
 .extern syscall_dispatch
-.extern kernel_rsp_for_syscall
 .global syscall_entry
-/* Entered with interrupts masked (SFMASK). rcx = user rip, r11 = user rflags, rsp = user stack. */
+/* Entered with interrupts masked (SFMASK). rcx = user rip, r11 = user rflags, rsp = user stack.
+ * The per-CPU offsets are CPU_OFF_SYSCALL_RSP / CPU_OFF_USER_RSP in percpu.h. */
 syscall_entry:
-    movq %rsp, user_rsp_scratch(%rip)
-    movq kernel_rsp_for_syscall(%rip), %rsp
-    pushq user_rsp_scratch(%rip)   /* user rsp */
+    swapgs
+    movq %rsp, %gs:24              /* user rsp, until it is on the kernel stack */
+    movq %gs:16, %rsp              /* this thread's kernel stack */
+    pushq %gs:24                   /* user rsp */
     pushq %rcx                     /* user rip */
     pushq %r11                     /* user rflags */
     pushq %rbx
@@ -41,10 +42,8 @@ syscall_entry:
     popq %rbx
     popq %r11
     popq %rcx
+    swapgs
     popq %rsp
     sysretq
-
-.section .bss
-user_rsp_scratch: .quad 0
 
 .section .note.GNU-stack,"",@progbits

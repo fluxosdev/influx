@@ -319,12 +319,13 @@ static void draw(struct settings *s) {
         if (logo) gfx_blit_scaled_tinted(c, cx, cy, 72, 72, logo, theme.text);
         font_draw(c, font_ui_title, cx + 90, cy + 8, theme.text, "inFlux");
         snprintf(buf, sizeof buf, "Version %s", INFLUX_VERSION); font_draw(c, font_ui, cx + 90, cy + 40, theme.text_secondary, buf);
-        char brand[64]; cpu_get_brand(brand, sizeof brand);
+        char brand[64], cpu[96]; cpu_get_brand(brand, sizeof brand);
+        snprintf(cpu, sizeof cpu, cpu_count > 1 ? "%s (%d cores)" : "%s", brand, cpu_count);
         char isa[64]; cpu_simd_describe(isa, sizeof isa);
         char mem[32]; snprintf(mem, sizeof mem, "%lu MB", pmm_total_bytes() >> 20);
         char disp[32]; snprintf(disp, sizeof disp, "%d × %d", wm_screen_w(), wm_screen_h());
         const char *labels[] = { "Name", "Processor", "Extensions", "Memory", "Display", "Boot loader", "Kernel" };
-        const char *vals[] = { system_hostname, brand, isa, mem, disp, "Limine", "inFlux x86-64, preemptive, multithreaded" };
+        const char *vals[] = { system_hostname, cpu, isa, mem, disp, "Limine", "inFlux x86-64, preemptive, multithreaded" };
         int ty = cy + 96;
         for (int i = 0; i < 7; i++) { font_draw_aligned(c, font_ui_semibold, rect_make(cx, ty, 90, 20), theme.text, labels[i], 2); font_draw_ellipsized(c, font_ui, cx + 102, ty + 3, cw - 110, theme.text_secondary, vals[i]); ty += 24; }
         font_draw(c, font_ui_small, cx, ty + 16, theme.text_tertiary, "This operating system was written entirely by Claude (Anthropic).");

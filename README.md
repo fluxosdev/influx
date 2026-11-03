@@ -21,6 +21,11 @@ shell, user-space C library and build system.
   spaces, bucket heap allocator
 - Preemptive round-robin scheduler with kernel threads and ring-3 user
   threads, sleep queues, wait queues, mutexes, semaphores, FPU state switching
+- SMP: every core Limine finds (up to 64) runs threads from a shared run
+  queue, with per-CPU GDT/TSS, LAPIC timers and idle threads, IPIs to wake
+  idle cores and TLB shootdowns; a worker pool (`smp_parallel_for`) spreads
+  window composition and the blur over the cores. `cmdline: nosmp` in
+  `limine.conf` keeps to one CPU
 - **AVX required**: boot stops at the splash screen with an error on CPUs
   without AVX (Intel Sandy Bridge / AMD Bulldozer or newer). XSAVE/XSAVEOPT
   context switching of the full x87/SSE/AVX (and AVX-512) register state; AVX
@@ -269,6 +274,9 @@ inFlux needs an AVX-capable CPU. The `run` targets pass `-cpu max` (QEMU's
 default emulated CPU has no AVX) and `run-kvm` passes `-cpu host`; when starting
 QEMU by hand, pick a CPU model with AVX.
 
+The `run` targets start two CPUs; use e.g. `make run QEMU_SMP="-smp 8"`, or
+`make run QEMU_SMP=` for one.
+
 Changing the SVG icon sources requires `python3` with `cairosvg`; run
 `tools/render_icons.py` to regenerate the committed PNGs.
 
@@ -324,7 +332,9 @@ third_party         Limine, stb headers
 
 ## Limitations
 
-- Single CPU (other cores are left parked), no audio.
+- SMP: one shared run queue with no CPU affinity, every device interrupt is
+  delivered to the boot CPU, and xAPIC only (no x2APIC, so no more than 255
+  APIC IDs).
 - USB: no UHCI/OHCI drivers (keyboards on USB 1.1 companion ports keep working
   through the BIOS's PS/2 emulation), isochronous transfers on xHCI only (USB
   audio does not work behind an EHCI controller), mass storage over Bulk-Only

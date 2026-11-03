@@ -1,5 +1,6 @@
 #pragma once
 #include "kernel.h"
+#include "percpu.h"
 
 /* Register frame pushed by the interrupt stubs (see isr.S) */
 struct regs {
@@ -22,15 +23,20 @@ typedef void (*irq_handler_t)(struct regs *r, void *ctx);
 #define IRQ_KEYBOARD  1
 #define IRQ_MOUSE     12
 #define VEC_LAPIC_TIMER 0x40
+#define VEC_RESCHED     0xF0   /* IPI: wake an idle CPU to pick up new work */
+#define VEC_TLB         0xF1   /* IPI: flush the TLB entries in tlb_req */
+#define VEC_HALT        0xF2   /* IPI: stop (another CPU panicked) */
 #define VEC_SPURIOUS    0xFF
 
-void gdt_init(void);
+void gdt_init(void);               /* the calling CPU's GDT, TSS and IST stacks (this_cpu() must be set) */
 void tss_set_kernel_stack(uint64_t rsp);
 void idt_init(void);
+void idt_load(void);               /* an AP loads the IDT idt_init built */
 void idt_set_gate(uint8_t vec, void *handler, uint8_t ist, uint8_t dpl);
 void irq_register(uint8_t vec, irq_handler_t h, void *ctx);
 int irq_alloc_vector(void);        /* a free vector for a device interrupt, 0 if none left */
 void cpu_init(void);
+void cpu_init_ap(void);            /* control registers and MSRs on an AP, matching what cpu_init chose */
 void cpu_get_brand(char *out, size_t n);
 uint64_t cpu_tsc_hz(void);
 
@@ -50,9 +56,23 @@ extern struct madt_info madt;
 
 /* APIC */
 void lapic_init(void);
+void lapic_init_ap(void);
 void lapic_eoi(void);
-void lapic_timer_start(uint32_t hz);
+void lapic_timer_start(uint32_t hz);   /* calibrates on the first call (BSP), reuses that on APs */
 uint32_t lapic_id(void);
+uint32_t lapic_bsp_id(void);       /* where device interrupts are delivered */
+void lapic_send_ipi(uint32_t apic_id, uint8_t vector);
+
+/* SMP (arch/smp.c) */
+void smp_init(void);               /* start the APs; after sched_init and timer_init */
+void smp_send_resched(int cpu);
+void smp_halt_others(void);        /* panic: stop every other CPU */
+void tlb_shootdown(uint64_t virt, uint64_t pages);   /* invalidate on every CPU, waiting for all of them */
+void tlb_flush_local(uint64_t virt, uint64_t pages);
+/* Run fn(ctx, i) for i in [0, n) spread over the CPUs; returns when all are done.
+ * The calling thread takes part. Callbacks run on kernel threads, so simd_ok() holds. */
+void smp_parallel_for(int n, void (*fn)(void *ctx, int i), void *ctx);
+int smp_workers(void);             /* how many CPUs smp_parallel_for can use */
 void ioapic_init(void);
 void ioapic_route_irq(uint8_t irq, uint8_t vector);
 bool ioapic_route_gsi(uint32_t gsi, uint8_t vector, bool level, bool active_low);

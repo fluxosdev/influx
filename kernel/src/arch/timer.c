@@ -5,8 +5,9 @@ volatile uint64_t system_ticks;
 static uint64_t boot_unix;
 int64_t tz_offset_minutes = 0;
 
+/* every CPU's LAPIC timer lands here; the BSP's keeps the time */
 static void timer_irq(struct regs *r, void *ctx) {
-    system_ticks++;
+    if (this_cpu()->id == 0) system_ticks++;
     sched_tick(r);   /* sends the EOI */
 }
 

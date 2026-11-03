@@ -48,7 +48,10 @@ static void init_thread(void *arg) {
     desktop_main(NULL);
 }
 
+void syscall_init_cpu(void);
+
 void kmain(void) {
+    percpu_init(&cpus[0], 0);   /* before anything reads current_thread */
     serial_init();
     kprintf("\n\033[36;1minFlux\033[0m %s booting...\n", INFLUX_VERSION);
     if (!LIMINE_BASE_REVISION_SUPPORTED) panic("limine base revision not supported");
@@ -67,6 +70,7 @@ void kmain(void) {
     gdt_init();
     idt_init();
     cpu_init();
+    syscall_init_cpu();
     pmm_init();
     vmm_init();
     heap_init();
@@ -83,6 +87,7 @@ void kmain(void) {
     sched_init();
     timer_init();
     sti();
+    smp_init();
     vfs_init();
     if (boot_info.initrd) initrd_unpack(boot_info.initrd, boot_info.initrd_size, "/");
     /* the initrd module memory is bootloader-reclaimable; we copied it, leave it */

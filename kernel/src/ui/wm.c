@@ -429,13 +429,14 @@ static void draw_traffic_lights(struct canvas *c, struct window *w, struct rect 
     }
 }
 
-static void draw_window(struct canvas *c, struct window *w) {
+/* 'held': the caller already holds w->lock (parallel composition) */
+static void draw_window(struct canvas *c, struct window *w, bool held) {
     struct rect o = win_outer(w);
     bool active = (w == focused);
     if (!rect_overlaps(win_shadow_rect(w), c->clip)) return;
     gfx_shadow_ex(c, o.x, o.y + 6, o.w, o.h, WIN_RADIUS, active ? SHADOW_SPREAD_FOCUSED : SHADOW_SPREAD_UNFOCUSED, active ? 120 : 70, o);
     gfx_shadow_ex(c, o.x, o.y, o.w, o.h, WIN_RADIUS, 2, 90, o);
-    mutex_lock(&w->lock);
+    if (!held) mutex_lock(&w->lock);
     if (w->flags & WIN_FULL_TITLE) {
         draw_rounded_blit(c, o.x, o.y, w->canvas, WIN_RADIUS, 15);
     } else {
@@ -443,7 +444,7 @@ static void draw_window(struct canvas *c, struct window *w) {
         gfx_hline(c, o.x, o.y + TITLEBAR_H - 1, o.w, theme.titlebar_line);
         draw_rounded_blit(c, w->frame.x, w->frame.y, w->canvas, WIN_RADIUS, 12);
     }
-    mutex_unlock(&w->lock);
+    if (!held) mutex_unlock(&w->lock);
     struct rect tb = rect_make(o.x, o.y, o.w, TITLEBAR_H);
     draw_traffic_lights(c, w, tb);
     if (!(w->flags & WIN_DIALOG) || w->title[0]) {
@@ -656,11 +657,38 @@ static int dock_item_at(int mx, int my) {
 }
 
 /* ---- compose ---- */
-static void compose(struct rect r) {
-    canvas_set_clip(screen, r);
-    gfx_blit_rect(screen, r.x, r.y, wallpaper, r, false);
+/* Wallpaper and windows go down in horizontal bands spread over the CPUs.
+ * The dock, whose blur reads the whole composed backdrop, and everything above
+ * it follow on the full rect. The compositor holds every window lock across
+ * the bands (the usual wm_lock -> w->lock order), so the bands draw without them. */
+#define COMPOSE_BAND_MIN_PX (64 * 1024)
+struct compose_job { struct rect r; int bands; };
+
+static void compose_band(void *ctx, int i) {
+    struct compose_job *j = ctx;
+    int y0 = j->r.y + j->r.h * i / j->bands, y1 = j->r.y + j->r.h * (i + 1) / j->bands;
+    struct rect band = rect_make(j->r.x, y0, j->r.w, y1 - y0);
+    struct canvas c = *screen;
+    canvas_set_clip(&c, band);
+    gfx_blit_rect(&c, band.x, band.y, wallpaper, band, false);
     struct window *w;
-    list_for_each_entry(w, &windows, link) if (!(w->flags & WIN_MINIMIZED)) draw_window(screen, w);
+    list_for_each_entry(w, &windows, link) if (!(w->flags & WIN_MINIMIZED)) draw_window(&c, w, true);
+}
+
+static void compose(struct rect r) {
+    struct window *w;
+    int bands = smp_workers() > 1 && r.w * r.h >= COMPOSE_BAND_MIN_PX ? MIN(smp_workers() * 2, r.h / 16) : 1;
+    if (bands > 1) {
+        list_for_each_entry(w, &windows, link) mutex_lock(&w->lock);
+        struct compose_job j = { r, bands };
+        smp_parallel_for(bands, compose_band, &j);
+        list_for_each_entry(w, &windows, link) mutex_unlock(&w->lock);
+        canvas_set_clip(screen, r);
+    } else {
+        canvas_set_clip(screen, r);
+        gfx_blit_rect(screen, r.x, r.y, wallpaper, r, false);
+        list_for_each_entry(w, &windows, link) if (!(w->flags & WIN_MINIMIZED)) draw_window(screen, w, false);
+    }
     draw_dock(screen);
     draw_menubar(screen);
     if (open_menu != -1) draw_menu_popup(screen);

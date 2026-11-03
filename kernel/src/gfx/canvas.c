@@ -375,6 +375,21 @@ void gfx_blur_rect_rounded(struct canvas *c, struct rect r, int radius, int cr) 
     kfree(save);
 }
 
+/* The SIMD passes split across CPUs: rows are independent in the horizontal
+ * pass and columns in the vertical one (bands of 8 keep the AVX2 path whole). */
+struct blur_job { uint32_t *px; int stride; uint32_t *tmp; uint8_t *sums; int w, h, radius, bands; };
+static void blur_h_band(void *ctx, int i) {
+    struct blur_job *j = ctx;
+    int y0 = j->h * i / j->bands, y1 = j->h * (i + 1) / j->bands;
+    simd_blur_h(j->px + (size_t)y0 * j->stride, j->stride, j->tmp + (size_t)y0 * j->w, j->w, j->w, y1 - y0, j->radius);
+}
+static void blur_v_band(void *ctx, int i) {
+    struct blur_job *j = ctx;
+    int x0 = (j->w * i / j->bands) & ~7, x1 = i == j->bands - 1 ? j->w : (j->w * (i + 1) / j->bands) & ~7;
+    if (x1 > x0) simd_blur_v(j->tmp + x0, j->w, j->px + x0, j->stride, x1 - x0, j->h, j->radius, j->sums + (size_t)x0 * 16);
+}
+#define BLUR_PARALLEL_MIN_PX (32 * 1024)
+
 /* Cheap box blur (2 passes) within r, used for translucent surfaces */
 void gfx_blur_rect(struct canvas *c, struct rect r, int radius) {
     r = rect_intersect(r, rect_make(0, 0, c->w, c->h));
@@ -382,10 +397,11 @@ void gfx_blur_rect(struct canvas *c, struct rect r, int radius) {
     uint32_t *tmp = kmalloc((size_t)r.w * r.h * 4);
     if (radius <= SIMD_BLUR_MAX_RADIUS && simd_ok()) {
         void *sums = kmalloc((size_t)r.w * 16);
-        uint32_t *px = c->px + r.y * c->stride + r.x;
+        struct blur_job j = { c->px + r.y * c->stride + r.x, c->stride, tmp, sums, r.w, r.h, radius, 1 };
+        if (r.w * r.h >= BLUR_PARALLEL_MIN_PX) j.bands = MAX(1, MIN(smp_workers(), MIN(r.h, r.w / 8)));
         for (int pass = 0; pass < 2; pass++) {
-            simd_blur_h(px, c->stride, tmp, r.w, r.w, r.h, radius);
-            simd_blur_v(tmp, r.w, px, c->stride, r.w, r.h, radius, sums);
+            smp_parallel_for(j.bands, blur_h_band, &j);
+            smp_parallel_for(j.bands, blur_v_band, &j);
         }
         kfree(sums); kfree(tmp);
         return;

@@ -38,6 +38,8 @@ struct thread {
     struct waitq *waiting_on;
     bool kill_pending;
     bool is_user;
+    bool on_cpu;                  /* running, or its CPU has not finished switching away (sched_lock) */
+    bool wake_pending;            /* woken while not waiting: its next wait returns at once (sched_lock) */
 };
 
 struct process {
@@ -65,11 +67,13 @@ struct process {
 };
 void process_close_windows(struct process *p);
 
-extern struct thread *current_thread;
+/* current_thread is per CPU (percpu.h) */
 extern struct process *kernel_process;
 
 void sched_init(void);
 void sched_start(void) NORETURN;
+void sched_create_idle(struct cpu *c);
+void sched_ap_enter(void) NORETURN;   /* an AP, set up, starts scheduling */
 struct thread *thread_create(struct process *p, const char *name, void (*entry)(void *), void *arg);
 struct thread *thread_create_user(struct process *p, const char *name, uint64_t rip, uint64_t rsp);
 void thread_exit(int code) NORETURN;
@@ -86,12 +90,18 @@ void thread_kill(struct thread *t);
 struct process *process_create(const char *name, bool user);
 void process_exit(int code) NORETURN;
 struct process *process_find(int pid);
+/* Hold off process and thread creation, exit and freeing: a walk of the
+ * process list, or of a process's threads, is safe between these. Recursive;
+ * interrupts stay off, so nothing in between may sleep. */
+void procs_lock(void);
+void procs_unlock(void);
 int process_wait(int pid, int *status);
 bool process_kill(int pid, int sig);
 int process_list(struct process **out, int max);
 int thread_list(struct thread **out, int max);
 void sched_sample_cpu(void);          /* refresh cpu_percent fields (task manager) */
-int sched_idle_percent(void);
+int sched_idle_percent(void);         /* averaged over the CPUs */
+int sched_cpu_load(int cpu);          /* busy percent of one CPU over the last sample */
 extern uint64_t sched_context_switches;
 
 /* wait queues */

@@ -21,10 +21,13 @@ void heap_init(void) {}
 
 static void account(int pid, int64_t delta) {
     if (pid <= 0) return;
-    uint64_t f = irq_save();   /* single CPU: nothing can free p until irqs come back */
+    /* the caller's own process cannot be freed under it; any other is held by the procs lock */
+    struct thread *t = current_thread;
+    if (t && t->proc && t->proc->pid == pid) { __atomic_fetch_add(&t->proc->heap_bytes, delta, __ATOMIC_RELAXED); return; }
+    procs_lock();
     struct process *p = process_find(pid);
-    if (p) p->heap_bytes += delta;
-    irq_restore(f);
+    if (p) __atomic_fetch_add(&p->heap_bytes, delta, __ATOMIC_RELAXED);
+    procs_unlock();
 }
 
 static void refill(int b) {

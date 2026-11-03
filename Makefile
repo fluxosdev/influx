@@ -173,6 +173,8 @@ $(DISK_INSTALL):
 QEMU      := qemu-system-x86_64
 # inFlux requires AVX, which TCG's default CPU model lacks; 'max' has AVX and AVX2
 QEMU_CPU  := -cpu max
+# processors; e.g. make run QEMU_SMP="-smp 8", or QEMU_SMP= for one
+QEMU_SMP  ?= -smp 2
 # NE2000 (RTL8029) on QEMU's user-mode network: DHCP gives 10.0.2.15, the host is reachable as 10.0.2.2
 QEMU_NET  := -netdev user,id=net0 -device ne2k_pci,netdev=net0
 # Intel HD Audio with a line-out codec, played through the host's PulseAudio/PipeWire;
@@ -182,10 +184,10 @@ QEMU_AUDIO ?= -audiodev $(QEMU_AUDIODEV),id=snd0 -device intel-hda -device hda-d
 # xHCI with a USB tablet: an absolute pointer, so the window needs no mouse grab.
 # Plug in a USB stick image with e.g. make run USB_STICK=stick.img, or set QEMU_USB=
 # for no USB at all
-QEMU_USB ?= -device qemu-xhci,id=xhci -device usb-tablet,bus=xhci.0 \
-            $(if $(USB_STICK),-drive id=stick,file=$(USB_STICK),format=raw,if=none -device usb-storage,bus=xhci.0,drive=stick)
+QEMU_STICK = -drive id=stick,file=$(USB_STICK),format=raw,if=none -device usb-storage,bus=xhci.0,drive=stick
+QEMU_USB ?= -device qemu-xhci,id=xhci -device usb-tablet,bus=xhci.0 $(if $(USB_STICK),$(QEMU_STICK))
 # the live CD gets bootindex=0 so it boots ahead of an installed system on install.img
-QEMU_ARGS := -M q35 -m 2G -serial stdio \
+QEMU_ARGS := -M q35 -m 2G $(QEMU_SMP) -serial stdio \
              -drive id=cd0,file=$(ISO),format=raw,media=cdrom,readonly=on,if=none \
              -device ide-cd,drive=cd0,bus=ide.2,bootindex=0 \
              -device ahci,id=ahci \
@@ -200,13 +202,13 @@ run-kvm: $(ISO) disk
 
 # boot an installed system (after using the installer on build/install.img)
 run-installed: $(DISK_INSTALL)
-	$(QEMU) $(QEMU_CPU) -M q35 -m 2G -serial stdio $(QEMU_NET) $(QEMU_AUDIO) $(QEMU_USB) -vga std -display gtk,zoom-to-fit=on -drive file=$(DISK_INSTALL),format=raw,if=none,id=d -device ahci,id=ahci -device ide-hd,drive=d,bus=ahci.0
+	$(QEMU) $(QEMU_CPU) -M q35 -m 2G $(QEMU_SMP) -serial stdio $(QEMU_NET) $(QEMU_AUDIO) $(QEMU_USB) -vga std -display gtk,zoom-to-fit=on -drive file=$(DISK_INSTALL),format=raw,if=none,id=d -device ahci,id=ahci -device ide-hd,drive=d,bus=ahci.0
 
 OVMF_CODE ?= /usr/share/OVMF/OVMF_CODE_4M.fd
 OVMF_VARS ?= /usr/share/OVMF/OVMF_VARS_4M.fd
 run-installed-uefi: $(DISK_INSTALL)
 	cp -n $(OVMF_VARS) $(BUILD)/ovmf_vars.fd || true
-	$(QEMU) $(QEMU_CPU) -M q35 -m 2G -serial stdio $(QEMU_NET) $(QEMU_AUDIO) $(QEMU_USB) -vga std -display gtk,zoom-to-fit=on \
+	$(QEMU) $(QEMU_CPU) -M q35 -m 2G $(QEMU_SMP) -serial stdio $(QEMU_NET) $(QEMU_AUDIO) $(QEMU_USB) -vga std -display gtk,zoom-to-fit=on \
 	    -drive if=pflash,format=raw,readonly=on,file=$(OVMF_CODE) -drive if=pflash,format=raw,file=$(BUILD)/ovmf_vars.fd \
 	    -drive file=$(DISK_INSTALL),format=raw,if=none,id=d -device ahci,id=ahci -device ide-hd,drive=d,bus=ahci.0
 

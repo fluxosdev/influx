@@ -45,6 +45,7 @@ enter_user_mode:
     xorq %r13, %r13
     xorq %r14, %r14
     xorq %r15, %r15
+    swapgs               /* user GS; the kernel's per-CPU pointer waits in KERNEL_GS_BASE */
     iretq
 
 .section .note.GNU-stack,"",@progbits

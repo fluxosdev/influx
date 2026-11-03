@@ -8,31 +8,62 @@
 extern void context_switch(uint64_t *old_rsp, uint64_t new_rsp);
 extern void enter_user_mode(uint64_t rip, uint64_t rsp);
 
-struct thread *current_thread;
 struct process *kernel_process;
 uint64_t sched_context_switches;
-uint64_t kernel_rsp_for_syscall;   /* read by the syscall entry stub */
 
 static LIST_HEAD(run_queue);
 static LIST_HEAD(sleep_list);
 static LIST_HEAD(all_threads);
 static LIST_HEAD(all_processes);
-static struct thread *idle_thread;
-static struct thread *reap_thread;
 static int next_tid = 1, next_pid = 1;
-static uint64_t idle_ticks, idle_sample;
-static spinlock_t sched_lock = SPINLOCK_INIT;   /* protects the lists */
+/* sched_lock: the run queue, the sleep list, wait queues and thread state.
+ * schedule() holds it across context_switch and the thread switched to drops
+ * it (finish_switch), so no other CPU can pick a thread up before its
+ * registers are saved. Taken with interrupts already off. */
+static spinlock_t sched_lock = SPINLOCK_INIT;
+static volatile uint64_t idle_cpus;   /* bit per CPU halted in its idle loop */
+static spinlock_t exit_lock = SPINLOCK_INIT;   /* process->exited and its exit_wq */
 #define TIME_SLICE 10
 #define STACK_CANARY 0x57AC4CA9A2E57AC4ULL
 
+/* ---- procs lock: the process and thread lists, and process lifetime ----
+ * Recursive, since heap accounting looks processes up from inside walks that
+ * allocate. Order: procs lock, then sched_lock. */
+static spinlock_t procs_spin = SPINLOCK_INIT;
+static int procs_owner = -1, procs_depth;
+
+void procs_lock(void) {
+    uint64_t f = irq_save();
+    int me = this_cpu()->id;
+    if (__atomic_load_n(&procs_owner, __ATOMIC_RELAXED) == me) { procs_depth++; return; }
+    spin_acquire(&procs_spin);
+    procs_spin.flags = f;
+    procs_owner = me;
+    procs_depth = 1;
+}
+void procs_unlock(void) {
+    if (--procs_depth) return;
+    procs_owner = -1;
+    spin_unlock(&procs_spin);
+}
+
 /* Run whatever an interrupt woke right away instead of at the next tick: a
  * USB mass storage command waits for three completions, so this doubles its
- * throughput. sti; hlt cannot lose a wakeup: sti takes effect after the hlt. */
+ * throughput. sti; hlt cannot lose a wakeup: sti takes effect after the hlt.
+ * The idle bit is set before looking at the run queue and make_ready() looks
+ * at the bits after queueing, so either this CPU sees the work or gets an IPI. */
 static void idle_loop(void *arg) {
+    uint64_t bit = 1ULL << this_cpu()->id;
     for (;;) {
         cli();
-        if (!list_empty(&run_queue)) schedule();
+        __atomic_fetch_or(&idle_cpus, bit, __ATOMIC_SEQ_CST);
+        if (!list_empty(&run_queue)) {
+            __atomic_fetch_and(&idle_cpus, ~bit, __ATOMIC_SEQ_CST);
+            schedule();
+            continue;
+        }
         sti(); hlt();
+        __atomic_fetch_and(&idle_cpus, ~bit, __ATOMIC_SEQ_CST);
     }
 }
 
@@ -42,14 +73,48 @@ static void thread_free(struct thread *t) {
     kfree(t);
 }
 
+/* Second half of a context switch, on the thread switched to: release the
+ * previous thread to the other CPUs and free it if it exited. */
+static void finish_switch(void) {
+    struct cpu *c = this_cpu();
+    struct thread *prev = c->prev, *dead = NULL;
+    c->prev = NULL;
+    if (prev) {
+        prev->on_cpu = false;
+        if (prev->state == THREAD_ZOMBIE) dead = prev;
+    }
+    spin_release(&sched_lock);
+    if (dead) thread_free(dead);
+}
+
 static void thread_trampoline(void) {
     /* Runs on the new thread's stack after the first context switch. */
+    finish_switch();
     struct thread *t = current_thread;
-    if (reap_thread) { struct thread *r = reap_thread; reap_thread = NULL; thread_free(r); }
     sti();
     if (t->is_user) enter_user_mode(t->user_rip, t->user_rsp);
     t->entry(t->arg);
     thread_exit(0);
+}
+
+/* wake an idle CPU (not this one) for newly queued work; true if there was one */
+static bool kick_idle_cpu(void) {
+    __atomic_thread_fence(__ATOMIC_SEQ_CST);   /* the queued thread is visible before we read the bits */
+    uint64_t m = idle_cpus & ~(1ULL << this_cpu()->id);
+    if (!m) return false;
+    int cpu = __builtin_ctzll(m);
+    if (__atomic_fetch_and(&idle_cpus, ~(1ULL << cpu), __ATOMIC_SEQ_CST) & (1ULL << cpu)) smp_send_resched(cpu);
+    return true;
+}
+
+/* sched_lock held: t may run. A thread still on its CPU, on its way into
+ * schedule() after deciding to wait, only has its state flipped; schedule()
+ * sees READY and carries on. True if an idle CPU was woken to run it. */
+static bool make_ready(struct thread *t) {
+    t->state = THREAD_READY;
+    if (t->on_cpu) return false;
+    list_add_tail(&t->sched_link, &run_queue);
+    return kick_idle_cpu();
 }
 
 static struct thread *alloc_thread(struct process *p, const char *name) {
@@ -71,29 +136,33 @@ static struct thread *alloc_thread(struct process *p, const char *name) {
     t->rsp = (uint64_t)sp;
     t->fpu = fpu_state_alloc(&t->fpu_mem);     /* sane initial FPU/SSE/AVX state */
     list_init(&t->sched_link);
-    spin_lock(&sched_lock);
+    procs_lock();
     list_add_tail(&t->all_link, &all_threads);
     list_add_tail(&t->proc_link, &p->threads);
     p->nthreads++;
-    spin_unlock(&sched_lock);
+    procs_unlock();
     return t;
+}
+
+static void start_thread(struct thread *t) {
+    uint64_t f = irq_save();
+    spin_acquire(&sched_lock);
+    make_ready(t);
+    spin_release(&sched_lock);
+    irq_restore(f);
 }
 
 struct thread *thread_create(struct process *p, const char *name, void (*entry)(void *), void *arg) {
     struct thread *t = alloc_thread(p ? p : kernel_process, name);
     t->entry = entry; t->arg = arg;
-    spin_lock(&sched_lock);
-    list_add_tail(&t->sched_link, &run_queue);
-    spin_unlock(&sched_lock);
+    start_thread(t);
     return t;
 }
 
 struct thread *thread_create_user(struct process *p, const char *name, uint64_t rip, uint64_t rsp) {
     struct thread *t = alloc_thread(p, name);
     t->is_user = true; t->user_rip = rip; t->user_rsp = rsp;
-    spin_lock(&sched_lock);
-    list_add_tail(&t->sched_link, &run_queue);
-    spin_unlock(&sched_lock);
+    start_thread(t);
     return t;
 }
 
@@ -109,9 +178,9 @@ struct process *process_create(const char *name, bool user) {
     list_init(&p->threads);
     waitq_init(&p->exit_wq);
     p->parent = current_thread ? current_thread->proc : NULL;
-    spin_lock(&sched_lock);
+    procs_lock();
     list_add_tail(&p->all_link, &all_processes);
-    spin_unlock(&sched_lock);
+    procs_unlock();
     return p;
 }
 
@@ -123,6 +192,7 @@ void sched_init(void) {
     strlcpy(boot->name, "init", sizeof boot->name);
     boot->proc = kernel_process;
     boot->state = THREAD_RUNNING;
+    boot->on_cpu = true;
     boot->slice = TIME_SLICE;
     boot->kstack_base = 0;
     boot->fpu = fpu_state_alloc(&boot->fpu_mem);
@@ -130,61 +200,99 @@ void sched_init(void) {
     list_add_tail(&boot->all_link, &all_threads);
     list_add_tail(&boot->proc_link, &kernel_process->threads);
     kernel_process->nthreads++;
-    current_thread = boot;
-    idle_thread = alloc_thread(kernel_process, "idle");
-    idle_thread->entry = idle_loop;
-    kprintf("sched: initialised (init tid %d, idle tid %d)\n", boot->tid, idle_thread->tid);
+    struct cpu *c = this_cpu();
+    c->current = boot;
+    sched_create_idle(c);
+    kprintf("sched: initialised (init tid %d, idle tid %d)\n", boot->tid, c->idle->tid);
 }
 
-static struct thread *pick_next(void) {
+void sched_create_idle(struct cpu *c) {
+    char name[16]; snprintf(name, sizeof name, "idle%d", c->id);
+    c->idle = alloc_thread(kernel_process, name);
+    c->idle->entry = idle_loop;
+}
+
+/* An AP's boot context is dropped here: it becomes this CPU's idle thread. */
+void sched_ap_enter(void) {
+    struct cpu *c = this_cpu();
+    struct thread *idle = c->idle;
+    cli();
+    spin_acquire(&sched_lock);
+    idle->state = THREAD_RUNNING;
+    idle->on_cpu = true;
+    c->current = idle;
+    c->prev = NULL;
+    tss_set_kernel_stack(idle->kstack_top);
+    c->syscall_rsp = idle->kstack_top;
+    fpu_restore(idle->fpu);
+    uint64_t discard;
+    context_switch(&discard, idle->rsp);   /* to thread_trampoline, which drops sched_lock */
+    __builtin_unreachable();
+}
+
+static struct thread *pick_next(struct cpu *c) {
     while (!list_empty(&run_queue)) {
         struct thread *t = list_first_entry(&run_queue, struct thread, sched_link);
         list_del(&t->sched_link);
         if (t->state == THREAD_READY) return t;
     }
-    return idle_thread;
+    return c->idle;
 }
 
 /* Must be called with interrupts disabled. */
 void schedule(void) {
-    struct thread *prev = current_thread;
+    struct cpu *c = this_cpu();
+    struct thread *prev = c->current;
     /* a thread that ran off the bottom of its stack has been overwriting the
      * allocation below it: stop here rather than let that spread */
     if (prev->kstack_base && *(uint64_t *)prev->kstack_base != STACK_CANARY)
         panic("kernel stack overflow in thread '%s' (%d KiB stack)", prev->name, (int)(KSTACK_SIZE / 1024));
-    spin_lock(&sched_lock);
+    spin_acquire(&sched_lock);
+    if (prev->state == THREAD_READY) {   /* woken between deciding to wait and getting here */
+        prev->state = THREAD_RUNNING;
+        spin_release(&sched_lock);
+        return;
+    }
     if (prev->state == THREAD_RUNNING) {
         prev->state = THREAD_READY;
-        if (prev != idle_thread) list_add_tail(&prev->sched_link, &run_queue);
+        if (prev != c->idle) list_add_tail(&prev->sched_link, &run_queue);
     }
-    struct thread *next = pick_next();
+    struct thread *next = pick_next(c);
     next->state = THREAD_RUNNING;
     next->slice = TIME_SLICE;
-    spin_unlock(&sched_lock);
-    if (next == prev) return;
+    if (next == prev) { spin_release(&sched_lock); return; }
+    next->on_cpu = true;
     /* save the vector registers before current_thread changes, so nothing in
      * between can mistake them for the next thread's (see simd_ok) */
     fpu_save(prev->fpu);
-    sched_context_switches++;
-    current_thread = next;
+    __atomic_fetch_add(&sched_context_switches, 1, __ATOMIC_RELAXED);
+    c->current = next;
+    c->prev = prev;
     tss_set_kernel_stack(next->kstack_top);
-    kernel_rsp_for_syscall = next->kstack_top;
+    c->syscall_rsp = next->kstack_top;
     vmm_switch(next->proc->pml4 ? next->proc->pml4 : vmm_kernel_pml4());
     fpu_restore(next->fpu);
-    if (prev->state == THREAD_ZOMBIE) reap_thread = prev;
     context_switch(&prev->rsp, next->rsp);
-    /* back on 'prev' stack */
-    if (reap_thread && reap_thread != current_thread) {
-        struct thread *r = reap_thread; reap_thread = NULL;
-        thread_free(r);
-    }
+    /* back on 'prev' stack, possibly on another CPU */
+    finish_switch();
 }
 
 void thread_yield(void) { uint64_t f = irq_save(); schedule(); irq_restore(f); }
 
+/* sched_lock held: a wakeup aimed at t while it was not waiting (a kill
+ * racing with its last check) is kept for its next wait, which then returns
+ * at once instead of sleeping through it. One-shot, like a spurious wakeup. */
+static bool take_wakeup(struct thread *t) {
+    if (!t->wake_pending) return false;
+    t->wake_pending = false;
+    return true;
+}
+
 void thread_block(void) {
     uint64_t f = irq_save();
-    current_thread->state = THREAD_BLOCKED;
+    spin_acquire(&sched_lock);
+    if (!take_wakeup(current_thread)) current_thread->state = THREAD_BLOCKED;
+    spin_release(&sched_lock);
     schedule();
     irq_restore(f);
 }
@@ -197,64 +305,74 @@ static void unblock_locked(struct thread *t) {
     if (t->state == THREAD_BLOCKED || t->state == THREAD_SLEEPING) {
         list_del(&t->sched_link);
         if (t->state == THREAD_BLOCKED) t->waiting_on = NULL;
-        t->state = THREAD_READY;
-        list_add_tail(&t->sched_link, &run_queue);
-    }
+        make_ready(t);
+    } else if (t->state != THREAD_ZOMBIE) t->wake_pending = true;
 }
 
 void thread_unblock(struct thread *t) {
-    spin_lock(&sched_lock);
+    uint64_t f = irq_save();
+    spin_acquire(&sched_lock);
     unblock_locked(t);
-    spin_unlock(&sched_lock);
+    spin_release(&sched_lock);
+    irq_restore(f);
+}
+
+/* sched_lock held; keeps sleep_list sorted by wake time */
+static void sleep_insert(struct thread *t) {
+    struct thread *pos;
+    list_for_each_entry(pos, &sleep_list, sched_link)
+        if (pos->wake_at > t->wake_at) { list_add_tail(&t->sched_link, &pos->sched_link); return; }
+    list_add_tail(&t->sched_link, &sleep_list);
 }
 
 void thread_sleep_ms(uint64_t ms) {
     if (ms == 0) { thread_yield(); return; }
     uint64_t f = irq_save();
     struct thread *t = current_thread;
-    t->wake_at = system_ticks + ms;
-    t->state = THREAD_SLEEPING;
-    spin_lock(&sched_lock);
-    /* keep sleep_list sorted by wake time */
-    struct thread *pos; bool inserted = false;
-    list_for_each_entry(pos, &sleep_list, sched_link) {
-        if (pos->wake_at > t->wake_at) { list_add_tail(&t->sched_link, &pos->sched_link); inserted = true; break; }
+    spin_acquire(&sched_lock);
+    if (!take_wakeup(t)) {
+        t->wake_at = system_ticks + ms;
+        t->state = THREAD_SLEEPING;
+        sleep_insert(t);
     }
-    if (!inserted) list_add_tail(&t->sched_link, &sleep_list);
-    spin_unlock(&sched_lock);
+    spin_release(&sched_lock);
     schedule();
     irq_restore(f);
 }
 
 bool thread_should_exit(void) { return current_thread->kill_pending; }
 
-/* The last thread out releases the process's resources (which may block)
- * and only then, with every other thread already unlinked, marks it exited;
- * interrupts stay off from there to the switch away from its address space,
- * so the reaper cannot free it under us. */
+/* The last thread out releases the process's resources (which may block),
+ * leaves its address space and only then, with every other thread already
+ * unlinked, marks it exited: from there the reaper on another CPU may free
+ * the page tables and the process. */
 void thread_exit(int code) {
     struct thread *t = current_thread;
     struct process *p = t->proc;
     t->exit_code = code;
-    uint64_t f = irq_save();
-    spin_lock(&sched_lock);
+    procs_lock();
     bool last = --p->nthreads == 0 && p != kernel_process;
     if (!last) { list_del(&t->all_link); list_del(&t->proc_link); }
-    spin_unlock(&sched_lock);
+    procs_unlock();
     if (last) {
-        irq_restore(f);
         if (!p->exit_code) p->exit_code = code;
         for (int i = 0; i < MAX_FDS; i++) if (p->fds[i]) { vfs_close(p->fds[i]); p->fds[i] = NULL; }
         process_close_windows(p);
         cli();
-        spin_lock(&sched_lock);
+        vmm_switch(vmm_kernel_pml4());
+        procs_lock();
         list_del(&t->all_link);
         list_del(&t->proc_link);
+        procs_unlock();
+        spin_lock(&exit_lock);
         p->exited = true;
-        spin_unlock(&sched_lock);
         waitq_wake_all(&p->exit_wq);
+        spin_unlock(&exit_lock);
     }
+    cli();
+    spin_acquire(&sched_lock);
     t->state = THREAD_ZOMBIE;
+    spin_release(&sched_lock);
     schedule();
     panic("thread_exit returned");
 }
@@ -264,14 +382,24 @@ void thread_kill(struct thread *t) {
     thread_unblock(t);
 }
 
+/* procs lock held: mark every thread of p (but the caller) killed and wake it */
+static void kill_threads(struct process *p) {
+    struct thread *t;
+    list_for_each_entry(t, &p->threads, proc_link) if (t != current_thread) {
+        t->kill_pending = true;
+        spin_acquire(&sched_lock);
+        unblock_locked(t);
+        spin_release(&sched_lock);
+    }
+}
+
 void process_exit(int code) {
     struct process *p = current_thread->proc;
     p->exit_code = code;
     /* kill sibling threads; they exit when they next run */
-    struct thread *t;
-    spin_lock(&sched_lock);
-    list_for_each_entry(t, &p->threads, proc_link) if (t != current_thread) { t->kill_pending = true; unblock_locked(t); }
-    spin_unlock(&sched_lock);
+    procs_lock();
+    kill_threads(p);
+    procs_unlock();
     thread_exit(code);
 }
 
@@ -281,24 +409,25 @@ static struct process *find_locked(int pid) {
     return NULL;
 }
 struct process *process_find(int pid) {
-    spin_lock(&sched_lock);
+    procs_lock();
     struct process *p = find_locked(pid);
-    spin_unlock(&sched_lock);
+    procs_unlock();
     return p;
 }
 
 struct thread *thread_find(int tid) {
     struct thread *t, *r = NULL;
-    spin_lock(&sched_lock);
+    procs_lock();
     list_for_each_entry(t, &all_threads, all_link) if (t->tid == tid) { r = t; break; }
-    spin_unlock(&sched_lock);
+    procs_unlock();
     return r;
 }
 
+/* waits for anyone walking the process list (they hold the procs lock) */
 static void process_free(struct process *p) {
-    spin_lock(&sched_lock);
+    procs_lock();
     list_del(&p->all_link);
-    spin_unlock(&sched_lock);
+    procs_unlock();
     if (p->pml4) vmm_free_pml4(p->pml4);
     kfree(p);
 }
@@ -306,18 +435,17 @@ static void process_free(struct process *p) {
 /* Only one caller may claim (and free) a process; user processes may only reap user processes. */
 int process_wait(int pid, int *status) {
     struct process *self = current_thread->proc;
-    spin_lock(&sched_lock);
+    procs_lock();
     struct process *p = find_locked(pid);
     bool ok = p && p != kernel_process && p != self && !p->reaping && (!self->is_user || p->is_user);
     if (ok) p->reaping = true;
-    spin_unlock(&sched_lock);
+    procs_unlock();
     if (!ok) return -1;
-    static spinlock_t wl = SPINLOCK_INIT;
-    spin_lock(&wl);
-    while (!p->exited && !current_thread->kill_pending) waitq_wait(&p->exit_wq, &wl);
+    spin_lock(&exit_lock);
+    while (!p->exited && !current_thread->kill_pending) waitq_wait(&p->exit_wq, &exit_lock);
     bool done = p->exited;
     if (!done) p->reaping = false;
-    spin_unlock(&wl);
+    spin_unlock(&exit_lock);
     if (!done) return -1;
     if (status) *status = p->exit_code;
     process_free(p);
@@ -325,71 +453,85 @@ int process_wait(int pid, int *status) {
 }
 
 bool process_kill(int pid, int sig) {
-    spin_lock(&sched_lock);
+    procs_lock();
     struct process *p = find_locked(pid);
-    if (!p || p == kernel_process) { spin_unlock(&sched_lock); return false; }
+    if (!p || p == kernel_process) { procs_unlock(); return false; }
     if (!p->exited) {
         p->exit_signal = sig;
         p->exit_code = 128 + sig;
-        struct thread *t;
-        list_for_each_entry(t, &p->threads, proc_link) { t->kill_pending = true; unblock_locked(t); }
+        kill_threads(p);
     }
-    spin_unlock(&sched_lock);
+    procs_unlock();
     return true;
 }
 
 int process_list(struct process **out, int max) {
     int n = 0; struct process *p;
-    spin_lock(&sched_lock);
+    procs_lock();
     list_for_each_entry(p, &all_processes, all_link) if (n < max) out[n++] = p;
-    spin_unlock(&sched_lock);
+    procs_unlock();
     return n;
 }
 int thread_list(struct thread **out, int max) {
     int n = 0; struct thread *t;
-    spin_lock(&sched_lock);
+    procs_lock();
     list_for_each_entry(t, &all_threads, all_link) if (n < max) out[n++] = t;
-    spin_unlock(&sched_lock);
+    procs_unlock();
     return n;
 }
 
 static uint64_t last_sample_ticks;
 void sched_sample_cpu(void) {
+    struct thread *t;
+    procs_lock();
     uint64_t now = system_ticks, span = now - last_sample_ticks;
     if (span == 0) span = 1;
-    struct thread *t;
-    spin_lock(&sched_lock);
     list_for_each_entry(t, &all_threads, all_link) {
         t->cpu_percent = (int)((t->cpu_ticks - t->cpu_sample) * 100 / span);
         t->cpu_sample = t->cpu_ticks;
     }
-    spin_unlock(&sched_lock);
-    idle_sample = idle_ticks;
-    last_sample_ticks = now;
-}
-int sched_idle_percent(void) { return idle_thread ? idle_thread->cpu_percent : 100; }
-
-/* Called from the timer interrupt every millisecond. */
-void sched_tick(struct regs *r) {
-    struct thread *cur = current_thread;
-    cur->cpu_ticks++;
-    if (cur == idle_thread) idle_ticks++;
-    bool resched = false;
-    spin_lock(&sched_lock);
-    while (!list_empty(&sleep_list)) {
-        struct thread *t = list_first_entry(&sleep_list, struct thread, sched_link);
-        if (t->wake_at > system_ticks) break;
-        list_del(&t->sched_link);
-        t->state = THREAD_READY;
-        list_add_tail(&t->sched_link, &run_queue);
-        resched = true;
+    for (int i = 0; i < cpu_count; i++) {
+        struct cpu *c = &cpus[i];
+        uint64_t ticks = c->ticks - c->sample_ticks, idle = c->idle_ticks - c->sample_idle;
+        c->load_percent = ticks ? (int)(100 - MIN(idle, ticks) * 100 / ticks) : 0;
+        c->sample_ticks += ticks; c->sample_idle += idle;
     }
-    spin_unlock(&sched_lock);
-    if (--cur->slice <= 0) resched = true;
+    last_sample_ticks = now;
+    procs_unlock();
+}
+/* averaged over the CPUs, so 100 - this is the machine's overall load */
+int sched_idle_percent(void) {
+    int sum = 0;
+    for (int i = 0; i < cpu_count; i++) sum += 100 - cpus[i].load_percent;
+    return cpu_count ? sum / cpu_count : 100;
+}
+int sched_cpu_load(int cpu) { return cpu >= 0 && cpu < cpu_count ? cpus[cpu].load_percent : 0; }
+
+/* Called from each CPU's timer interrupt every millisecond. */
+void sched_tick(struct regs *r) {
+    struct cpu *c = this_cpu();
+    struct thread *cur = c->current;
+    cur->cpu_ticks++;
+    c->ticks++;
+    if (cur == c->idle) c->idle_ticks++;
+    bool resched = --cur->slice <= 0;
+    if (c->id == 0) {   /* the BSP wakes sleepers for everyone */
+        bool unclaimed = false;
+        spin_acquire(&sched_lock);
+        while (!list_empty(&sleep_list)) {
+            struct thread *t = list_first_entry(&sleep_list, struct thread, sched_link);
+            if (t->wake_at > system_ticks) break;
+            list_del(&t->sched_link);
+            if (!make_ready(t)) unclaimed = true;
+        }
+        spin_release(&sched_lock);
+        if (unclaimed) resched = true;   /* no idle CPU took it: run it here now */
+    }
     /* A user thread with a pending kill dies here before returning to user mode */
     if (cur->kill_pending && cur->is_user && (r->cs & 3)) { lapic_eoi(); sti(); process_exit(cur->proc->exit_code); }
-    if (resched || cur == idle_thread) { lapic_eoi(); schedule(); return; }
     lapic_eoi();
+    /* the idle loop looks at the run queue itself once the interrupt returns */
+    if (resched && cur != c->idle) schedule();
 }
 
 void sched_start(void) {
@@ -397,54 +539,57 @@ void sched_start(void) {
     for (;;) { thread_sleep_ms(1000); }
 }
 
-/* ---- wait queues ---- */
+/* ---- wait queues ----
+ * A waiter checks its condition under 'held' and queues itself before
+ * dropping it; a waker changes the condition under the same lock, so the wake
+ * (inside or after it) always finds the waiter queued. */
 void waitq_init(struct waitq *q) { list_init(&q->waiters); }
 static inline void waitq_lazy(struct waitq *q) { if (!q->waiters.next) list_init(&q->waiters); }
 
+/* drop 'held', switch away, take it back (with the interrupt state its holder saved) */
+static void wait_and_relock(spinlock_t *held) {
+    uint64_t hf = held->flags;
+    spin_release(held);
+    schedule();
+    spin_acquire(held);
+    held->flags = hf;
+}
+
 void waitq_wait(struct waitq *q, spinlock_t *held) {
     uint64_t f = irq_save();
-    waitq_lazy(q);
     struct thread *t = current_thread;
+    spin_acquire(&sched_lock);
+    waitq_lazy(q);
+    if (take_wakeup(t)) { spin_release(&sched_lock); irq_restore(f); return; }
     t->state = THREAD_BLOCKED;
     t->waiting_on = q;
-    spin_lock(&sched_lock);
     list_add_tail(&t->sched_link, &q->waiters);
-    spin_unlock(&sched_lock);
-    uint64_t hf = held->flags;
-    __atomic_clear(&held->locked, __ATOMIC_RELEASE);
-    schedule();
-    while (__atomic_test_and_set(&held->locked, __ATOMIC_ACQUIRE)) pause();
-    held->flags = hf;
+    spin_release(&sched_lock);
+    wait_and_relock(held);
     t->waiting_on = NULL;
     irq_restore(f);
 }
 
 bool waitq_wait_timeout(struct waitq *q, spinlock_t *held, uint64_t ms) {
     uint64_t f = irq_save();
-    waitq_lazy(q);
     struct thread *t = current_thread;
+    spin_acquire(&sched_lock);
+    waitq_lazy(q);
+    if (take_wakeup(t)) { spin_release(&sched_lock); irq_restore(f); return true; }
     t->wake_at = system_ticks + ms;
     t->state = THREAD_SLEEPING;
     t->waiting_on = q;
-    spin_lock(&sched_lock);
     /* a sleeping waiter lives on the sleep list; the wait queue remembers it via waiting_on */
-    struct thread *pos; bool inserted = false;
-    list_for_each_entry(pos, &sleep_list, sched_link) {
-        if (pos->wake_at > t->wake_at) { list_add_tail(&t->sched_link, &pos->sched_link); inserted = true; break; }
-    }
-    if (!inserted) list_add_tail(&t->sched_link, &sleep_list);
-    spin_unlock(&sched_lock);
-    uint64_t hf = held->flags;
-    __atomic_clear(&held->locked, __ATOMIC_RELEASE);
-    schedule();
-    while (__atomic_test_and_set(&held->locked, __ATOMIC_ACQUIRE)) pause();
-    held->flags = hf;
+    sleep_insert(t);
+    spin_release(&sched_lock);
+    wait_and_relock(held);
     bool woken = t->waiting_on == NULL;   /* cleared by waker */
     t->waiting_on = NULL;
     irq_restore(f);
     return woken;
 }
 
+/* sched_lock held */
 static void waitq_wake_sleepers(struct waitq *q, bool all) {
     /* wake timed waiters (which sit on the sleep list) */
     struct thread *t, *n;
@@ -452,38 +597,39 @@ static void waitq_wake_sleepers(struct waitq *q, bool all) {
         if (t->waiting_on == q) {
             t->waiting_on = NULL;
             list_del(&t->sched_link);
-            t->state = THREAD_READY;
-            list_add_tail(&t->sched_link, &run_queue);
+            make_ready(t);
             if (!all) return;
         }
     }
 }
 
 void waitq_wake_one(struct waitq *q) {
+    uint64_t f = irq_save();
+    spin_acquire(&sched_lock);
     waitq_lazy(q);
-    spin_lock(&sched_lock);
     if (!list_empty(&q->waiters)) {
         struct thread *t = list_first_entry(&q->waiters, struct thread, sched_link);
         list_del(&t->sched_link);
         t->waiting_on = NULL;
-        t->state = THREAD_READY;
-        list_add_tail(&t->sched_link, &run_queue);
+        make_ready(t);
     } else waitq_wake_sleepers(q, false);
-    spin_unlock(&sched_lock);
+    spin_release(&sched_lock);
+    irq_restore(f);
 }
 
 void waitq_wake_all(struct waitq *q) {
+    uint64_t f = irq_save();
+    spin_acquire(&sched_lock);
     waitq_lazy(q);
-    spin_lock(&sched_lock);
     while (!list_empty(&q->waiters)) {
         struct thread *t = list_first_entry(&q->waiters, struct thread, sched_link);
         list_del(&t->sched_link);
         t->waiting_on = NULL;
-        t->state = THREAD_READY;
-        list_add_tail(&t->sched_link, &run_queue);
+        make_ready(t);
     }
     waitq_wake_sleepers(q, true);
-    spin_unlock(&sched_lock);
+    spin_release(&sched_lock);
+    irq_restore(f);
 }
 
 /* ---- mutex ---- */

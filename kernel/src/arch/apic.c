@@ -3,13 +3,18 @@
 #include "io.h"
 #include "mm.h"
 
-static volatile uint32_t *lapic;
+static volatile uint32_t *lapic;   /* every CPU sees its own LAPIC at this address */
+static uint32_t bsp_lapic_id;
 static struct { volatile uint32_t *regs; uint32_t gsi_base; int entries; } ioa[MAX_IOAPICS];
 static int nioa;
 
 #define LAPIC_ID        0x020
+#define LAPIC_TPR       0x080
 #define LAPIC_EOI       0x0B0
 #define LAPIC_SVR       0x0F0
+#define LAPIC_ICR_LO    0x300
+#define LAPIC_ICR_HI    0x310
+#define LAPIC_LVT_LINT0 0x350
 #define LAPIC_LVT_TIMER 0x320
 #define LAPIC_TIMER_INIT 0x380
 #define LAPIC_TIMER_CUR  0x390
@@ -30,16 +35,37 @@ void lapic_init(void) {
     lapic = vmm_map_mmio(madt.lapic_addr, 0x1000);
     lapic_write(LAPIC_SVR, 0x100 | VEC_SPURIOUS);
     lapic_write(LAPIC_LVT_TIMER, 0x10000);   /* masked for now */
+    bsp_lapic_id = lapic_id();
     kprintf("lapic: id %u enabled\n", lapic_id());
 }
+
+void lapic_init_ap(void) {
+    wrmsr(0x1B, rdmsr(0x1B) | (1 << 11));
+    lapic_write(LAPIC_TPR, 0);
+    lapic_write(LAPIC_LVT_LINT0, 0x10000);   /* the PIC's ExtINT belongs to the BSP */
+    lapic_write(LAPIC_SVR, 0x100 | VEC_SPURIOUS);
+    lapic_write(LAPIC_LVT_TIMER, 0x10000);
+}
+
 uint32_t lapic_id(void) { return lapic_read(LAPIC_ID) >> 24; }
+uint32_t lapic_bsp_id(void) { return bsp_lapic_id; }
+
+/* fixed delivery, physical destination; interrupts off so nothing on this CPU interleaves its ICR writes */
+void lapic_send_ipi(uint32_t apic_id, uint8_t vector) {
+    uint64_t f = irq_save();
+    while (lapic_read(LAPIC_ICR_LO) & (1 << 12)) pause();   /* previous IPI still pending */
+    lapic_write(LAPIC_ICR_HI, apic_id << 24);
+    lapic_write(LAPIC_ICR_LO, vector | (1 << 14));
+    irq_restore(f);
+}
 void lapic_eoi(void) { if (lapic) lapic_write(LAPIC_EOI, 0); }
 
 static uint32_t timer_ticks_per_ms;
 
 void lapic_timer_start(uint32_t hz) {
-    /* Calibrate against the PIT: run the timer for 50 ms with divider 16 */
     lapic_write(LAPIC_TIMER_DIV, 0x3);
+    if (timer_ticks_per_ms) goto program;   /* an AP: every LAPIC timer runs off the same clock */
+    /* Calibrate against the PIT: run the timer for 50 ms with divider 16 */
     lapic_write(LAPIC_LVT_TIMER, 0x10000);
     lapic_write(LAPIC_TIMER_INIT, 0xFFFFFFFF);
     uint64_t t0 = rdtsc();
@@ -51,6 +77,7 @@ void lapic_timer_start(uint32_t hz) {
     extern void cpu_set_tsc_hz(uint64_t);
     cpu_set_tsc_hz((t1 - t0) * 20);
     kprintf("lapic: timer %u ticks/ms, tsc %lu MHz\n", timer_ticks_per_ms, cpu_tsc_hz() / 1000000);
+program:;
     uint32_t count = timer_ticks_per_ms * 1000 / hz;
     if (count == 0) count = 1;
     lapic_write(LAPIC_LVT_TIMER, VEC_LAPIC_TIMER | (1 << 17));   /* periodic */
@@ -89,14 +116,14 @@ void ioapic_route_irq(uint8_t irq, uint8_t vector) {
     uint32_t lo = vector;
     if ((flags & 3) == 3) lo |= (1 << 13);     /* active low */
     if (((flags >> 2) & 3) == 3) lo |= (1 << 15); /* level triggered */
-    ioapic_write(a, 0x11 + idx * 2, lapic_id() << 24);
+    ioapic_write(a, 0x11 + idx * 2, bsp_lapic_id << 24);
     ioapic_write(a, 0x10 + idx * 2, lo);
 }
 
 bool ioapic_route_gsi(uint32_t gsi, uint8_t vector, bool level, bool active_low) {
     uint32_t idx; int a = ioapic_for(gsi, &idx);
     if (a < 0) return false;
-    ioapic_write(a, 0x11 + idx * 2, lapic_id() << 24);
+    ioapic_write(a, 0x11 + idx * 2, bsp_lapic_id << 24);
     ioapic_write(a, 0x10 + idx * 2, vector | (active_low ? 1 << 13 : 0) | (level ? 1 << 15 : 0));
     return true;
 }

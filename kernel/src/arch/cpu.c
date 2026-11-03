@@ -81,7 +81,8 @@ void fpu_restore(uint8_t *area) {
     __asm__ volatile("xrstor64 (%0)" :: "r"(area), "a"(-1), "d"(-1) : "memory");
 }
 
-void cpu_init(void) {
+/* control registers and MSRs every CPU needs; simd_setup() has chosen cpu_xcr0 */
+static void cpu_init_regs(void) {
     /* Enable SSE/FXSR so user programs (and fxsave/fxrstor) work */
     uint64_t cr0 = read_cr0();
     cr0 &= ~(1ULL << 2);   /* EM */
@@ -92,7 +93,6 @@ void cpu_init(void) {
     cr4 |= (1ULL << 9) | (1ULL << 10);   /* OSFXSR, OSXMMEXCPT */
     write_cr4(cr4);
     __asm__ volatile("fninit");
-    simd_setup();
 
     /* Enable NX (EFER.NXE) and SCE for syscall/sysret */
     uint64_t efer = rdmsr(0xC0000080);
@@ -104,6 +104,16 @@ void cpu_init(void) {
     pat &= ~(0xFFULL << 8);
     pat |= (0x01ULL << 8);
     wrmsr(0x277, pat);
+}
+
+void cpu_init(void) {
+    cpu_init_regs();
+    simd_setup();
+}
+
+void cpu_init_ap(void) {
+    cpu_init_regs();
+    if (cpu_xcr0) { write_cr4(read_cr4() | (1ULL << 18)); xsetbv(0, cpu_xcr0); }
 }
 
 void cpu_get_brand(char *out, size_t n) {

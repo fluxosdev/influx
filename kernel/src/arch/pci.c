@@ -110,9 +110,9 @@ static const char *gsi_attach(uint32_t gsi, bool level, bool active_low, irq_han
     if (pi && pi->n >= (int)ARRAY_LEN(pi->h)) return "too many handlers on the GSI";
     bool fresh = !pi;
     if (fresh) { if (!(pi = pirq_new())) return "no free vector"; pi->gsi = gsi; }
-    uint64_t fl = irq_save();
-    pi->h[pi->n] = h; pi->ctx[pi->n] = ctx; pi->n++;
-    irq_restore(fl);
+    /* the dispatcher may be running on another CPU: publish the entry before the count */
+    pi->h[pi->n] = h; pi->ctx[pi->n] = ctx;
+    __atomic_store_n(&pi->n, pi->n + 1, __ATOMIC_RELEASE);
     if (fresh && !ioapic_route_gsi(gsi, pi->vector, level, active_low)) { pi->n = 0; pi->gsi = ~0u; return "GSI outside the I/O APICs"; }
     return NULL;
 }
@@ -125,7 +125,7 @@ bool pci_irq_install(struct pci_device *d, irq_handler_t h, void *ctx, bool allo
         if (!pi) { snprintf(how, how_len, "no free vector"); return false; }
         pi->msi = true; pi->h[0] = h; pi->ctx[0] = ctx; pi->n = 1;
         uint16_t ctl = pci_read16(d->bus, d->slot, d->func, msi + 2);
-        pci_write32(d->bus, d->slot, d->func, msi + 4, 0xFEE00000u | (lapic_id() << 12));
+        pci_write32(d->bus, d->slot, d->func, msi + 4, 0xFEE00000u | (lapic_bsp_id() << 12));
         if (ctl & (1 << 7)) { pci_write32(d->bus, d->slot, d->func, msi + 8, 0); pci_write16(d->bus, d->slot, d->func, msi + 12, pi->vector); }
         else pci_write16(d->bus, d->slot, d->func, msi + 8, pi->vector);
         pci_write16(d->bus, d->slot, d->func, msi + 2, (ctl & ~(7 << 4)) | 1);   /* one vector, enabled */

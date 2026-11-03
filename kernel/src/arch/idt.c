@@ -38,15 +38,18 @@ void idt_init(void) {
     idt_set_gate(18, isr_table[18], 3, 0);
     idtr.limit = sizeof idt - 1;
     idtr.base = (uint64_t)idt;
-    __asm__ volatile("lidt %0" :: "m"(idtr));
+    idt_load();
 }
+
+void idt_load(void) { __asm__ volatile("lidt %0" :: "m"(idtr)); }
 
 void irq_register(uint8_t vec, irq_handler_t h, void *ctx) { handlers[vec].h = h; handlers[vec].ctx = ctx; }
 
 /* 0x20-0x2F legacy IRQs, 0x40 the LAPIC timer; devices get 0x50 and up */
 int irq_alloc_vector(void) {
     static int next = 0x50;
-    return next < 0xF0 ? next++ : 0;
+    int v = __atomic_fetch_add(&next, 1, __ATOMIC_RELAXED);
+    return v < 0xF0 ? v : 0;
 }
 
 static void dump_regs(struct regs *r) {

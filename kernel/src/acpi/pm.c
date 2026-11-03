@@ -28,6 +28,7 @@ static int gpe_bytes[2], gpe_first[2];      /* status bytes per block, number of
 static uint8_t gpe_edge[2][MAX_GPE_BYTES], gpe_enabled[2][MAX_GPE_BYTES];
 static volatile uint8_t gpe_pending[2][MAX_GPE_BYTES];
 static volatile uint32_t pending_fixed;
+static spinlock_t sci_lock = SPINLOCK_INIT;   /* pending_*, gpe_enabled and the GPE registers: SCI handler vs worker */
 static struct aml_node **gpe_method;        /* indexed by GPE number */
 static int gpe_count, gpe_runtime;
 static uint32_t sci_gsi;
@@ -197,6 +198,7 @@ static void call_pic(int mode) {
 /* ---- SCI ---- */
 static void sci_irq(struct regs *r, void *ctx) {
     bool any = false;
+    spin_lock(&sci_lock);
     uint32_t hit = pm1_read(false) & pm1_read(true) & (PM1_PWRBTN | PM1_SLPBTN);
     if (hit) { pm1_write(false, hit); pending_fixed |= hit; any = true; }
     for (int b = 0; b < 2; b++)
@@ -209,6 +211,7 @@ static void sci_irq(struct regs *r, void *ctx) {
             gpe_pending[b][i] |= s;
             any = true;
         }
+    spin_unlock(&sci_lock);
     if (any) sem_post(&sci_sem);   /* the shared dispatcher in arch/pci.c sends the EOI */
 }
 
@@ -236,24 +239,24 @@ static bool run_gpe(int gpe) {
 static void acpi_worker(void *arg) {
     for (;;) {
         sem_wait(&sci_sem);
-        uint64_t fl = irq_save();
+        spin_lock(&sci_lock);
         uint32_t fixed = pending_fixed; pending_fixed = 0;
-        irq_restore(fl);
+        spin_unlock(&sci_lock);
         if (fixed & PM1_PWRBTN) power_button_pressed();
         if (fixed & PM1_SLPBTN) kprintf("acpi: sleep button pressed (sleep states are not supported)\n");
         for (int b = 0; b < 2; b++)
             for (int i = 0; i < gpe_bytes[b]; i++) {
-                fl = irq_save();
+                spin_lock(&sci_lock);
                 uint8_t s = gpe_pending[b][i]; gpe_pending[b][i] = 0;
-                irq_restore(fl);
+                spin_unlock(&sci_lock);
                 for (int bit = 0; bit < 8; bit++) {
                     if (!(s & (1 << bit))) continue;
                     bool ok = run_gpe(gpe_first[b] + i * 8 + bit);
-                    fl = irq_save();
+                    spin_lock(&sci_lock);
                     if (!(gpe_edge[b][i] & (1 << bit))) gpe_write(b, i, false, 1 << bit);   /* level: clear after the handler */
                     if (ok) gpe_enabled[b][i] |= 1 << bit;
                     gpe_write(b, i, true, gpe_enabled[b][i]);
-                    irq_restore(fl);
+                    spin_unlock(&sci_lock);
                 }
             }
     }

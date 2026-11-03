@@ -267,7 +267,7 @@ void shell_main(void *arg);
 struct shell_start { struct tty *tty; char *cwd; char *cmd; };
 
 static void term_interrupt(void *priv) { UNUSED(priv); }
-static bool shell_alive(struct term *t) { uint64_t f = irq_save(); struct process *p = process_find(t->shell_pid); bool a = p && !p->exited; irq_restore(f); return a; }
+static bool shell_alive(struct term *t) { procs_lock(); struct process *p = process_find(t->shell_pid); bool a = p && !p->exited; procs_unlock(); return a; }
 
 void terminal_main(void *arg) {
     struct term *t = kzalloc(sizeof *t);

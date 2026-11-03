@@ -27,7 +27,9 @@ struct tty *tty_create(void (*output)(void *, const char *, size_t), void *priv)
     return t;
 }
 void tty_destroy(struct tty *t) {
+    spin_lock(&t->lock);   /* readers check it under the lock before waiting */
     t->closed = true;
+    spin_unlock(&t->lock);
     waitq_wake_all(&t->in_wq);
     if (t->vn) { char p[32]; snprintf(p, sizeof p, "/dev/%s", t->vn->name); vfs_unlink(p); }
     /* the struct is leaked intentionally if readers are still blocked; small and rare */

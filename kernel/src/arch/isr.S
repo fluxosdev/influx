@@ -16,7 +16,13 @@ isr\n:
     jmp isr_common
 .endm
 
+/* From user mode, swapgs puts the per-CPU pointer in GS (see percpu.h).
+ * NMI and #MC can land between the exit swapgs and iretq; both only panic. */
 isr_common:
+    testb $3, 24(%rsp)       /* CS of the interrupted context, above int_no and err_code */
+    jz 1f
+    swapgs
+1:
     pushq %rax
     pushq %rbx
     pushq %rcx
@@ -51,6 +57,10 @@ isr_common:
     popq %rbx
     popq %rax
     addq $16, %rsp
+    testb $3, 8(%rsp)
+    jz 2f
+    swapgs
+2:
     iretq
 
 .altmacro

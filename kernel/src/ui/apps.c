@@ -44,13 +44,13 @@ static void app_thread(void *p) {
 static void reaper_thread(void *arg) { process_wait((int)(intptr_t)arg, NULL); wm_notify_app_state(); }
 static void reap_when_done(struct process *p) { thread_create(NULL, "reaper", reaper_thread, (void *)(intptr_t)p->pid); }
 
-/* running instances of an app; with irqs off so the reaper can't free a process mid-scan (single CPU).
+/* running instances of an app; under the procs lock so the reaper can't free a process mid-scan.
    The pointers are only compared against window owners afterwards, never dereferenced. */
 static int app_instances(int id, struct process **out, int max) {
-    uint64_t f = irq_save();
+    procs_lock();
     struct process *list[64]; int n = process_list(list, 64), k = 0;
     for (int i = 0; i < n && k < max; i++) if (list[i]->app_id == id && !list[i]->exited) out[k++] = list[i];
-    irq_restore(f);
+    procs_unlock();
     return k;
 }
 
@@ -207,6 +207,7 @@ void power_restart(void) {
     kprintf("power: restarting\n");
     acpi_reboot();
     cli();
+    smp_halt_others();
     uint8_t good = 0x02;
     while (good & 0x02) good = inb(0x64);
     outb(0x64, 0xFE);
@@ -224,6 +225,7 @@ void power_shutdown(void) {
     outw(0xB004, 0x2000);   /* Bochs */
     outw(0x4004, 0x3400);   /* VirtualBox */
     cli();
+    smp_halt_others();      /* nothing else draws over the message */
     gfx_fill(screen, RGB(0, 0, 0));
     font_draw_centered(screen, font_ui_large, rect_make(0, screen->h / 2 - 10, screen->w, 20), RGB(200, 200, 200), "It is now safe to turn off your computer.");
     fb_flush_all();

@@ -170,9 +170,9 @@ static int64_t do_syscall(struct syscall_frame *f) {
     case SYS_IOCTL: { struct file *fl = fd_get(p, a1); if (!fl) return -EBADF; if (!fl->vn->ops->ioctl) return -ENOTTY_; if (a2 == 2 && !user_range_ok(p, a3, 8)) return -EINVAL; return fl->vn->ops->ioctl(fl->vn, (int)a2, (void *)a3); }
     case SYS_DUP2: { struct file *fl = fd_get(p, a1); if (!fl || a2 >= MAX_FDS) return -EBADF; if (a1 == a2) return a2; struct file *nf = vfs_dup(fl); if (p->fds[a2]) vfs_close(p->fds[a2]); p->fds[a2] = nf; return a2; }
     case SYS_PIPE: { if (!user_range_ok(p, a1, 8)) return -EINVAL; struct file *r, *w; pipe_create(&r, &w); int fr = fd_alloc(p, r); if (fr < 0) { vfs_close(w); return -ENOMEM; } int fw = fd_alloc(p, w); if (fw < 0) { p->fds[fr] = NULL; vfs_close(r); return -ENOMEM; } ((int *)a1)[0] = fr; ((int *)a1)[1] = fw; return 0; }
-    case SYS_KILL: { uint64_t fl = irq_save(); struct process *tp = process_find((int)a1); int r = !tp ? -ESRCH : !tp->is_user ? -EACCES : 0; irq_restore(fl); if (r) return r; return process_kill((int)a1, (int)a2) ? 0 : -ESRCH; }
+    case SYS_KILL: { procs_lock(); struct process *tp = process_find((int)a1); int r = !tp ? -ESRCH : !tp->is_user ? -EACCES : 0; procs_unlock(); if (r) return r; return process_kill((int)a1, (int)a2) ? 0 : -ESRCH; }
     case SYS_SYSINFO: { if (!user_range_ok(p, a1, sizeof(struct user_sysinfo))) return -EINVAL; struct user_sysinfo *si = (void *)a1; si->uptime_ms = system_ticks; si->total_mem = pmm_total_bytes(); si->free_mem = pmm_free_bytes(); si->used_mem = pmm_used_bytes(); struct process *l[64]; si->procs = process_list(l, 64); struct thread *t[128]; si->threads = thread_list(t, 128); return 0; }
-    case SYS_PS: { int max = (int)a2; if (max > 64) max = 64; if (!user_range_ok(p, a1, max * sizeof(struct user_procinfo))) return -EINVAL; sched_sample_cpu(); uint64_t fl = irq_save(); struct process *l[64]; int n = process_list(l, 64); struct user_procinfo *out = (void *)a1; int k = 0; for (int i = 0; i < n && k < max; i++) { out[k].pid = l[i]->pid; strlcpy(out[k].name, l[i]->name, 32); out[k].user = l[i]->is_user; out[k].mem = l[i]->heap_bytes + (l[i]->pml4 ? vmm_user_pages(l[i]->pml4) * PAGE_SIZE : 0); int cpu = 0, nt = 0; struct thread *t; list_for_each_entry(t, &l[i]->threads, proc_link) { cpu += t->cpu_percent; nt++; } out[k].cpu = l[i]->pid == 1 ? 0 : cpu; out[k].threads = nt; k++; } irq_restore(fl); return k; }
+    case SYS_PS: { int max = (int)a2; if (max > 64) max = 64; if (!user_range_ok(p, a1, max * sizeof(struct user_procinfo))) return -EINVAL; sched_sample_cpu(); procs_lock(); struct process *l[64]; int n = process_list(l, 64); struct user_procinfo *out = (void *)a1; int k = 0; for (int i = 0; i < n && k < max; i++) { out[k].pid = l[i]->pid; strlcpy(out[k].name, l[i]->name, 32); out[k].user = l[i]->is_user; out[k].mem = l[i]->heap_bytes + (l[i]->pml4 ? vmm_user_pages(l[i]->pml4) * PAGE_SIZE : 0); int cpu = 0, nt = 0; struct thread *t; list_for_each_entry(t, &l[i]->threads, proc_link) { cpu += t->cpu_percent; nt++; } out[k].cpu = l[i]->pid == 1 ? 0 : cpu; out[k].threads = nt; k++; } procs_unlock(); return k; }
     case SYS_SYNC: vfs_sync(); return 0;
     case SYS_WIN_CREATE: {
         char title[128]; if (copy_user_string(p, a3, title, sizeof title) < 0) strcpy(title, p->name);
@@ -219,9 +219,11 @@ void syscall_dispatch(struct syscall_frame *f) {
 }
 
 extern void syscall_entry(void);
-void syscall_init(void) {
+/* every CPU, at bring-up: no user code runs before syscall_init() anyway */
+void syscall_init_cpu(void) {
     wrmsr(0xC0000081, ((uint64_t)0x13 << 48) | ((uint64_t)KERNEL_CS << 32));   /* STAR */
     wrmsr(0xC0000082, (uint64_t)syscall_entry);                                /* LSTAR */
     wrmsr(0xC0000084, 0x700);                                                  /* SFMASK: clear IF, TF, DF */
-    kprintf("syscall: fast system calls enabled\n");
 }
+
+void syscall_init(void) { kprintf("syscall: fast system calls enabled on %d CPUs\n", cpu_count); }

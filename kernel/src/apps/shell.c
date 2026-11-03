@@ -517,10 +517,10 @@ static int b_clear(struct ctx *c, int argc, char **argv) { cputs(c, "\033[H\033[
 static int b_ps(struct ctx *c, int argc, char **argv) {
     bool threads = argc > 1 && (strstr(argv[1], "T") || strstr(argv[1], "t"));
     sched_sample_cpu();
-    /* format with irqs off so the reaper can't free a process mid-walk (single CPU); write once they're back on */
+    /* format under the procs lock so the reaper can't free a process mid-walk; write once it is dropped */
     size_t cap = 32768, o = 0; char *out = kmalloc(cap);
     #define PS_OUT(...) do { int r_ = snprintf(out + o, cap - o, __VA_ARGS__); o += CLAMP(r_, 0, (int)(cap - 1 - o)); } while (0)
-    uint64_t irqf = irq_save();
+    procs_lock();
     struct process *list[64]; int n = process_list(list, 64);
     PS_OUT("  PID %s  %%CPU     MEM STAT  CMD\n", threads ? "  TID" : "     ");
     for (int i = 0; i < n; i++) {
@@ -534,7 +534,7 @@ static int b_ps(struct ctx *c, int argc, char **argv) {
             PS_OUT("      %5d %4d%%         %-4s    \u2514 %s\n", t->tid, t->cpu_percent, st, t->name);
         }
     }
-    irq_restore(irqf);
+    procs_unlock();
     #undef PS_OUT
     cwrite(c, out, o); kfree(out);
     return 0;
@@ -1025,7 +1025,7 @@ static int b_fetch(struct ctx *c, int argc, char **argv) {
     snprintf(lines[3], 128, "\033[1mUptime:\033[0m %lu min, %lu sec", s / 60, s % 60);
     snprintf(lines[4], 128, "\033[1mShell:\033[0m zsh (inFlux)  \033[1mProcs:\033[0m %d", np);
     snprintf(lines[5], 128, "\033[1mResolution:\033[0m %dx%d", wm_screen_w(), wm_screen_h());
-    snprintf(lines[6], 128, "\033[1mCPU:\033[0m %s", brand);
+    snprintf(lines[6], 128, cpu_count > 1 ? "\033[1mCPU:\033[0m %s (%d)" : "\033[1mCPU:\033[0m %s", brand, cpu_count);
     snprintf(lines[7], 128, "\033[1mMemory:\033[0m %lu MiB / %lu MiB", pmm_used_bytes() >> 20, pmm_total_bytes() >> 20);
     for (int i = 0; i < 8; i++) cprintf(c, "%s  %s\n", logo[i], lines[i]);
     cputs(c, "\n                   ");
@@ -1363,10 +1363,10 @@ void shell_main(void *arg) {
     while (!sh->exiting && !thread_should_exit()) {
         /* reap finished background jobs */
         struct { int pid; char name[32]; } done[16]; int nd = 0;
-        uint64_t irqf = irq_save();   /* copy under irqs-off: a process can't be freed mid-scan (single CPU) */
+        procs_lock();   /* a process can't be freed mid-scan */
         struct process *plist[64]; int np = process_list(plist, 64);
         for (int i = 0; i < np && nd < 16; i++) if (plist[i]->parent == sh->proc && plist[i]->exited && plist[i]->is_user) { done[nd].pid = plist[i]->pid; strlcpy(done[nd].name, plist[i]->name, sizeof done[nd].name); nd++; }
-        irq_restore(irqf);
+        procs_unlock();
         for (int i = 0; i < nd; i++) { char msg[64]; int ml = snprintf(msg, sizeof msg, "[1]  + done  %s\n", done[i].name); tty_write(sh->tty, msg, ml); process_wait(done[i].pid, NULL); }
         char title[PATH_MAX + 16]; int tl = snprintf(title, sizeof title, "\033]0;%s\007", sh->proc->cwd); tty_write(sh->tty, title, tl);
         if (!read_line(sh)) break;

@@ -89,6 +89,8 @@ void kprintf(const char *fmt, ...) { va_list ap; va_start(ap, fmt); kvprintf(fmt
 
 void NORETURN panic(const char *fmt, ...) {
     cli();
+    smp_halt_others();
+    spin_release(&print_lock);   /* a CPU stopped mid-kprintf would keep it forever */
     kprintf("\n\033[31;1m*** KERNEL PANIC ***\033[0m\n");
     va_list ap; va_start(ap, fmt); kvprintf(fmt, ap); va_end(ap);
     kprintf("\n");
