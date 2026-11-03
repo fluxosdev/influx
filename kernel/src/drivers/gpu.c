@@ -30,6 +30,7 @@ void gpu_init(void) {
     }
     if (!found_vga) strcpy(software_gpu.name, "Software Rasterizer (linear framebuffer)");
     radeon_init();
+    intel_gfx_init();
     bochs_init();
     gpu_register(&software_gpu);
     for (int i = 0; i < ngpus; i++) kprintf("gpu: %s [%s] %s%s\n", gpus[i]->name, gpus[i]->driver, gpus[i]->vram_bytes ? "" : "", gpus[i]->scanout_verified ? " (scanout)" : "");

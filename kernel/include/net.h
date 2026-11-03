@@ -163,3 +163,4 @@ void url_resolve(const char *base, const char *ref, char *out, size_t outsz);
 void url_encode_component(const char *in, char *out, size_t outsz);
 
 void ne2000_init(void);
+void e1000_init(void);

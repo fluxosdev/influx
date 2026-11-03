@@ -600,7 +600,11 @@ static int b_lsgpu(struct ctx *c, int argc, char **argv) {
         cprintf(c, "%s%s\n  driver: %s   chip: %s   bus: %s\n", g->name, g == gpu_primary() ? "  (primary)" : "", g->driver, g->chip, g->bus[0] ? g->bus : "-");
         if (g->vram_bytes) cprintf(c, "  VRAM: %lu MiB at %lx, registers at %lx\n", g->vram_bytes >> 20, g->vram_base, g->mmio_base);
         if (g->bios_message[0]) cprintf(c, "  BIOS: %s %s\n", g->bios_message, g->bios_part);
-        if (g->engine_clock_khz) cprintf(c, "  clocks: %u MHz engine, %u MHz memory, %d stream processors\n", g->engine_clock_khz / 1000, g->memory_clock_khz / 1000, g->stream_processors);
+        if (g->engine_clock_khz) {
+            const char *units = !strcmp(g->driver, "i915") ? "execution units" : "stream processors";
+            if (g->memory_clock_khz) cprintf(c, "  clocks: %u MHz engine, %u MHz memory, %d %s\n", g->engine_clock_khz / 1000, g->memory_clock_khz / 1000, g->stream_processors, units);
+            else cprintf(c, "  clocks: %u MHz engine, %d %s\n", g->engine_clock_khz / 1000, g->stream_processors, units);
+        }
         cprintf(c, "  features: %s%s%s\n", g->scanout_verified ? "scanout " : "", g->page_flip ? "page-flip " : "", g->hw_cursor ? "hw-cursor" : "");
     }
     return 0;

@@ -240,7 +240,9 @@ static void draw(struct settings *s) {
         char vram[48], drv[96], clk[64];
         if (g && g->vram_bytes) snprintf(vram, sizeof vram, "%lu MB (%s)", g->vram_bytes >> 20, g->chip); else strcpy(vram, "unknown");
         snprintf(drv, sizeof drv, "%s%s%s", g ? g->driver : "software", g && g->page_flip ? ", page flipping" : "", g && g->hw_cursor ? ", hardware cursor" : "");
-        if (g && g->engine_clock_khz) snprintf(clk, sizeof clk, "%u MHz core, %u MHz memory", g->engine_clock_khz / 1000, g->memory_clock_khz / 1000); else strcpy(clk, "n/a");
+        if (g && g->engine_clock_khz && g->memory_clock_khz) snprintf(clk, sizeof clk, "%u MHz core, %u MHz memory", g->engine_clock_khz / 1000, g->memory_clock_khz / 1000);
+        else if (g && g->engine_clock_khz) snprintf(clk, sizeof clk, "%u MHz core", g->engine_clock_khz / 1000);
+        else strcpy(clk, "n/a");
         const char *labels[] = { "Graphics", "Driver", "VRAM", "Clocks", "Modes", "OpenGL" };
         const char *vals[] = { g ? g->name : "framebuffer", drv, vram, clk, g && g->modeset ? "Changeable now" : "Changeable at next boot", "1.1 software rasterizer" };
         int ix = L.cx + L.preview.w + 20, iw = L.cx + L.cw - ix;

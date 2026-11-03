@@ -110,7 +110,17 @@ shell, user-space C library and build system.
   monitor's EDID is read over the DDC lines (bit-banged I2C) for the mode
   list, and the PLL, CRTC timing and DAC (VGA) or DIG/UNIPHY/LVTMA (DVI,
   HDMI in DVI mode) encoders are programmed in Linux's order. DisplayPort,
-  LVDS panels, TV-out and a second display keep the boot mode. Every other
+  LVDS panels, TV-out and a second display keep the boot mode.
+- **Intel Haswell driver** (HD Graphics 4600, and the rest of Gen7.5: HD
+  4200/4400/5000, Iris 5100, Iris Pro 5200), modelled on Linux's `i915`:
+  finds the pipe whose primary plane is the bootloader's framebuffer and the
+  transcoder and DDI port behind it, then moves the scanout to two buffers in
+  system memory mapped through the GTT for **vblank-synchronised page
+  flipping**, with a 64x64 ARGB **hardware cursor**. The monitor's EDID is read
+  over GMBUS (HDMI, DVI, VGA) or DisplayPort AUX for the mode list.
+  **Runtime resolution changes** go through the panel fitter: the pipe keeps
+  the timing the firmware lit (and the DisplayPort link it trained), and
+  smaller modes are scaled up with the aspect ratio kept. Every other
   adapter uses the **software fallback** (CPU compositing into the
   bootloader's linear framebuffer).
 - **OpenGL**: fixed-function OpenGL 1.1 with a software rasteriser:
@@ -158,6 +168,14 @@ shell, user-space C library and build system.
   fallback probe of the classic ISA I/O bases. Frames move through the card's
   16 KiB buffer with remote DMA (`rep insw`/`rep outsw`). The adapter is
   polled by the network thread.
+- **Intel PRO/1000 driver** (`em0`): the 82540EM and 82574L (QEMU's `e1000`
+  and `e1000e`) and the LAN controller of the Intel 8-series chipset with its
+  **I217-LM/I217-V** PHY (and the I218-LM/V on the same platform). Legacy
+  descriptor rings of 256 receive and 128 transmit buffers in host memory,
+  MSI or the routed INTx line. On the chipset parts the PHY is shared with
+  the Management Engine: MDIO access goes through the software flag, and a
+  PHY left in SMBus or power-gated mode is brought back by toggling LANPHYPC,
+  as Linux's `e1000e` does.
 - **TCP/IP stack**: Ethernet, ARP (cache, request retries, packets parked
   until the next hop resolves), IPv4 with routing through a default gateway,
   ICMP echo (answers pings, and `ping`), UDP sockets, a DHCP client that
@@ -294,7 +312,8 @@ Changing the SVG icon sources requires `python3` with `cairosvg`; run
 - Type `help` in the Terminal for the list of shell built-ins; programs in
   `/bin` run in user mode. `lsgpu` shows the graphics adapter, `glcube &`
   starts the user-mode OpenGL program.
-- `make run` attaches an NE2000 to QEMU's user-mode network; the adapter gets
+- `make run` attaches an NE2000 to QEMU's user-mode network (`make run
+  QEMU_NIC=e1000e` or `QEMU_NIC=e1000` for the Intel driver); the adapter gets
   10.0.2.15 from QEMU's DHCP server at boot (`ifconfig` shows it). Open the
   Browser from the Dock: ⌘L focuses the address bar, ⌘R reloads, ⌘[ and ⌘]
   go back and forward, ⌘U shows the source. In the Terminal, try
@@ -309,7 +328,8 @@ kernel/src/arch     GDT, IDT, APIC, ACPI, PCI, timers, serial
 kernel/src/mm       physical/virtual memory, heap
 kernel/src/sched    scheduler, synchronisation, ELF loader, system calls
 kernel/src/drivers  framebuffer, PS/2, AHCI, NVMe, block devices, GPU abstraction, Radeon R700
-                    (radeon.c, radeon_kms.c), AtomBIOS interpreter (atom.c), EDID (edid.c), NE2000
+                    (radeon.c, radeon_kms.c), AtomBIOS interpreter (atom.c), EDID (edid.c),
+                    Intel Haswell graphics (intel_gfx.c), NE2000, Intel PRO/1000 (e1000.c)
 kernel/src/usb      USB core and hubs (usb.c), xHCI, EHCI, HID, mass storage
 kernel/src/net      Ethernet/ARP, IPv4/ICMP, UDP, TCP, DHCP, DNS, HTTP client
 kernel/src/gl       kernel build of the OpenGL renderer and the OpenGL Demo app
@@ -338,7 +358,10 @@ third_party         Limine, stb headers
 - USB audio: playback only (no microphones; the audio core has no capture
   path), no MIDI, no webcams. Only QEMU's UAC1 device has been tested; UAC2
   devices and feedback endpoints follow the specification but are untested.
-- Networking: IPv4 only, one NE2000 adapter type, TCP as a client only (no
+- Networking: IPv4 only, NE2000 and Intel PRO/1000 adapters only (the newer
+  chipset LAN of the I218-LM/V on Haswell ultrabooks and the I219 is not
+  supported: those need ultra-low-power exit and other quirks), no checksum or
+  segmentation offload, TCP as a client only (no
   listening sockets), no IP fragment reassembly, DHCP leases are not renewed.
   The stack is used by the kernel and the desktop; user programs in `/bin`
   have no socket system calls yet.
@@ -359,6 +382,15 @@ third_party         Limine, stb headers
   engine (that needs the R700 CP microcode and a command-stream backend), so
   OpenGL is always software-rendered. QEMU does not emulate an R700, so the
   software path is what you see under QEMU.
+- The Intel Haswell driver has not been run on real hardware yet either (QEMU
+  does not emulate it). It does not program display PLLs, DDI buffers or
+  DisplayPort link training, so it cannot light a display the firmware left
+  off or change the pipe timing: Settings offers the boot mode and smaller
+  ones (scaled), and a larger mode can only be saved for the next boot with
+  `display WIDTHxHEIGHT` in the Terminal. Only the lit pipe is driven; the
+  render engine is not used.
+- The I217 code path has not been tested on real hardware; the 82540EM and
+  82574L paths are tested under QEMU.
 - The hardware clock is assumed to be in UTC; adjust the offset in
   System Settings → Date & Time.
 

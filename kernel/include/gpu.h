@@ -8,7 +8,7 @@ struct display_mode { int w, h; };
  * present; a hardware driver can add page flipping and a hardware cursor. */
 struct gpu_device {
     char name[64];            /* marketing name, e.g. "ATI Radeon HD 4870" */
-    char driver[24];          /* "radeon", "software" */
+    char driver[24];          /* "radeon", "i915", "bochs", "software" */
     char chip[16];            /* "RV770" */
     char bus[16];             /* "PCI 01:00.0" */
     uint64_t vram_bytes;      /* 0 if unknown */
@@ -16,7 +16,7 @@ struct gpu_device {
     char bios_message[96];    /* AtomBIOS bootup message */
     char bios_part[32];       /* "113-..." part number */
     uint32_t engine_clock_khz, memory_clock_khz;
-    int stream_processors;
+    int stream_processors;    /* shader units: stream processors (radeon), execution units (i915) */
     bool scanout_verified;    /* the bootloader framebuffer lives in this GPU's VRAM */
     bool hw_cursor, page_flip, accelerated, modeset;
     uint64_t fb_phys; int fb_pitch, fb_width, fb_height;   /* current scanout after set_mode */
@@ -37,6 +37,7 @@ int gpu_count(void);
 struct gpu_device *gpu_at(int i);
 struct gpu_device *gpu_primary(void);      /* the device driving the framebuffer */
 void radeon_init(void);
+void intel_gfx_init(void);
 void bochs_init(void);
 
 int gpu_list_modes(struct display_mode *out, int max);

@@ -171,12 +171,22 @@ $(DISK_INSTALL):
 	truncate -s 1G $@
 
 QEMU      := qemu-system-x86_64
+# A terminal inside snap-packaged VS Code inherits the snap's GTK/GIO environment
+# (its own GSettings schemas, GTK modules, locale path); the host's GTK then aborts
+# on a schema mismatch. Hand QEMU the host's environment back instead.
+ifdef XDG_DATA_DIRS_VSCODE_SNAP_ORIG
+QEMU := env -u GSETTINGS_SCHEMA_DIR -u GTK_PATH -u GTK_EXE_PREFIX -u GTK_IM_MODULE_FILE \
+        -u GIO_MODULE_DIR -u GDK_PIXBUF_MODULE_FILE -u GDK_PIXBUF_MODULEDIR -u LOCPATH \
+        XDG_DATA_DIRS='$(XDG_DATA_DIRS_VSCODE_SNAP_ORIG)' $(QEMU)
+endif
 # inFlux requires AVX, which TCG's default CPU model lacks; 'max' has AVX and AVX2
 QEMU_CPU  := -cpu max
 # processors; e.g. make run QEMU_SMP="-smp 8", or QEMU_SMP= for one
 QEMU_SMP  ?= -smp 2
-# NE2000 (RTL8029) on QEMU's user-mode network: DHCP gives 10.0.2.15, the host is reachable as 10.0.2.2
-QEMU_NET  := -netdev user,id=net0 -device ne2k_pci,netdev=net0
+# NE2000 (RTL8029) on QEMU's user-mode network: DHCP gives 10.0.2.15, the host is reachable as 10.0.2.2.
+# QEMU_NIC=e1000 (82540EM) or QEMU_NIC=e1000e (82574L) uses the Intel PRO/1000 driver instead
+QEMU_NIC  ?= ne2k_pci
+QEMU_NET  := -netdev user,id=net0 -device $(QEMU_NIC),netdev=net0
 # Intel HD Audio with a line-out codec, played through the host's PulseAudio/PipeWire;
 # override with e.g. QEMU_AUDIODEV=pipewire, or QEMU_AUDIO= for no sound card
 QEMU_AUDIODEV ?= pa

@@ -49,6 +49,7 @@ static void net_thread(void *arg) {
 
 void net_init(void) {
     sem_init(&kick, 0);
+    e1000_init();
     ne2000_init();
     if (!nifaces) { kprintf("net: no network adapters found\n"); return; }
     thread_create(kernel_process, "net", net_thread, NULL);
