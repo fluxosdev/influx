@@ -24,6 +24,9 @@ void blockdev_alloc_name(const char *prefix, char *out, size_t n);   /* first fr
 void blockdev_rescan(struct blockdev *d);     /* drop and re-read the partition table */
 void storage_mount(struct blockdev *d);       /* mount the disk's filesystems under /mnt (or /home) */
 void storage_unmount(struct blockdev *d);     /* unmount everything on the disk */
+bool storage_mount_point(struct blockdev *v, char *out, size_t n);   /* is this volume mounted, and where */
+int storage_mount_volume(struct blockdev *v);    /* 0, -EBUSY (already mounted), -EINVAL (no FAT32/btrfs) */
+int storage_unmount_volume(struct blockdev *v);  /* 0, -EINVAL (not mounted), -EBUSY (the system's /home) */
 int blockdev_count(void);
 struct blockdev *blockdev_at(int i);
 struct blockdev *blockdev_find(const char *name);
@@ -32,5 +35,14 @@ int blockdev_write(struct blockdev *d, uint64_t lba, uint32_t count, const void 
 int blockdev_flush(struct blockdev *d);   /* make completed writes durable (partitions flush the whole disk) */
 int blockdev_read_bytes(struct blockdev *d, uint64_t off, void *buf, size_t n);
 int blockdev_write_bytes(struct blockdev *d, uint64_t off, const void *buf, size_t n);
+
+/* partition tables: what a disk carries, and GPT editing (the caller rescans afterwards) */
+enum { PTABLE_NONE, PTABLE_MBR, PTABLE_GPT };
+extern const uint8_t GPT_TYPE_BASIC_DATA[16], GPT_TYPE_LINUX_FS[16], GPT_TYPE_ESP[16];
+int blockdev_ptable(struct blockdev *d);   /* PTABLE_*, as the partition scan reads it */
+int gpt_usable_range(struct blockdev *d, uint64_t *first, uint64_t *last);   /* 0, or -errno without a valid GPT */
+int gpt_create(struct blockdev *d);        /* new empty GPT + protective MBR; everything on the disk is lost */
+int gpt_add_partition(struct blockdev *d, uint64_t first, uint64_t last, const uint8_t type[16], const char *name);
+int gpt_delete_partition(struct blockdev *d, uint64_t first);   /* the entry that starts at LBA 'first' */
 void ahci_init(void);
 void nvme_init(void);

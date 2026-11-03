@@ -15,6 +15,7 @@ void gldemo_main(void *arg);
 void installer_main(void *arg);
 void browser_main(void *arg);
 void player_main(void *arg);
+void diskmgr_main(void *arg);
 
 const struct app_info app_table[APP_COUNT] = {
     [APP_FILES]   = { "Files", "files", files_main, false },
@@ -27,6 +28,7 @@ const struct app_info app_table[APP_COUNT] = {
     [APP_INSTALLER] = { "Install inFlux", "drive", installer_main, true },
     [APP_BROWSER]  = { "Browser", "browser", browser_main, false },
     [APP_PLAYER]   = { "Audio Player", "player", player_main, true },
+    [APP_DISKMGR]  = { "Disk Manager", "diskmgr", diskmgr_main, true },
 };
 
 struct app_start { int id; char *arg; };

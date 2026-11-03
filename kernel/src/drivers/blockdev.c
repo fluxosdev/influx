@@ -3,6 +3,7 @@
 #include "mm.h"
 #include "string.h"
 #include "sched.h"
+#include "io.h"
 
 static struct blockdev *devs[32];
 static int ndevs;
@@ -109,8 +110,6 @@ static void add_dev(struct blockdev *d) {
     kprintf("blockdev: /dev/%s %s%s%s (%s)\n", d->name, d->parent ? "partition of " : "", d->parent ? d->parent->name : d->model, d->parent ? "" : "", sz);
 }
 
-static const uint8_t GUID_ESP[16] = { 0x28, 0x73, 0x2A, 0xC1, 0x1F, 0xF8, 0xD2, 0x11, 0xBA, 0x4B, 0x00, 0xA0, 0xC9, 0x3E, 0xC9, 0x3B };
-
 uint32_t crc32_ieee(const void *data, size_t n);
 struct prange { uint64_t first, last; };
 static bool overlaps(const struct prange *r, int n, uint64_t first, uint64_t last) { for (int i = 0; i < n; i++) if (first <= r[i].last && r[i].first <= last) return true; return false; }
@@ -160,7 +159,7 @@ static void scan_gpt(struct blockdev *d, const struct gpt_header *h, const uint8
         if (overlaps(used, nused, e->first, e->last)) { kprintf("blockdev: %s: GPT entry %u overlaps another partition, ignored\n", d->name, i); continue; }
         used[nused++] = (struct prange){ e->first, e->last };
         struct blockdev *p = new_part(d, idx++, e->first, e->last - e->first + 1);
-        p->esp = !memcmp(e->type, GUID_ESP, 16);
+        p->esp = !memcmp(e->type, GPT_TYPE_ESP, 16);
         for (int k = 0; k < 36 && e->name[k] && k < 47; k++) p->model[k] = (char)e->name[k];
         add_dev(p);
     }
@@ -199,6 +198,136 @@ static void scan_partitions(struct blockdev *d) {
     }
     scan_gpt(d, &h, entries);
     kfree(entries);
+}
+
+int blockdev_ptable(struct blockdev *d) {
+    if (d->sectors < 3) return PTABLE_NONE;
+    struct gpt_header h; uint8_t *entries;
+    const char *why = gpt_read(d, 1, &h, &entries);
+    if (!why) { kfree(entries); return PTABLE_GPT; }
+    uint8_t *mbr = kmalloc(d->sector_size);
+    bool mbr_ok = blockdev_read(d, 0, 1, mbr) == 0 && mbr[510] == 0x55 && mbr[511] == 0xAA, prot = false, any = false;
+    for (int i = 0; mbr_ok && i < 4; i++) { uint8_t t = mbr[446 + i * 16 + 4]; if (t == 0xEE) prot = true; else if (t && *(uint32_t *)(mbr + 446 + i * 16 + 12)) any = true; }
+    kfree(mbr);
+    if (why == GPT_NOSIG && !prot) return any ? PTABLE_MBR : PTABLE_NONE;
+    if (!gpt_read(d, d->sectors - 1, &h, &entries)) { kfree(entries); return PTABLE_GPT; }
+    return PTABLE_NONE;
+}
+
+/* ---- GPT editing ---- */
+const uint8_t GPT_TYPE_BASIC_DATA[16] = { 0xA2, 0xA0, 0xD0, 0xEB, 0xE5, 0xB9, 0x33, 0x44, 0x87, 0xC0, 0x68, 0xB6, 0xB7, 0x26, 0x99, 0xC7 };
+const uint8_t GPT_TYPE_LINUX_FS[16] = { 0xAF, 0x3D, 0xC6, 0x0F, 0x83, 0x84, 0x72, 0x47, 0x8E, 0x79, 0x3D, 0x69, 0xD8, 0x47, 0x7D, 0xE4 };
+const uint8_t GPT_TYPE_ESP[16] = { 0x28, 0x73, 0x2A, 0xC1, 0x1F, 0xF8, 0xD2, 0x11, 0xBA, 0x4B, 0x00, 0xA0, 0xC9, 0x3E, 0xC9, 0x3B };
+
+static void random_guid(uint8_t *g) {
+    static uint64_t seed;
+    seed ^= rdtsc() ^ (time_unix() << 20);
+    for (int i = 0; i < 16; i++) { seed = seed * 6364136223846793005ull + 1442695040888963407ull; g[i] = seed >> 56; }
+    g[7] = (g[7] & 0x0F) | 0x40; g[8] = (g[8] & 0x3F) | 0x80;   /* version 4, RFC 4122 variant (GPT stores the first three fields little-endian) */
+}
+
+/* the primary or, failing that, the backup GPT; *entries is kmalloc'd */
+static int gpt_load(struct blockdev *d, struct gpt_header *h, uint8_t **entries) {
+    if (d->sectors < 3) return -EINVAL;
+    if (!gpt_read(d, 1, h, entries)) return 0;
+    if (!gpt_read(d, d->sectors - 1, h, entries)) return 0;
+    return -EINVAL;
+}
+
+/* writes the entry array and both headers (primary at LBA 1, backup in the last sector) from h's
+ * geometry; the backup header goes first so that a torn update leaves at least one valid copy */
+static int gpt_commit(struct blockdev *d, const struct gpt_header *h, const uint8_t *entries) {
+    uint32_t ss = d->sector_size;
+    uint64_t bytes = (uint64_t)h->nparts * h->part_size, nsec = (bytes + ss - 1) / ss, last = d->sectors - 1;
+    if (d->sectors < 2 * nsec + 4 || h->first_usable < 2 + nsec || h->last_usable >= last - nsec || h->first_usable > h->last_usable) return -EINVAL;
+    uint8_t *arr = kzalloc(nsec * ss);
+    memcpy(arr, entries, bytes);
+    struct gpt_header p = *h;
+    p.hdr_size = 92; p.res = 0; p.parts_crc = crc32_ieee(arr, bytes);
+    p.cur_lba = 1; p.backup_lba = last; p.part_lba = 2;
+    struct gpt_header b = p; b.cur_lba = last; b.backup_lba = 1; b.part_lba = last - nsec;
+    p.crc = 0; p.crc = crc32_ieee(&p, 92);
+    b.crc = 0; b.crc = crc32_ieee(&b, 92);
+    uint8_t *sec = kzalloc(ss);
+    int r = blockdev_write(d, b.part_lba, nsec, arr);
+    if (r == 0) { memcpy(sec, &b, sizeof b); r = blockdev_write(d, last, 1, sec); }
+    if (r == 0) r = blockdev_flush(d);
+    if (r == 0) r = blockdev_write(d, 2, nsec, arr);
+    if (r == 0) { memset(sec, 0, ss); memcpy(sec, &p, sizeof p); r = blockdev_write(d, 1, 1, sec); }
+    if (r == 0) r = blockdev_flush(d);
+    kfree(sec); kfree(arr);
+    return r;
+}
+
+int gpt_usable_range(struct blockdev *d, uint64_t *first, uint64_t *last) {
+    struct gpt_header h; uint8_t *e;
+    int r = gpt_load(d, &h, &e);
+    if (r < 0) return r;
+    kfree(e);
+    *first = h.first_usable; *last = MIN(h.last_usable, d->sectors - 1);
+    return 0;
+}
+
+int gpt_create(struct blockdev *d) {
+    uint32_t ss = d->sector_size;
+    if (ss < 512 || d->sectors < 4096) return -ENOSPC;
+    struct gpt_header h; memset(&h, 0, sizeof h);
+    uint64_t nsec = (128 * 128 + ss - 1) / ss;
+    memcpy(h.sig, "EFI PART", 8); h.rev = 0x00010000; h.nparts = 128; h.part_size = 128;
+    h.first_usable = 2 + nsec; h.last_usable = d->sectors - 2 - nsec;
+    random_guid(h.guid);
+    /* protective MBR: no boot code, one 0xEE entry over the whole disk */
+    uint8_t *mbr = kzalloc(ss);
+    uint8_t *e = mbr + 446;
+    e[1] = 0x00; e[2] = 0x02; e[3] = 0x00; e[4] = 0xEE; e[5] = 0xFF; e[6] = 0xFF; e[7] = 0xFF;
+    *(uint32_t *)(e + 8) = 1; *(uint32_t *)(e + 12) = (uint32_t)MIN(d->sectors - 1, 0xFFFFFFFFull);
+    mbr[510] = 0x55; mbr[511] = 0xAA;
+    int r = blockdev_write(d, 0, 1, mbr);
+    kfree(mbr);
+    uint8_t *entries = kzalloc(128 * 128);
+    if (r == 0) r = gpt_commit(d, &h, entries);
+    kfree(entries);
+    kprintf("blockdev: %s: new GPT partition table%s\n", d->name, r ? " failed" : "");
+    return r;
+}
+
+int gpt_add_partition(struct blockdev *d, uint64_t first, uint64_t last, const uint8_t type[16], const char *name) {
+    struct gpt_header h; uint8_t *ents;
+    int r = gpt_load(d, &h, &ents);
+    if (r < 0) return r;
+    if (first > last || first < h.first_usable || last > h.last_usable) { kfree(ents); return -EINVAL; }
+    int slot = -1;
+    for (uint32_t i = 0; i < h.nparts; i++) {
+        struct gpt_entry *e = (struct gpt_entry *)(ents + i * h.part_size);
+        bool empty = true; for (int k = 0; k < 16; k++) if (e->type[k]) empty = false;
+        if (empty) { if (slot < 0 && i < 128) slot = i; continue; }   /* the scan only reads the first 128 entries */
+        if (first <= e->last && e->first <= last) { kfree(ents); return -EEXIST; }
+    }
+    if (slot < 0) { kfree(ents); return -ENOSPC; }
+    struct gpt_entry *e = (struct gpt_entry *)(ents + slot * h.part_size);
+    memset(e, 0, h.part_size);
+    memcpy(e->type, type, 16); random_guid(e->guid); e->first = first; e->last = last;
+    for (int i = 0; name && name[i] && i < 36; i++) e->name[i] = (uint8_t)name[i];
+    r = gpt_commit(d, &h, ents);
+    kfree(ents);
+    kprintf("blockdev: %s: added partition LBA %lu-%lu%s\n", d->name, first, last, r ? " failed" : "");
+    return r;
+}
+
+int gpt_delete_partition(struct blockdev *d, uint64_t first) {
+    struct gpt_header h; uint8_t *ents;
+    int r = gpt_load(d, &h, &ents);
+    if (r < 0) return r;
+    r = -ENOENT;
+    for (uint32_t i = 0; i < h.nparts; i++) {
+        struct gpt_entry *e = (struct gpt_entry *)(ents + i * h.part_size);
+        bool empty = true; for (int k = 0; k < 16; k++) if (e->type[k]) empty = false;
+        if (!empty && e->first == first) { memset(e, 0, h.part_size); r = 0; break; }
+    }
+    if (r == 0) r = gpt_commit(d, &h, ents);
+    kfree(ents);
+    kprintf("blockdev: %s: deleted the partition at LBA %lu%s\n", d->name, first, r ? " failed" : "");
+    return r;
 }
 
 void blockdev_register(struct blockdev *d) {

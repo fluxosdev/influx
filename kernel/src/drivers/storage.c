@@ -19,11 +19,11 @@ void storage_init(void) {
     for (int i = 0; i < blockdev_count(); i++) { struct blockdev *d = blockdev_at(i); if (d && !d->parent) storage_mount(d); }
 }
 
-static void mount_one(struct blockdev *d) {
-    if (vfs_mount_count() >= VFS_MAX_MOUNTS) { kprintf("storage: no free mount slot for %s\n", d->name); return; }   /* a mounted fs cannot be torn down again */
+static int mount_one(struct blockdev *d) {
+    if (vfs_mount_count() >= VFS_MAX_MOUNTS) { kprintf("storage: no free mount slot for %s\n", d->name); return -ENOSPC; }   /* a mounted fs cannot be torn down again */
     struct vnode *root = btrfs_mount(d);
     if (!root) root = fat32_mount(d);
-    if (!root) return;
+    if (!root) return -EINVAL;
     char mp[64];
     snprintf(mp, sizeof mp, d->esp ? "/mnt/.%s" : "/mnt/%s", d->name);   /* dot-name hides the ESP */
     vfs_mkdir("/mnt");
@@ -36,8 +36,10 @@ static void mount_one(struct blockdev *d) {
         if (!home_taken) { strcpy(mp, "/home"); kprintf("storage: %s is the installed inFlux root, mounting at /home\n", d->name); }
         vnode_unref(marker);
     }
-    if (vfs_mount(mp, root) == 0) root->priv = d;
+    int r = vfs_mount(mp, root);
+    if (r == 0) root->priv = d;
     else { kprintf("storage: mounting %s on %s failed\n", d->name, mp); btrfs_unmount(root); }
+    return r;
 }
 
 /* a whole disk with partitions mounts each partition, otherwise the disk itself */
@@ -59,7 +61,7 @@ void storage_unmount(struct blockdev *d) {
     for (int i = 0; i < vfs_mount_count(); ) {
         char mp[64]; struct vnode *root = vfs_mount_at(i, mp, sizeof mp);
         if (root && on_disk(root->priv, d) && strcmp(mp, "/")) {
-            kprintf("storage: unmounting %s (%s removed)\n", mp, d->name);
+            kprintf("storage: unmounting %s (disk %s)\n", mp, d->name);
             vfs_unmount(mp);
             btrfs_unmount(root);   /* no-op for other filesystems */
             if (!strncmp(mp, "/mnt/", 5)) vfs_unlink(mp);
@@ -67,4 +69,35 @@ void storage_unmount(struct blockdev *d) {
         }
         i++;
     }
+}
+
+/* ---- single volumes (Disk Manager): a partition, or a whole disk that carries a filesystem ---- */
+bool storage_mount_point(struct blockdev *v, char *out, size_t n) {
+    for (int i = 0; i < vfs_mount_count(); i++) {
+        char mp[64]; struct vnode *root = vfs_mount_at(i, mp, sizeof mp);
+        if (root && root->priv == v && strcmp(mp, "/")) { if (out) strlcpy(out, mp, n); return true; }
+    }
+    return false;
+}
+int storage_mount_volume(struct blockdev *v) {
+    if (v->removed) return -ENODEV;
+    if (storage_mount_point(v, NULL, 0)) return -EBUSY;
+    return mount_one(v);
+}
+/* the installed system's home volume stays mounted */
+int storage_unmount_volume(struct blockdev *v) {
+    char mp[64];
+    if (!storage_mount_point(v, mp, sizeof mp)) return -EINVAL;
+    if (!strcmp(mp, "/home")) return -EBUSY;
+    for (int i = 0; i < vfs_mount_count(); i++) {
+        char p[64]; struct vnode *r = vfs_mount_at(i, p, sizeof p);
+        if (!r || strcmp(p, mp)) continue;
+        int e = vfs_unmount(mp);
+        if (e < 0) return e;
+        kprintf("storage: unmounted %s from %s\n", v->name, mp);
+        btrfs_unmount(r);   /* no-op for other filesystems */
+        if (!strncmp(mp, "/mnt/", 5)) vfs_unlink(mp);
+        return 0;
+    }
+    return -EINVAL;
 }

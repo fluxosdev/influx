@@ -590,7 +590,7 @@ struct dock_item { int app; const char *icon; const char *label; bool separator;
 static const struct dock_item dock_items_all[] = {
     { APP_FILES, "files", "Files", false }, { APP_BROWSER, "browser", "Browser", false }, { APP_TERMINAL, "terminal", "Terminal", false },
     { APP_EDITOR, "editor", "Text Editor", false }, { APP_CALC, "calculator", "Calculator", false },
-    { APP_TASKMAN, "taskman", "Task Manager", false }, { APP_SETTINGS, "settings", "System Settings", false }, { APP_GLDEMO, "gldemo", "OpenGL Demo", false },
+    { APP_TASKMAN, "taskman", "Task Manager", false }, { APP_DISKMGR, "diskmgr", "Disk Manager", false }, { APP_SETTINGS, "settings", "System Settings", false }, { APP_GLDEMO, "gldemo", "OpenGL Demo", false },
     { APP_INSTALLER, "drive", "Install inFlux", false },
     { -1, NULL, NULL, true }, { -2, "trash", "Trash", false },
 };

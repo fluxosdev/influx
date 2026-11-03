@@ -23,7 +23,8 @@ struct tm_app {
     int scroll;                        /* table scroll offset in pixels */
 };
 enum { TCMD_QUIT_PROC = CMD_APP + 1, TCMD_SORT_CPU, TCMD_SORT_MEM, TCMD_SORT_NAME, TCMD_SORT_PID, TCMD_INFO, TCMD_REFRESH };
-static const struct menu_item proc_items[] = { MENU("Force Quit Process…", TCMD_QUIT_PROC, KEY_BACKSPACE, MOD_CMD), MENU("Process Info", TCMD_INFO, 'i', MOD_CMD), MENU_SEP, MENU("Refresh Now", TCMD_REFRESH, 'r', MOD_CMD), MENU_SEP, MENU("Close", CMD_CLOSE, 'w', MOD_CMD), MENU("Quit Task Manager", CMD_QUIT, 'q', MOD_CMD) };
+/* not const: Force Quit and Process Info are greyed out while they can't apply (update_menus) */
+static struct menu_item proc_items[] = { MENU("Force Quit Process…", TCMD_QUIT_PROC, KEY_BACKSPACE, MOD_CMD), MENU("Process Info", TCMD_INFO, 'i', MOD_CMD), MENU_SEP, MENU("Refresh Now", TCMD_REFRESH, 'r', MOD_CMD), MENU_SEP, MENU("Close", CMD_CLOSE, 'w', MOD_CMD), MENU("Quit Task Manager", CMD_QUIT, 'q', MOD_CMD) };
 static const struct menu_item view_items[] = { MENU("Sort by CPU", TCMD_SORT_CPU, '1', MOD_CMD), MENU("Sort by Memory", TCMD_SORT_MEM, '2', MOD_CMD), MENU("Sort by Name", TCMD_SORT_NAME, '3', MOD_CMD), MENU("Sort by PID", TCMD_SORT_PID, '4', MOD_CMD) };
 static const struct menu menus[] = { { "Process", proc_items, ARRAY_LEN(proc_items) }, { "View", view_items, ARRAY_LEN(view_items) } };
 static const struct app_menus tm_menus = { menus, ARRAY_LEN(menus) };
@@ -65,6 +66,11 @@ static void refresh(struct tm_app *t) {
     t->hist_pos = (t->hist_pos + 1) % HIST;
 }
 
+static struct prow *selected_row(struct tm_app *t) { for (int i = 0; i < t->nrows; i++) if (t->rows[i].pid == t->selected_pid) return &t->rows[i]; return NULL; }
+/* the kernel (PID 1) can't be killed, and a zombie has already exited */
+static bool can_force_quit(struct tm_app *t) { struct prow *r = selected_row(t); return r && r->pid > 1 && !r->exited; }
+static void update_menus(struct tm_app *t) { proc_items[0].disabled = !can_force_quit(t); proc_items[1].disabled = !selected_row(t); }
+
 static struct rect btn_quit(struct tm_app *t) { return rect_make(14, TITLEBAR_H + 8, 32, 28); }
 static struct rect table_rect(struct tm_app *t) { return rect_make(0, TITLEBAR_H + TOOLBAR_H, t->w->frame.w, t->w->frame.h - TITLEBAR_H - TOOLBAR_H - SUMMARY_H); }
 static int rows_h(struct tm_app *t) { return table_rect(t).h - HDR_H; }
@@ -78,8 +84,9 @@ static void draw(struct tm_app *t) {
     /* toolbar */
     gfx_fill_rect(c, 0, 0, W, TITLEBAR_H + TOOLBAR_H, theme.titlebar);
     gfx_hline(c, 0, TITLEBAR_H + TOOLBAR_H - 1, W, theme.titlebar_line);
+    update_menus(t);
     struct rect bq = btn_quit(t);
-    bool can_quit = t->selected_pid > 1;
+    bool can_quit = can_force_quit(t);
     gfx_fill_rounded_rect(c, bq.x, bq.y, bq.w, bq.h, 6, t->pressed_btn == 1 ? (theme.dark ? RGBA(255, 255, 255, 0x30) : RGBA(0, 0, 0, 0x18)) : theme.control_bg);
     gfx_draw_rounded_rect(c, bq.x, bq.y, bq.w, bq.h, 6, theme.control_border);
     color_t xc = can_quit ? theme.text_secondary : theme.text_disabled;
@@ -175,15 +182,14 @@ static void draw(struct tm_app *t) {
 }
 
 static void force_quit(struct tm_app *t) {
-    if (t->selected_pid <= 1) return;
-    struct prow *r = NULL; for (int i = 0; i < t->nrows; i++) if (t->rows[i].pid == t->selected_pid) r = &t->rows[i];
-    if (!r) return;
+    if (!can_force_quit(t)) return;
+    struct prow *r = selected_row(t);
     if (r->pid == current_thread->proc->pid) { if (dialog_confirm("Task Manager", "Quit Task Manager?", "Quit", false)) { struct event e = { .type = EV_CLOSE }; window_post_event(t->w, &e); } return; }
     char msg[160]; snprintf(msg, sizeof msg, "Do you want to force “%s” (PID %d) to quit?\nYou will lose any unsaved changes.", r->name, r->pid);
     if (dialog_confirm("Force Quit", msg, "Force Quit", true)) process_kill(r->pid, 9);
 }
 static void process_info(struct tm_app *t) {
-    struct prow *r = NULL; for (int i = 0; i < t->nrows; i++) if (t->rows[i].pid == t->selected_pid) r = &t->rows[i];
+    struct prow *r = selected_row(t);
     if (!r) return;
     procs_lock();
     struct process *p = process_find(r->pid);
@@ -221,7 +227,7 @@ void taskman_main(void *arg) {
             break;
         case EV_MOUSE_DOWN: {
             if (ev.button != BTN_LEFT) break;
-            if (rect_contains(btn_quit(t), ev.x, ev.y)) { t->pressed_btn = 1; break; }
+            if (rect_contains(btn_quit(t), ev.x, ev.y)) { if (can_force_quit(t)) t->pressed_btn = 1; break; }
             int W = t->w->frame.w, sx = W - 14 - 3 * 64;
             if (ev.y >= TITLEBAR_H + 8 && ev.y < TITLEBAR_H + 36 && ev.x >= sx && ev.x < sx + 192) { int i = (ev.x - sx) / 64; t->sort_col = i == 0 ? 1 : i == 1 ? 2 : 0; t->sort_desc = i != 2; refresh(t); break; }
             struct rect tr = table_rect(t);
