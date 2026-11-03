@@ -10,8 +10,6 @@ TCP/IP stack.
 in a single session: kernel, drivers, filesystems, window server, applications,
 shell, user-space C library and build system.
 
-![inFlux desktop](docs/screenshot.png)
-
 ## Features
 
 ### Kernel
@@ -135,8 +133,6 @@ shell, user-space C library and build system.
 - BIOS and UEFI boot both work through Limine's hybrid ISO; under BIOS the
   Radeon's VBIOS sets the mode through VBE and the driver takes over scanout
   programming from there.
-
-![OpenGL demo](docs/opengl.png)
 
 ### Installer and display modes
 - **Install inFlux** (Dock icon on the live system, or `install /dev/sdX` in the
