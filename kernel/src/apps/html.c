@@ -572,19 +572,21 @@ static void finish_fields(struct html_doc *d) {
     }
 }
 
-static const char *sniff_charset(const char *data, size_t len) {
-    static char cs[32];
+/* <meta charset=...> in the first 2 KiB, into the caller's cs (Browser windows parse concurrently).
+ * data need not be NUL-terminated: every read stays below data + lim */
+static bool sniff_charset(const char *data, size_t len, char *cs, size_t csz) {
     size_t lim = MIN(len, (size_t)2048);
+    const char *end = data + lim;
     for (size_t i = 0; i + 8 < lim; i++) {
         if (strncmp(data + i, "charset=", 8) && strncmp(data + i, "CHARSET=", 8)) continue;
         const char *v = data + i + 8;
-        while (*v == '"' || *v == '\'' || *v == ' ') v++;
+        while (v < end && (*v == '"' || *v == '\'' || *v == ' ')) v++;
         size_t n = 0;
-        while (v + n < data + lim && n < sizeof cs - 1 && (isalnum(v[n]) || v[n] == '-' || v[n] == '_')) { cs[n] = tolower(v[n]); n++; }
+        while (v + n < end && n < csz - 1 && (isalnum(v[n]) || v[n] == '-' || v[n] == '_')) { cs[n] = tolower(v[n]); n++; }
         cs[n] = 0;
-        return n ? cs : NULL;
+        return n > 0;
     }
-    return NULL;
+    return false;
 }
 
 static struct html_doc *doc_new(const char *url) {
@@ -601,7 +603,8 @@ static struct html_doc *doc_new(const char *url) {
 
 struct html_doc *html_parse(const char *data, size_t len, const char *charset, const char *url) {
     struct html_doc *d = doc_new(url);
-    if (!charset) charset = sniff_charset(data, len);
+    char sniffed[32];
+    if (!charset && sniff_charset(data, len, sniffed, sizeof sniffed)) charset = sniffed;
     size_t ulen;
     char *u = html_to_utf8(data, len, charset, &ulen);
     d->source = u; d->source_len = ulen;

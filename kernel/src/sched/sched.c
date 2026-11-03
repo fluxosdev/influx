@@ -346,12 +346,47 @@ void thread_sleep_ms(uint64_t ms) {
 
 bool thread_should_exit(void) { return current_thread->kill_pending; }
 
-/* p is ready to reap: wake anyone in process_wait() on it */
+static void process_free(struct process *p);
+
+/* exit_lock held: an exited orphan that no process_wait() has claimed is
+ * claimed here, so exactly one of its own exit and its creator's exit frees it */
+static bool claim_orphan(struct process *p) {
+    if (!p->orphan || !p->exited || p->reaping) return false;
+    p->reaping = true;
+    return true;
+}
+
+/* p is ready to reap: wake anyone in process_wait() on it. An orphan has
+ * nobody to wait for it and is freed right here (its caller, the last thread
+ * of p, is already off p's page tables and does not touch p again). */
 void process_mark_exited(struct process *p) {
     spin_lock(&exit_lock);
     p->exited = true;
+    bool reap = claim_orphan(p);
     waitq_wake_all(&p->exit_wq);
     spin_unlock(&exit_lock);
+    if (reap) process_free(p);
+}
+
+/* p is exiting: nothing will ever process_wait() on the processes it created
+ * (a user process may only reap its own children, and kernel callers only wait
+ * for what they spawned), so they free themselves when they exit. Those that
+ * already have are freed now. */
+static void orphan_children(struct process *p) {
+    for (;;) {
+        struct process *c, *reap = NULL;
+        procs_lock();
+        list_for_each_entry(c, &all_processes, all_link) if (c->ppid == p->pid && c != p) {
+            spin_lock(&exit_lock);
+            c->orphan = true;
+            if (claim_orphan(c)) reap = c;
+            spin_unlock(&exit_lock);
+            if (reap) break;
+        }
+        procs_unlock();
+        if (!reap) return;
+        process_free(reap);
+    }
 }
 int process_user_count(void) { return __atomic_load_n(&user_procs, __ATOMIC_RELAXED); }
 
@@ -377,6 +412,7 @@ void thread_exit(int code) {
         if (!p->exit_code) p->exit_code = code;
         for (int i = 0; i < MAX_FDS; i++) if (p->fds[i]) { vfs_close(p->fds[i]); p->fds[i] = NULL; }
         process_close_windows(p);
+        orphan_children(p);
         cli();
         vmm_switch(vmm_kernel_pml4());
         procs_lock();
@@ -476,6 +512,9 @@ bool process_kill(int pid, int sig) {
         p->exit_signal = sig;
         p->exit_code = 128 + sig;
         kill_threads(p);
+        /* kill_threads spares the caller (process_exit wants that); killing your own
+         * process must still take: the syscall return path sees kill_pending and exits */
+        if (current_thread->proc == p) current_thread->kill_pending = true;
     }
     procs_unlock();
     return true;
@@ -684,6 +723,20 @@ bool sem_wait_timeout(struct semaphore *s, uint64_t ms) {
     while (s->count <= 0) {
         if (system_ticks >= deadline) { spin_unlock(&s->lock); return false; }
         waitq_wait_timeout(&s->wq, &s->lock, deadline - system_ticks);
+    }
+    s->count--;
+    spin_unlock(&s->lock);
+    return true;
+}
+/* A kill wakes the waiter (kill_threads), but sem_wait/sem_wait_timeout just
+ * go back to sleep while the count is 0: this one returns false instead. */
+bool sem_wait_killable(struct semaphore *s, int64_t ms) {
+    uint64_t deadline = ms >= 0 ? system_ticks + (uint64_t)ms : 0;
+    spin_lock(&s->lock);
+    while (s->count <= 0) {
+        if (thread_should_exit() || (ms >= 0 && system_ticks >= deadline)) { spin_unlock(&s->lock); return false; }
+        if (ms < 0) waitq_wait(&s->wq, &s->lock);
+        else waitq_wait_timeout(&s->wq, &s->lock, deadline - system_ticks);
     }
     s->count--;
     spin_unlock(&s->lock);

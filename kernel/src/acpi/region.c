@@ -29,7 +29,15 @@ static void mem_write(uint64_t phys, int width, uint64_t v) {
     default: *(volatile uint64_t *)p = v; break;
     }
 }
-static uint64_t io_read(uint16_t port, int width) {
+/* the I/O space ends at 0xFFFF: a wider address would wrap to an unrelated port */
+static bool io_ok(uint64_t port, int width) {
+    if (port <= 0x10000 - width / 8) return true;
+    static bool warned;
+    if (!warned) { warned = true; kprintf("acpi: %d-bit I/O access at port 0x%lx beyond 0xFFFF refused\n", width, port); }
+    return false;
+}
+static uint64_t io_read(uint64_t port, int width) {
+    if (!io_ok(port, width)) return width >= 64 ? ~0ULL : (1ULL << width) - 1;
     switch (width) {
     case 8: return inb(port);
     case 16: return inw(port);
@@ -37,7 +45,8 @@ static uint64_t io_read(uint16_t port, int width) {
     default: return inl(port) | (uint64_t)inl(port + 4) << 32;
     }
 }
-static void io_write(uint16_t port, int width, uint64_t v) {
+static void io_write(uint64_t port, int width, uint64_t v) {
+    if (!io_ok(port, width)) return;
     switch (width) {
     case 8: outb(port, v); break;
     case 16: outw(port, v); break;
@@ -119,13 +128,11 @@ static void pci_resolve(struct aml_obj *rgn) {
     rgn->region.bus = bus; adr_decode(adr, &rgn->region.dev, &rgn->region.fn);
 }
 
-/* CMOS bank 0 at 0x70/0x71 (bit 7 of 0x70 is NMI disable: keep it), bank 1 at 0x72/0x73 */
+/* CMOS through arch/rtc.c, under the lock the RTC uses (bank 1 for 128-255); nothing past 255 */
 static uint64_t cmos_rw(uint64_t a, bool write, uint8_t v) {
     if (a >= 256) return 0;
-    if (a < 128) outb(0x70, (inb(0x70) & 0x80) | a); else outb(0x72, a);
-    uint16_t data = a < 128 ? 0x71 : 0x73;
-    if (write) { outb(data, v); return 0; }
-    return inb(data);
+    if (write) { cmos_write(a, v); return 0; }
+    return cmos_read(a);
 }
 
 static void unsupported(struct aml_obj *rgn) {

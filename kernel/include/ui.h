@@ -94,13 +94,13 @@ void window_resize(struct window *w, int cw, int ch);
 void window_focus(struct window *w);
 void window_minimize(struct window *w);
 bool window_wait_event(struct window *w, struct event *ev, int timeout_ms);   /* -1 = forever */
-void window_post_event(struct window *w, const struct event *ev);
+bool window_post_event(struct window *w, const struct event *ev);   /* false: queue full, event dropped */
 int window_content_top(struct window *w);   /* TITLEBAR_H for WIN_FULL_TITLE windows */
 struct window *window_find(int id);
 int window_list(struct window **out, int max);
 struct window *window_top_of_process(struct process *p);
 bool window_focus_process(struct process *p);                      /* focus its top window; false if none */
-bool window_post_process(struct process *p, const struct event *ev);   /* post to its top window; false if none */
+bool window_post_process(struct process *p, const struct event *ev);   /* post to its top window; false if none or its queue is full */
 
 void clipboard_set(const char *text, size_t n);
 char *clipboard_get(void);

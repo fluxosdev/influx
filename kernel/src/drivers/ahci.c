@@ -28,6 +28,9 @@ static volatile struct hba_mem *hba;
 #define PORT_CMD_FRE (1 << 4)
 #define PORT_CMD_FR  (1 << 14)
 #define PORT_CMD_CR  (1 << 15)
+#define PORT_CMD_ICC_MASK   (0xFu << 28)   /* interface communication control */
+#define PORT_CMD_ICC_ACTIVE (1u << 28)
+#define SSTS_IPM(s)  (((s) >> 8) & 0xF)     /* 1 active, 2 partial, 6 slumber, 8 devsleep */
 #define ATA_READ_DMA_EXT  0x25
 #define ATA_WRITE_DMA_EXT 0x35
 #define ATA_IDENTIFY      0xEC
@@ -62,13 +65,28 @@ static void port_recover(struct ahci_port *ap) {
     p->cmd |= PORT_CMD_FRE | PORT_CMD_ST;
 }
 
+/* Firmware with aggressive link power management may leave a present device's link in Partial, Slumber
+ * or DevSleep. Request Active (PxCMD.ICC takes a new request only while it reads 0, Idle, and returns to
+ * 0 once accepted) and give the link a moment. If it stays down the port is still used: the HBA wakes
+ * the link itself when a command is issued. */
+static void port_wake(volatile struct hba_port *p, int i) {
+    if (SSTS_IPM(p->ssts) == 1) return;
+    for (int t = 0; t < 10 && (p->cmd & PORT_CMD_ICC_MASK); t++) thread_sleep_ms(1);
+    if (!(p->cmd & PORT_CMD_ICC_MASK)) p->cmd = (p->cmd & ~PORT_CMD_ICC_MASK) | PORT_CMD_ICC_ACTIVE;
+    for (int t = 0; t < 50 && SSTS_IPM(p->ssts) != 1; t++) thread_sleep_ms(1);   /* slumber exit is <= 10 ms, devsleep ~20 ms */
+    if (SSTS_IPM(p->ssts) != 1) kprintf("ahci: port %d: link still in power state %u, using it anyway\n", i, SSTS_IPM(p->ssts));
+}
+
 static int ahci_cmd(struct ahci_port *ap, uint8_t cmd, uint64_t lba, uint16_t count, void *buf, size_t bytes, bool write) {
     volatile struct hba_port *p = ap->regs;
     if (ap->failed) return -EIO;
     for (int i = 0; i < 1000000 && (p->tfd & 0x88); i++) pause();   /* BSY | DRQ */
     if (p->tfd & 0x88) { port_recover(ap); if (ap->failed) return -EIO; }
     struct cmd_header *h = &ap->clb[0];
-    h->cfl = sizeof(struct fis_h2d) / 4; h->w = write ? 1 : 0; h->p = 0; h->c = 1;
+    /* C (clear busy upon R_OK) must stay 0: when set, real HBAs clear PxCI as soon as the command FIS
+     * is acknowledged, before any data has moved, so reads and IDENTIFY would return an unfilled buffer.
+     * It is only for the software-reset FIS. (QEMU completes the command synchronously and hides this.) */
+    h->cfl = sizeof(struct fis_h2d) / 4; h->w = write ? 1 : 0; h->p = 0; h->c = 0;
     struct cmd_table *t = ap->ctb;
     memset(t, 0, sizeof *t);
     int nprd = 0;
@@ -133,8 +151,9 @@ static void ata_string(const uint16_t *w, int words, char *out) {
 
 static void init_port(int i) {
     volatile struct hba_port *p = &hba->ports[i];
-    uint32_t ssts = p->ssts;
-    if ((ssts & 0xF) != 3 || ((ssts >> 8) & 0xF) != 1) return;   /* no device / not active */
+    /* DET 3: device present and phy communication established. IPM is not checked: a link in a power
+     * saving state still has a device behind it (port_wake brings it back). */
+    if ((p->ssts & 0xF) != 3) return;
     if (p->sig != 0x00000101) { kprintf("ahci: port %d: non-SATA device (sig %08x), skipped\n", i, p->sig); return; }
     struct ahci_port *ap = kzalloc(sizeof *ap);
     ap->regs = p; ap->index = i;
@@ -146,13 +165,17 @@ static void init_port(int i) {
     ap->clb[0].ctba = (uint32_t)ctb; ap->clb[0].ctbau = (uint32_t)(ctb >> 32);
     p->serr = 0xFFFFFFFF; p->is = 0xFFFFFFFF; p->ie = 0;
     port_start(p);
-    uint16_t *id = kmalloc(512);
+    port_wake(p, i);
+    uint16_t *id = kzalloc(512);
     if (ahci_cmd(ap, ATA_IDENTIFY, 0, 0, id, 512, false) < 0) { kprintf("ahci: port %d: identify failed\n", i); kfree(id); return; }
     struct blockdev *d = kzalloc(sizeof *d);
     blockdev_alloc_name("sd", d->name, sizeof d->name);
     ata_string(id + 27, 20, d->model);
-    uint64_t sectors = *(uint64_t *)(id + 100);
+    /* words 100-103 hold the LBA48 capacity only when word 83 bit 10 says LBA48 is supported */
+    bool lba48 = (id[83] & 0xC000) == 0x4000 && (id[83] & (1 << 10));
+    uint64_t sectors = lba48 ? *(uint64_t *)(id + 100) : 0;
     if (!sectors) sectors = *(uint32_t *)(id + 60);
+    if (!sectors) { kprintf("ahci: port %d (%s): identify reports no capacity (words 60/100 are zero), disk ignored\n", i, d->model); kfree(id); kfree(d); return; }
     /* word 106 (valid when bits 15:14 = 01): bit 12 = logical sector longer than 256 words, size in words 117-118 */
     uint32_t ss = 512;
     if ((id[106] & 0xC000) == 0x4000 && (id[106] & (1 << 12))) ss = (id[117] | (uint32_t)id[118] << 16) * 2;

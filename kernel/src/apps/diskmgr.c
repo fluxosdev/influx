@@ -5,6 +5,7 @@
 #include "fs.h"
 #include "mm.h"
 #include "string.h"
+#include "installer.h"
 
 int fat32_format(struct blockdev *d, const char *label);
 int btrfs_mkfs(struct blockdev *d, const char *label);
@@ -92,17 +93,6 @@ static struct vnode *mount_root(struct blockdev *v, char *mp, size_t n) {
     }
     return NULL;
 }
-/* the installed system's disk: its /home volume can't be unmounted, nothing on it may be erased */
-static bool is_system_disk(struct blockdev *d) {
-    for (int i = 0; i < vfs_mount_count(); i++) {
-        char p[64]; struct vnode *r = vfs_mount_at(i, p, sizeof p);
-        if (!r || strcmp(p, "/home")) continue;
-        /* r->priv is only a blockdev for disk volumes: match it against the disk's devices, don't dereference it */
-        for (int j = 0; j < blockdev_count(); j++) { struct blockdev *b = blockdev_at(j); if (b && (void *)b == r->priv && (b == d || b->parent == d)) return true; }
-    }
-    return false;
-}
-
 static int probe_fs(struct blockdev *v) {
     uint8_t *buf = kmalloc(4096);
     int fs = FS_NONE;
@@ -209,10 +199,10 @@ static bool can_mount(struct dm *m) {
     struct item *it = item_of(m, m->sel);
     return it && it->fs != FS_NONE;
 }
-static bool can_erase(struct dm *m) { return m->sel && !is_system_disk(disk_of(m->sel)); }
-static bool can_add(struct dm *m) { uint64_t f, l; return m->sel && !is_system_disk(disk_of(m->sel)) && largest_free(m, disk_of(m->sel), &f, &l); }
+static bool can_erase(struct dm *m) { return m->sel && !install_is_system_disk(disk_of(m->sel)); }
+static bool can_add(struct dm *m) { uint64_t f, l; return m->sel && !install_is_system_disk(disk_of(m->sel)) && largest_free(m, disk_of(m->sel), &f, &l); }
 static bool can_delete(struct dm *m) {
-    if (!m->sel || !m->sel->parent || is_system_disk(m->sel->parent)) return false;
+    if (!m->sel || !m->sel->parent || install_is_system_disk(m->sel->parent)) return false;
     struct diskinfo *di = info_of(m, m->sel->parent);
     return di && di->table == PTABLE_GPT;
 }
@@ -425,7 +415,7 @@ static void draw(struct dm *m) {
                 font_draw(c, font_ui_small, x, by + 16, theme.text_secondary, buf);
             }
         }
-        if (is_system_disk(disk)) font_draw(c, font_ui_small, x, H - 28, theme.text_tertiary, "This disk holds the running inFlux system. It can’t be erased or repartitioned.");
+        if (install_is_system_disk(disk)) font_draw(c, font_ui_small, x, H - 28, theme.text_tertiary, "This disk holds the running inFlux system. It can’t be erased or repartitioned.");
     }
 
     /* sheet */
@@ -546,7 +536,7 @@ static bool sheet_commit(struct dm *m) {
     } else if (m->sheet_disk) {
         if (dev_bytes(disk) < min + (2ull << 20)) { snprintf(m->err, sizeof m->err, "The disk is too small for %s.", m->fmt == FMT_FAT32 ? "FAT32" : "btrfs"); return false; }
     } else if (dev_bytes(s) < min) { snprintf(m->err, sizeof m->err, "A %s volume needs at least %lu MB.", m->fmt == FMT_FAT32 ? "FAT32" : "btrfs", min >> 20); return false; }
-    if (is_system_disk(disk)) { strlcpy(m->err, "This disk holds the running system.", sizeof m->err); return false; }
+    if (install_is_system_disk(disk)) { strlcpy(m->err, "This disk holds the running system.", sizeof m->err); return false; }
 
     m->err[0] = 0;
     m->busy = m->sheet == SHEET_ADD ? "Creating the partition…" : "Erasing…";

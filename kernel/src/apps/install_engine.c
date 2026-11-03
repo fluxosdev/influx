@@ -10,6 +10,7 @@
 
 int fat32_format(struct blockdev *d, const char *label);
 struct vnode *fat32_mount(struct blockdev *d);
+void fat32_free(struct vnode *root);     /* frees a FAT volume that never got mounted */
 struct vnode *btrfs_mount(struct blockdev *d);
 int btrfs_mkfs(struct blockdev *d, const char *label);
 int btrfs_unmount(struct vnode *root);
@@ -109,6 +110,17 @@ static int copy_tree(const char *src, const char *dst) {
     return r;
 }
 
+/* the installed system's disk: its root volume is mounted at /home (Disk Manager, the installer app and `install` use this too) */
+bool install_is_system_disk(struct blockdev *d) {
+    for (int i = 0; i < vfs_mount_count(); i++) {
+        char p[64]; struct vnode *r = vfs_mount_at(i, p, sizeof p);
+        if (!r || strcmp(p, "/home")) continue;
+        /* r->priv is only a blockdev for disk volumes: match it against the disk's devices, don't dereference it */
+        for (int j = 0; j < blockdev_count(); j++) { struct blockdev *b = blockdev_at(j); if (b && (void *)b == r->priv && (b == d || b->parent == d)) return true; }
+    }
+    return false;
+}
+
 bool install_is_installed_system(void) {
     for (int i = 0; i < vfs_mount_count(); i++) { char mp[PATH_MAX]; vfs_mount_at(i, mp, sizeof mp); if (!strcmp(mp, "/home")) return true; }
     return false;
@@ -118,6 +130,8 @@ int install_run(struct blockdev *disk, install_progress_fn progress, void *ctx) 
     if (!disk || disk->parent) return -EINVAL;
     char msg[160];
     #define STEP(pct, ...) do { snprintf(msg, sizeof msg, __VA_ARGS__); kprintf("install: %s\n", msg); if (progress) progress(ctx, pct, msg); } while (0)
+    /* the loop below would unmount /home and write_gpt would wipe the running system's files */
+    if (install_is_system_disk(disk)) { STEP(100, "%s holds the running system (its volume is mounted at /home); choose another disk", disk->name); return -EBUSY; }
     if (disk->sector_size != 512) { STEP(100, "%s has %u-byte sectors; only 512-byte sector disks are supported", disk->name, disk->sector_size); return -EINVAL; }
     /* never install onto a disk that is currently mounted */
     for (int i = 0; i < blockdev_count(); i++) { struct blockdev *b = blockdev_at(i); if (b && (b == disk || b->parent == disk) && b->fs_type) { for (int m = 0; m < vfs_mount_count(); m++) { char mp[PATH_MAX]; struct vnode *r = vfs_mount_at(m, mp, sizeof mp); if (r && r->priv == b) { STEP(0, "%s is mounted at %s; unmounting", b->name, mp); if (vfs_unmount(mp) == 0) { btrfs_unmount(r); m--; } } } } }
@@ -139,7 +153,7 @@ int install_run(struct blockdev *disk, install_progress_fn progress, void *ctx) 
     struct vnode *esp_root = fat32_mount(esp);
     if (!esp_root) { STEP(100, "Cannot mount the new EFI partition"); return -EIO; }
     vfs_mkdir("/mnt");
-    if ((r = vfs_mount("/mnt/.install-esp", esp_root)) < 0) { STEP(100, "Cannot mount the new EFI partition (%d)", r); return r; }
+    if ((r = vfs_mount("/mnt/.install-esp", esp_root)) < 0) { STEP(100, "Cannot mount the new EFI partition (%d)", r); fat32_free(esp_root); return r; }
     STEP(28, "Copying bootloader");
     static const char *const esp_dirs[] = { "/mnt/.install-esp/EFI", "/mnt/.install-esp/EFI/BOOT", "/mnt/.install-esp/boot" };
     for (int i = 0; i < 3; i++) if ((r = vfs_mkdir(esp_dirs[i])) < 0 && r != -EEXIST) { STEP(100, "Creating %s failed (%d)", esp_dirs[i], r); vfs_unmount("/mnt/.install-esp"); return r; }

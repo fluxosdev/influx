@@ -9,7 +9,7 @@
 #define CACHE_MAX 384
 #define MAX_PENDING 128
 #define BTRFS_MAX_LEVEL 8
-struct pending_block { uint64_t bytenr; int level; uint64_t owner; bool free; };
+struct pending_block { uint64_t bytenr; int level; uint64_t owner; bool free, recording; };   /* recording: its extent item is being inserted */
 
 struct chunk_map { uint64_t logical, length, type; int nstripes; uint64_t stripe_dev[4], stripe_phys[4]; };
 struct tree_block { uint64_t logical; uint8_t *data; bool dirty, pinned; uint64_t lru; struct tree_block *hnext; };

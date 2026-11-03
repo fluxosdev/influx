@@ -161,8 +161,8 @@ int vsnprintf(char *buf, size_t n, const char *fmt, va_list ap) {
         int left = 0, zero = 0;
         for (;; fmt++) { if (*fmt == '-') left = 1; else if (*fmt == '0') zero = 1; else if (*fmt == '+' || *fmt == ' ' || *fmt == '#') {} else break; }
         int width = 0, prec = -1;
-        if (*fmt == '*') { width = va_arg(ap, int); fmt++; } else while (isdigit(*fmt)) width = width * 10 + (*fmt++ - '0');
-        if (*fmt == '.') { fmt++; prec = 0; if (*fmt == '*') { prec = va_arg(ap, int); fmt++; } else while (isdigit(*fmt)) prec = prec * 10 + (*fmt++ - '0'); }
+        if (*fmt == '*') { width = va_arg(ap, int); fmt++; if (width < 0) { left = 1; width = -width; } } else while (isdigit(*fmt)) width = width * 10 + (*fmt++ - '0');
+        if (*fmt == '.') { fmt++; prec = 0; if (*fmt == '*') { prec = va_arg(ap, int); fmt++; if (prec < 0) prec = -1; } else while (isdigit(*fmt)) prec = prec * 10 + (*fmt++ - '0'); }
         int lng = 0; while (*fmt == 'l' || *fmt == 'z' || *fmt == 'j') { lng = 1; fmt++; } while (*fmt == 'h') fmt++;
         if (!*fmt) break;
         switch (*fmt) {
@@ -173,7 +173,10 @@ int vsnprintf(char *buf, size_t n, const char *fmt, va_list ap) {
         case 'c': { char c = (char)va_arg(ap, int); if (!left) pad(&o, width - 1, ' '); put(&o, c); if (left) pad(&o, width - 1, ' '); break; }
         case 's': { const char *s = va_arg(ap, const char *); if (!s) s = "(null)"; int len = 0; while (s[len] && (prec < 0 || len < prec)) len++; if (!left) pad(&o, width - len, ' '); for (int i = 0; i < len; i++) put(&o, s[i]); if (left) pad(&o, width - len, ' '); break; }
         case '%': put(&o, '%'); break;
-        default: put(&o, '%'); put(&o, *fmt); break;
+        /* unsupported conversions still take their argument, so the ones after them print
+         * correctly; %n is never written through */
+        case 'f': case 'F': case 'e': case 'E': case 'g': case 'G': case 'a': case 'A': (void)va_arg(ap, double); put(&o, '%'); put(&o, *fmt); break;
+        default: (void)va_arg(ap, unsigned long); put(&o, '%'); put(&o, *fmt); break;
         }
     }
     if (n) buf[o.pos < n ? o.pos : n - 1] = 0;

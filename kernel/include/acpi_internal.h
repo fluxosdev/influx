@@ -145,6 +145,7 @@ struct acpi_fadt {
 } PACKED;
 #define FADT_PWR_BUTTON    (1u << 4)    /* set: power button is a control-method device */
 #define FADT_SLP_BUTTON    (1u << 5)
+#define FADT_TMR_VAL_EXT   (1u << 8)    /* PM timer counts 32 bits (else 24) */
 #define FADT_RESET_REG_SUP (1u << 10)
 #define FADT_HW_REDUCED    (1u << 20)
 

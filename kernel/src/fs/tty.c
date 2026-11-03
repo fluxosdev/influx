@@ -63,13 +63,13 @@ void tty_input(struct tty *t, const char *s, size_t n) {
         if (c == 3 && !t->raw) {   /* Ctrl+C in cooked mode: interrupt the foreground job */
             tty_write(t, "^C\n", 3);
             /* a builtin blocked reading the terminal sees EOF; one that loops checks the flag */
-            spin_lock(&t->lock); t->line_len = 0; t->eof_pending = true; spin_unlock(&t->lock); wake = true;
-            if (t->intr_flag) *t->intr_flag = true;
+            /* intr_flag points into the shell, which clears it under this lock before it frees itself */
+            spin_lock(&t->lock); t->line_len = 0; t->eof_pending = true; if (t->intr_flag) *t->intr_flag = true; spin_unlock(&t->lock); wake = true;
             if (t->fg_pid > 0) process_kill(t->fg_pid, 2);
             if (t->on_interrupt) t->on_interrupt(t->priv);
             continue;
         }
-        if (c == 3 && t->intr_flag) *t->intr_flag = true;
+        if (c == 3) { spin_lock(&t->lock); if (t->intr_flag) *t->intr_flag = true; spin_unlock(&t->lock); }
         /* echo after dropping the spinlock: the output callback may sleep on the terminal's mutex */
         const char *echo = NULL; int elen = 0, erep = 1;
         spin_lock(&t->lock);

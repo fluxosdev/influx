@@ -283,7 +283,10 @@ static void store_named(struct state *s, struct aml_node *node, struct aml_obj *
     node = ns_resolve_alias(node);
     struct aml_obj *cur = node->obj;
     struct aml_obj *v = aml_value_of(val);
-    if (copy_object || !cur) { obj_put(cur); node->obj = obj_copy(v); obj_put(v); return; }
+    /* CopyObject replaces the object, except that a field unit or buffer field
+     * keeps its type and is written through (as ACPICA) */
+    bool field = cur && (cur->type == AML_FIELD || cur->type == AML_BUFFER_FIELD);
+    if ((copy_object && !field) || !cur) { obj_put(cur); node->obj = obj_copy(v); obj_put(v); return; }
     switch (cur->type) {
     case AML_FIELD: field_write(cur, v); break;
     case AML_BUFFER_FIELD: bfield_write(cur, v); break;
@@ -337,6 +340,10 @@ static bool frame_ref(struct frame *f, bool up, struct aml_obj *o, int lvl) {
         return false;
     }
     if (o->type != AML_REFERENCE) return false;
+    if (o->ref.kind == REF_INDEX) {   /* the package element it designates may name a method-local object */
+        struct aml_obj *c = o->ref.target;
+        return lvl < 8 && c->type == AML_PACKAGE && o->ref.index < c->pkg.n && frame_ref(f, up, c->pkg.e[o->ref.index], lvl + 1);
+    }
     for (; f; f = up ? f->up : NULL) if (in_frame(f, o)) return true;
     return false;
 }
@@ -475,11 +482,10 @@ static struct aml_obj *parse_package(struct state *s, bool var) {
     struct aml_obj *pkg = obj_pkg(n);
     for (size_t i = 0; s->p < end && s->status == ST_OK; i++) {
         struct aml_obj *e;
-        if (name_start(*s->p)) {   /* names are references, not evaluated */
+        if (name_start(*s->p)) {   /* names are references, not evaluated: a later Store to a named Integer shows through, as in ACPICA */
             struct name nm; parse_name(s, &nm);
             struct aml_node *node = resolve(s, &nm, true);
-            if (node && node_has_value(node->obj) && node->obj->type != AML_FIELD && node->obj->type != AML_BUFFER_FIELD) e = obj_copy(node->obj);
-            else if (node) e = obj_ref_named(node);
+            if (node) e = obj_ref_named(node);
             else { char b[64]; name_str(&nm, b, sizeof b); e = obj_new(AML_NAMEREF); e->nameref.path = kstrdup(b); e->nameref.scope = s->scope; }
         } else e = eval2(s);
         if (i < n) { obj_put(pkg->pkg.e[i]); pkg->pkg.e[i] = e; } else obj_put(e);
@@ -770,7 +776,7 @@ static struct aml_obj *op_loadtable(struct state *s) {
     struct aml_obj *a[6];
     for (int i = 0; i < 6; i++) a[i] = eval_value(s);
     bool ok = false;
-    if (s->status == ST_OK && a[0]->type == AML_STRING) {
+    if (s->status == ST_OK && a[0]->type == AML_STRING && a[0]->str.len >= 4) {   /* memcmp reads 4 bytes */
         char sig[5];
         for (int i = 0; acpi_table_at(i, sig); i++) {
             const uint8_t *tbl = acpi_table_at(i, sig);
@@ -1378,6 +1384,29 @@ int aml_load_table(const void *table, size_t len, const char *what) {
     return s.status == ST_ERROR ? -EIO : 0;
 }
 
+/* A package element naming an Integer, String, Buffer or Package is a
+ * reference, so AML sees later stores to that name. C callers get such
+ * elements as values instead (ACPICA also hands out packages with named data
+ * resolved), so pm.c, irq.c and _CID matching need not chase them; devices
+ * and other objects stay references. Copies only packages that need it. */
+static bool named_data(struct aml_obj *e) {
+    if (e->type != AML_REFERENCE || e->ref.kind != REF_NAMED) return false;
+    struct aml_obj *o = ns_resolve_alias(e->ref.node)->obj;
+    return o && o->type >= AML_INTEGER && o->type <= AML_PACKAGE;
+}
+static bool has_named_data(struct aml_obj *o, int lvl) {
+    if (named_data(o)) return true;
+    for (size_t i = 0; o->type == AML_PACKAGE && lvl < 8 && i < o->pkg.n; i++) if (has_named_data(o->pkg.e[i], lvl + 1)) return true;
+    return false;
+}
+static struct aml_obj *resolve_named_data(struct aml_obj *o, int lvl) {
+    if (lvl >= 8 || !has_named_data(o, lvl)) return obj_get(o);
+    if (o->type != AML_PACKAGE) { struct aml_obj *v = aml_value_of(o), *r = resolve_named_data(v, lvl + 1); obj_put(v); return r; }
+    struct aml_obj *p = obj_pkg(o->pkg.n);
+    for (size_t i = 0; i < o->pkg.n; i++) { obj_put(p->pkg.e[i]); p->pkg.e[i] = resolve_named_data(o->pkg.e[i], lvl + 1); }
+    return p;
+}
+
 int aml_eval(struct aml_node *n, struct aml_obj **args, int argc, struct aml_obj **result) {
     aml_lock();
     n = ns_resolve_alias(n);
@@ -1389,6 +1418,7 @@ int aml_eval(struct aml_node *n, struct aml_obj **args, int argc, struct aml_obj
         r = invoke(&caller, n, args, argc);
         if (caller.status == ST_ERROR) rc = -EIO;
     } else r = node_value(n);
+    if (rc == 0 && r && r->type == AML_PACKAGE) { struct aml_obj *c = resolve_named_data(r, 0); obj_put(r); r = c; }
     aml_unlock();
     if (rc < 0) { obj_put(r); r = NULL; }
     if (result) *result = r; else obj_put(r);

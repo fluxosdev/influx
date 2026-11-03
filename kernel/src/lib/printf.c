@@ -38,8 +38,8 @@ int vsnprintf(char *buf, size_t n, const char *fmt, va_list ap) {
             else if (*fmt == ' ') {} else break;
         }
         int width = 0, prec = -1;
-        if (*fmt == '*') { width = va_arg(ap, int); fmt++; } else while (isdigit(*fmt)) width = width * 10 + (*fmt++ - '0');
-        if (*fmt == '.') { fmt++; prec = 0; if (*fmt == '*') { prec = va_arg(ap, int); fmt++; } else while (isdigit(*fmt)) prec = prec * 10 + (*fmt++ - '0'); }
+        if (*fmt == '*') { width = va_arg(ap, int); fmt++; if (width < 0) { left = true; width = -width; } } else while (isdigit(*fmt)) width = width * 10 + (*fmt++ - '0');
+        if (*fmt == '.') { fmt++; prec = 0; if (*fmt == '*') { prec = va_arg(ap, int); fmt++; if (prec < 0) prec = -1; } else while (isdigit(*fmt)) prec = prec * 10 + (*fmt++ - '0'); }
         int lng = 0;
         while (*fmt == 'l') { lng++; fmt++; }
         if (*fmt == 'z' || *fmt == 'j' || *fmt == 't') { lng = 2; fmt++; }
@@ -65,7 +65,12 @@ int vsnprintf(char *buf, size_t n, const char *fmt, va_list ap) {
             if (left) pad(&o, width - len, ' ');
             break; }
         case '%': put(&o, '%'); break;
-        default: put(&o, '%'); put(&o, *fmt); break;
+        /* No floating point. The SysV ABI passes doubles in vector registers, separately from
+         * the integer arguments, so leaving them unread keeps the later arguments in step. */
+        case 'f': case 'F': case 'e': case 'E': case 'g': case 'G': case 'a': case 'A': put(&o, '%'); put(&o, *fmt); break;
+        /* %n would write through an argument: never; anything else unsupported still takes
+         * its (integer or pointer) argument so the ones after it print correctly */
+        default: (void)va_arg(ap, uint64_t); put(&o, '%'); put(&o, *fmt); break;
         }
     }
     if (n) buf[o.pos < n ? o.pos : n - 1] = 0;

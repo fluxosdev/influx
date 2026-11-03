@@ -1,11 +1,35 @@
 #include "arch.h"
 #include "io.h"
+#include "spinlock.h"
 
-static uint8_t cmos_read(uint8_t reg) { outb(0x70, reg); return inb(0x71); }
+/* The index/data pairs are shared by the RTC and AML CMOS regions, which may
+ * run on different CPUs: one lock keeps an index and its data access together.
+ * Port 0x70 is write-only (reads give 0xFF on QEMU and most chipsets), so its
+ * NMI-disable bit 7 cannot be preserved; it is always written clear. Bank 1
+ * takes a 7-bit index too: 0x72 aliases 0x70 when the upper bank is disabled. */
+static spinlock_t cmos_lock = SPINLOCK_INIT;
+
+static uint16_t cmos_select(uint8_t reg) {
+    outb(reg < 128 ? 0x70 : 0x72, reg & 0x7F);
+    return reg < 128 ? 0x71 : 0x73;
+}
+uint8_t cmos_read(uint8_t reg) {
+    spin_lock(&cmos_lock);
+    uint8_t v = inb(cmos_select(reg));
+    spin_unlock(&cmos_lock);
+    return v;
+}
+void cmos_write(uint8_t reg, uint8_t v) {
+    spin_lock(&cmos_lock);
+    outb(cmos_select(reg), v);
+    spin_unlock(&cmos_lock);
+}
 static int bcd(uint8_t v) { return (v & 0x0F) + ((v >> 4) * 10); }
 
 void rtc_read(struct rtc_time *t) {
-    while (cmos_read(0x0A) & 0x80) pause();
+    /* update in progress lasts about 2 ms; an absent RTC reads 0xFF forever, so give up after
+     * about a second (each port read is ~1 us) rather than hang timer_init silently */
+    for (int i = 0; i < 1000000 && (cmos_read(0x0A) & 0x80); i++) pause();
     uint8_t s = cmos_read(0x00), m = cmos_read(0x02), h = cmos_read(0x04);
     uint8_t d = cmos_read(0x07), mo = cmos_read(0x08), y = cmos_read(0x09);
     uint8_t b = cmos_read(0x0B);

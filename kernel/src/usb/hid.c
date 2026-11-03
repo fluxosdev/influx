@@ -207,7 +207,10 @@ static bool parse_report(struct hid_dev *h, const uint8_t *d, int n) {
         case 0x28: umax = sz == 4 ? v : g.page << 16 | v; break;
         case 0x80: {   /* Input */
             uint32_t rsize = g.rsize, rid = g.rid;
-            for (uint32_t k = 0; k < g.rcount && g.rcount <= 256; k++) {
+            /* only the first 256 elements can be a field we use, but every element takes its
+             * bits in the report: the later fields' offsets must count all of them */
+            uint32_t nk = MIN(g.rcount, 256u);
+            for (uint32_t k = 0; k < nk; k++) {
                 uint32_t u = range ? umin + k : k < (uint32_t)nusage ? usages[k] : nusage ? usages[nusage - 1] : 0;
                 if (range && umin + k > umax) u = 0;
                 int idx = -1;
@@ -219,6 +222,7 @@ static bool parse_report(struct hid_dev *h, const uint8_t *d, int n) {
                 }
                 offs[rid] = (int)MIN((uint64_t)offs[rid] + rsize, 1u << 24);   /* no overflow on absurd sizes */
             }
+            if (g.rcount > nk) offs[rid] = (int)MIN((uint64_t)offs[rid] + (uint64_t)(g.rcount - nk) * rsize, 1u << 24);
         }
             __attribute__((fallthrough));
         case 0x90: case 0xB0: case 0xA0: case 0xC0:   /* every main item ends the local state */

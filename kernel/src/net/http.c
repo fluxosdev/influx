@@ -6,6 +6,7 @@
 #define HTTP_UA "Mozilla/5.0 (inFlux " INFLUX_VERSION "; x86_64) InfluxBrowser/1.0"
 #define CONNECT_TIMEOUT 10000
 #define RECV_TIMEOUT 20000
+#define SEND_TIMEOUT 20000   /* while the server accepts none of the request */
 #define DNS_TIMEOUT 6000
 
 /* ---- URLs ---- */
@@ -203,12 +204,13 @@ static const char *strerr(int e) {
 
 /* incremental chunked-body decoder */
 struct chunked { size_t pos; size_t remaining; int state; };   /* state: 0 size line, 1 data, 2 CRLF after data, 3 trailers, 4 done */
-static void chunked_feed(struct chunked *c, const struct buf *raw, struct buf *body) {
+/* false if the body could not grow (the decoder state is then meaningless) */
+static bool chunked_feed(struct chunked *c, const struct buf *raw, struct buf *body) {
     while (c->state != 4 && c->pos < raw->len) {
         const char *base = (const char *)raw->d;
         if (c->state == 0 || c->state == 2 || c->state == 3) {
             const char *eol = strstr(base + c->pos, "\r\n");
-            if (!eol) return;
+            if (!eol) return true;
             size_t line_len = eol - (base + c->pos);
             if (c->state == 0) {
                 c->remaining = strtoul(base + c->pos, NULL, 16);
@@ -218,11 +220,12 @@ static void chunked_feed(struct chunked *c, const struct buf *raw, struct buf *b
             c->pos = (eol - base) + 2;
         } else {
             size_t n = MIN(c->remaining, raw->len - c->pos);
-            buf_append(body, raw->d + c->pos, n);
+            if (!buf_append(body, raw->d + c->pos, n)) return false;
             c->pos += n; c->remaining -= n;
             if (!c->remaining) c->state = 2;
         }
     }
+    return true;
 }
 
 static int fetch_once(const struct http_request *req, const char *url, const char *method, const void *rbody, size_t rbody_len,
@@ -231,22 +234,8 @@ static int fetch_once(const struct http_request *req, const char *url, const cha
     if (!url_parse(url, &u) || !u.host[0]) { set_error(resp, "The address “%s” is not valid.", url); return -EINVAL; }
     if (!strcmp(u.scheme, "https")) { set_error(resp, "Secure (HTTPS) connections are not supported."); return -EPROTO; }
     if (strcmp(u.scheme, "http")) { set_error(resp, "The “%s:” scheme is not supported.", u.scheme); return -EPROTO; }
-    if (req->progress) req->progress(req->progress_ctx, "Resolving", 0, 0);
-    uint32_t ip;
-    int r = dns_resolve(u.host, &ip, DNS_TIMEOUT, req->cancel);
-    if (r < 0) {
-        if (r == -ENOENT) set_error(resp, "The server “%s” could not be found.", u.host);
-        else set_error(resp, "Looking up “%s” failed: %s.", u.host, strerr(-r));
-        return r;
-    }
-    if (req->progress) req->progress(req->progress_ctx, "Connecting", 0, 0);
-    int err;
-    struct tcp_conn *c = tcp_connect(ip, u.port, CONNECT_TIMEOUT, req->cancel, &err);
-    if (!c) {
-        char ips[16]; ip_to_str(ip, ips);
-        set_error(resp, "Could not connect to %s (%s): %s.", u.host, ips, strerr(err));
-        return -err;
-    }
+    /* the request is built first: one that does not fit is refused before anything is sent (cut short,
+     * it would lose its final blank line and the server would wait for the rest until we time out) */
     char hosthdr[300];
     if (u.port != 80) snprintf(hosthdr, sizeof hosthdr, "%s:%u", u.host, u.port); else strlcpy(hosthdr, u.host, sizeof hosthdr);
     /* control characters, spaces and non-ASCII would break (or inject into) the request line */
@@ -265,12 +254,32 @@ static int fetch_once(const struct http_request *req, const char *url, const cha
                       "Accept-Encoding: identity\r\nAccept-Language: en\r\nConnection: close\r\n",
                       method, epath, hosthdr);
     kfree(epath);
-    hl = MIN(hl, HEADSZ - 1);
-    if (rbody) { hl += snprintf(head + hl, HEADSZ - hl, "Content-Type: %s\r\nContent-Length: %zu\r\n", req->content_type ? req->content_type : "application/x-www-form-urlencoded", rbody_len); hl = MIN(hl, HEADSZ - 1); }
-    hl += snprintf(head + hl, HEADSZ - hl, "\r\n");
-    int64_t sent = tcp_send(c, head, MIN(hl, HEADSZ - 1));
+    /* snprintf returns the length it wanted: once hl reaches HEADSZ the request has been cut */
+    if (rbody && hl < HEADSZ) hl += snprintf(head + hl, HEADSZ - hl, "Content-Type: %s\r\nContent-Length: %zu\r\n", req->content_type ? req->content_type : "application/x-www-form-urlencoded", rbody_len);
+    if (hl < HEADSZ) hl += snprintf(head + hl, HEADSZ - hl, "\r\n");
+    if (hl >= HEADSZ) { kfree(head); set_error(resp, "The address is too long: the request would exceed %d bytes.", HEADSZ - 1); return -ENAMETOOLONG; }
+
+    if (req->progress) req->progress(req->progress_ctx, "Resolving", 0, 0);
+    uint32_t ip;
+    int r = dns_resolve(u.host, &ip, DNS_TIMEOUT, req->cancel);
+    if (r < 0) {
+        if (r == -ENOENT) set_error(resp, "The server “%s” could not be found.", u.host);
+        else set_error(resp, "Looking up “%s” failed: %s.", u.host, strerr(-r));
+        kfree(head);
+        return r;
+    }
+    if (req->progress) req->progress(req->progress_ctx, "Connecting", 0, 0);
+    int err;
+    struct tcp_conn *c = tcp_connect(ip, u.port, CONNECT_TIMEOUT, req->cancel, &err);
+    if (!c) {
+        char ips[16]; ip_to_str(ip, ips);
+        set_error(resp, "Could not connect to %s (%s): %s.", u.host, ips, strerr(err));
+        kfree(head);
+        return -err;
+    }
+    int64_t sent = tcp_send(c, head, hl, SEND_TIMEOUT, req->cancel);
     kfree(head);
-    if (sent >= 0 && rbody && rbody_len) sent = tcp_send(c, rbody, rbody_len);
+    if (sent >= 0 && rbody && rbody_len) sent = tcp_send(c, rbody, rbody_len, SEND_TIMEOUT, req->cancel);
     if (sent < 0) { tcp_abort(c); set_error(resp, "Sending the request failed: %s.", strerr((int)-sent)); return (int)sent; }
 
     if (req->progress) req->progress(req->progress_ctx, "Waiting", 0, 0);
@@ -334,7 +343,7 @@ static int fetch_once(const struct http_request *req, const char *url, const cha
         if (!header_end) continue;
         if (no_body) { complete = true; break; }
         if (chunked_enc) {
-            chunked_feed(&ch, &raw, &body);
+            if (!chunked_feed(&ch, &raw, &body)) { result = -ENOMEM; set_error(resp, "The page is too large."); break; }
             if (ch.state == 4) { complete = true; break; }
             /* drop the consumed wire bytes so raw only holds the unparsed tail */
             memmove(raw.d + header_end, raw.d + ch.pos, raw.len - ch.pos + 1);
@@ -352,9 +361,14 @@ static int fetch_once(const struct http_request *req, const char *url, const cha
     if (result == 0 && complete) tcp_close(c); else tcp_abort(c);
     if (result == 0 && header_end) {
         if (!chunked_enc && !no_body) {
+            /* the body is already in raw: move it down rather than copy it (a second buffer as large
+             * could fail to allocate, which would leave an empty body that looks complete) */
             size_t blen = raw.len - header_end;
             if (content_length >= 0 && blen > (size_t)content_length) blen = content_length;
-            buf_append(&body, raw.d + header_end, blen);
+            memmove(raw.d, raw.d + header_end, blen);
+            raw.d[blen] = 0;
+            body.d = raw.d; body.len = blen; body.cap = raw.cap;
+            raw.d = NULL;
         }
         resp->body = body.d ? body.d : kzalloc(1);
         resp->body_len = body.len;

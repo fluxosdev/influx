@@ -303,7 +303,8 @@ void terminal_main(void *arg) {
     if (a && !strncmp(a, "cd:", 3)) ss->cwd = strdup(a + 3);
     else if (a && a[0]) ss->cmd = strdup(a);
     struct process *sp = process_create("zsh", false);
-    strcpy(sp->cwd, ss->cwd ? ss->cwd : "/home/flux");
+    /* cwd[] is shorter than PATH_MAX: a path that doesn't fit would be cut to some other directory */
+    strlcpy(sp->cwd, ss->cwd && strlen(ss->cwd) < sizeof sp->cwd ? ss->cwd : "/home/flux", sizeof sp->cwd);
     t->shell_pid = sp->pid;
     thread_create(sp, "zsh", shell_main, ss);
     window_set_timer(t->w, 500);   /* cursor blink / title refresh */
@@ -332,7 +333,10 @@ void terminal_main(void *arg) {
         }
         if (t->dirty && !quit) draw(t);
     }
-    /* tear down: kill the shell and its foreground job */
+    /* tear down: kill the shell and its foreground job. Raise the shell's cancel flag first: dns,
+     * http and audio calls in a running builtin watch only that, not the kill (the shell clears
+     * intr_flag under the tty lock before freeing the flag) */
+    spin_lock(&t->tty->lock); if (t->tty->intr_flag) *t->tty->intr_flag = true; spin_unlock(&t->tty->lock);
     if (t->tty->fg_pid > 0) process_kill(t->tty->fg_pid, 9);
     if (shell_alive(t)) process_kill(t->shell_pid, 9);
     tty_destroy(t->tty);

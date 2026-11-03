@@ -22,6 +22,7 @@ struct lfn_ent { uint8_t seq; uint16_t name1[5]; uint8_t attr, type, chksum; uin
 struct fat {
     struct blockdev *dev;
     uint32_t spc, reserved, nfats, fat_size, root_cluster, total_sectors, nclusters, data_start;
+    uint32_t fsinfo, fsinfo_backup;   /* FSInfo sector and its copy in the backup boot area, 0 = none */
     uint32_t *fat;             /* cached FAT (first copy) */
     uint8_t *dirty;            /* one bit per FAT sector changed since the last flush */
     bool fat_dirty;
@@ -46,6 +47,7 @@ static void fat_set(struct fat *f, uint32_t c, uint32_t v) {
     f->fat[c] = (f->fat[c] & 0xF0000000) | v;
     uint32_t s = c / 128; f->dirty[s >> 3] |= 1 << (s & 7); f->fat_dirty = true;
 }
+static bool fsinfo_sig_ok(const uint8_t *s) { return *(const uint32_t *)s == 0x41615252 && *(const uint32_t *)(s + 484) == 0x61417272; }
 /* writes only the FAT sectors that changed (to every copy) plus FSInfo; on error they stay dirty for a retry */
 static int fat_flush(struct fat *f) {
     if (!f->fat_dirty) return 0;
@@ -62,7 +64,11 @@ static int fat_flush(struct fat *f) {
     f->fat_dirty = false;
     /* keep FSInfo's free cluster count accurate (advisory: its errors are not fatal) */
     uint8_t sec[512];
-    if (read_sectors(f, 1, 1, sec) == 0 && *(uint32_t *)sec == 0x41615252) { *(uint32_t *)(sec + 488) = f->free_count; *(uint32_t *)(sec + 492) = f->next_free; write_sectors(f, 1, 1, sec); write_sectors(f, 7, 1, sec); }
+    if (f->fsinfo && read_sectors(f, f->fsinfo, 1, sec) == 0 && fsinfo_sig_ok(sec)) {
+        *(uint32_t *)(sec + 488) = f->free_count; *(uint32_t *)(sec + 492) = f->next_free;
+        write_sectors(f, f->fsinfo, 1, sec);
+        if (f->fsinfo_backup) write_sectors(f, f->fsinfo_backup, 1, sec);
+    }
     if (f->root) { f->root->fs_free = (uint64_t)f->free_count * f->spc * 512; }
     return 0;
 }
@@ -440,8 +446,9 @@ static struct vnode *f_create(struct vnode *dirv, const char *name, int type) {
     uint32_t ec = sc; int ei = si;
     write_slot(f, &sc, &si, &e);
     fat_flush(f);
+    /* make_fnode's reference is the caller's: FAT keeps no node cache, so unlike tmpfs/btrfs there is no
+     * second holder, and the VFS drops exactly this one (an extra ref would keep f_release from ever running) */
     struct fnode *n = make_fnode(f, name, &e, ec, ei);
-    vnode_ref(&n->vn);
     mutex_unlock(&f->lock);
     return &n->vn;
 }
@@ -494,6 +501,13 @@ struct vnode *fat32_mount(struct blockdev *d) {
     f->nclusters = MIN((total - data_start) / spc, (uint64_t)f->fat_size * 128 - 2);   /* also bounded by the FAT's capacity */
     if (f->nclusters > 0x0FFFFFF5) f->nclusters = 0x0FFFFFF5;
     memcpy(f->label, b->label, 11); f->label[11] = 0; for (int i = 10; i >= 0 && f->label[i] == ' '; i--) f->label[i] = 0;
+    /* FSInfo and the backup boot sector (which holds FSInfo's copy at the same offset) must lie in the
+     * reserved area, or updating them would overwrite the FAT; 0 and 0xFFFF mean the volume has none */
+    uint32_t fsi = b->fsinfo, bk = b->backup;
+    if (fsi && fsi != 0xFFFF && fsi < f->reserved && blockdev_read(d, fsi, 1, sec) == 0 && fsinfo_sig_ok(sec)) {
+        f->fsinfo = fsi;
+        if (bk && bk != 0xFFFF && bk + fsi < f->reserved && blockdev_read(d, bk + fsi, 1, sec) == 0 && fsinfo_sig_ok(sec)) f->fsinfo_backup = bk + fsi;
+    }
     kfree(sec);
     if ((uint64_t)f->fat_size * 512 > 32ull << 20) { kprintf("fat32: %s: FAT too large to cache\n", d->name); kfree(f); return NULL; }
     if (!CLUS_OK(f, f->root_cluster)) { kprintf("fat32: %s: bad root cluster\n", d->name); kfree(f); return NULL; }
@@ -512,6 +526,15 @@ struct vnode *fat32_mount(struct blockdev *d) {
     d->fs_type = "fat32";
     kprintf("fat32: %s: '%s' %lu MiB, %u sectors/cluster\n", d->name, f->label, root->vn.fs_total >> 20, f->spc);
     return &root->vn;
+}
+
+/* tear down a volume fat32_mount returned that never got mounted (so no other node of it exists) */
+void fat32_free(struct vnode *root) {
+    if (!root || !root->fs_name || strcmp(root->fs_name, "fat32")) return;
+    struct fat *f = root->fs;
+    if (f->fat_dirty) fat_flush(f);
+    kfree(f->fat); kfree(f->dirty); kfree(f);
+    kfree((struct fnode *)root);
 }
 
 /* ---- formatter ---- */

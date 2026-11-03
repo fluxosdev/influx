@@ -62,21 +62,101 @@ void lapic_eoi(void) { if (lapic) lapic_write(LAPIC_EOI, 0); }
 
 static uint32_t timer_ticks_per_ms;
 
+/* ---- calibration references for the LAPIC timer and the TSC ----
+ * The PIT first; firmware on many newer Intel platforms clock-gates or leaves
+ * out the 8254, so then the ACPI PM timer, the TSC frequency CPUID reports,
+ * and as a last resort an assumed LAPIC clock. */
+#define CALIB_MS         50
+#define STUCK_READS      10000           /* unchanged over this many reads: the counter is not running */
+#define ASSUMED_LAPIC_HZ 100000000ULL    /* the bus clock of Intel before Skylake and of AMD */
+enum { REF_PIT, REF_PMTIMER, REF_CPUID, REF_ASSUMED, NREFS };
+static const char *const ref_names[NREFS] = { "PIT", "ACPI PM timer", "CPUID TSC frequency", "assumed 100 MHz LAPIC clock" };
+
+/* ACPI PM timer: 3.579545 MHz, 24 or 32 bits, at an I/O port or (X_PM_TMR_BLK) in memory */
+static uint16_t pmt_port;
+static volatile uint32_t *pmt_mmio;
+static uint32_t pmt_mask;
+static bool pmt_find(void) {
+    struct acpi_fadt *f = acpi_fadt();
+    if (!f || f->len < offsetof(struct acpi_fadt, pm_tmr_len) + 1) return false;
+    if (f->len >= offsetof(struct acpi_fadt, flags) + 4 && (f->flags & FADT_HW_REDUCED)) return false;   /* PM_TMR fields are ignored */
+    pmt_mask = f->len >= offsetof(struct acpi_fadt, flags) + 4 && (f->flags & FADT_TMR_VAL_EXT) ? 0xFFFFFFFF : 0xFFFFFF;
+    const struct acpi_gas *x = f->len >= offsetof(struct acpi_fadt, x_pm_tmr) + sizeof(struct acpi_gas) ? &f->x_pm_tmr : NULL;
+    if (x && x->address && x->space == SPACE_MEMORY) pmt_mmio = acpi_map_phys(x->address, 4);
+    else if (x && x->address && x->space == SPACE_IO && x->address <= 0xFFFC) pmt_port = x->address;
+    else if (f->pm_tmr && f->pm_tmr_len == 4 && f->pm_tmr <= 0xFFFC) pmt_port = f->pm_tmr;
+    return pmt_mmio || pmt_port;
+}
+static uint32_t pmt_read(void) { return (pmt_mmio ? *pmt_mmio : inl(pmt_port)) & pmt_mask; }
+static bool pmt_sleep_ms(uint32_t ms) {   /* false if the timer does not count (also gated on some chipsets) */
+    uint64_t ticks = (uint64_t)ms * 3579545 / 1000;
+    uint32_t last = pmt_read(), still = 0;
+    while (ticks > 0) {
+        uint32_t now = pmt_read(), delta = (now - last) & pmt_mask;   /* counts up, wraps */
+        if (!delta && ++still >= STUCK_READS) return false;
+        if (delta) still = 0;
+        ticks -= MIN(delta, ticks);
+        last = now;
+        pause();
+    }
+    return true;
+}
+
+static inline void cpuid(uint32_t leaf, uint32_t *a, uint32_t *b, uint32_t *c, uint32_t *d) {
+    __asm__ volatile("cpuid" : "=a"(*a), "=b"(*b), "=c"(*c), "=d"(*d) : "a"(leaf), "c"(0));
+}
+/* TSC Hz from CPUID 0x15 (crystal Hz x ratio) or 0x16 (base MHz), 0 if neither says */
+static uint64_t cpuid_tsc_hz(void) {
+    uint32_t max, a, b, c, d;
+    uint64_t r = 0;
+    cpuid(0, &max, &b, &c, &d);
+    if (max >= 0x15) { cpuid(0x15, &a, &b, &c, &d); if (a && b && c) r = (uint64_t)c * b / a; }   /* c: crystal Hz, 0 if unreported */
+    if (!r && max >= 0x16) { cpuid(0x16, &a, &b, &c, &d); r = (uint64_t)(a & 0xFFFF) * 1000000; }
+    return r >= 100000000 && r <= 10000000000ULL ? r : 0;   /* hypervisors may report nonsense */
+}
+
+/* busy-wait CALIB_MS by reference `ref`; false if it is missing or not counting */
+static bool ref_sleep(int ref, uint64_t cpuid_hz) {
+    switch (ref) {
+    case REF_PIT: return pit_sleep_ms(CALIB_MS);
+    case REF_PMTIMER: return pmt_find() && pmt_sleep_ms(CALIB_MS);
+    case REF_CPUID: {
+        if (!cpuid_hz) return false;
+        uint64_t end = rdtsc() + cpuid_hz / 1000 * CALIB_MS;
+        while (rdtsc() < end) pause();
+        return true;
+    }
+    default:   /* the LAPIC timer itself, at a guessed rate */
+        while (0xFFFFFFFF - lapic_read(LAPIC_TIMER_CUR) < ASSUMED_LAPIC_HZ / 16 / 1000 * CALIB_MS) pause();
+        return true;
+    }
+}
+
 void lapic_timer_start(uint32_t hz) {
     lapic_write(LAPIC_TIMER_DIV, 0x3);
     if (timer_ticks_per_ms) goto program;   /* an AP: every LAPIC timer runs off the same clock */
-    /* Calibrate against the PIT: run the timer for 50 ms with divider 16 */
+    /* Calibrate: run the timer (divider 16) for CALIB_MS by the first reference that works */
     lapic_write(LAPIC_LVT_TIMER, 0x10000);
-    lapic_write(LAPIC_TIMER_INIT, 0xFFFFFFFF);
-    uint64_t t0 = rdtsc();
-    pit_sleep_ms(50);
-    uint64_t t1 = rdtsc();
-    uint32_t elapsed = 0xFFFFFFFF - lapic_read(LAPIC_TIMER_CUR);
+    uint64_t cpuid_hz = cpuid_tsc_hz(), tsc_hz = 0;
+    int ref;
+    for (ref = 0; ref < NREFS; ref++) {
+        lapic_write(LAPIC_TIMER_INIT, 0xFFFFFFFF);
+        uint64_t t0 = rdtsc();
+        bool ok = ref_sleep(ref, cpuid_hz);
+        uint64_t t1 = rdtsc();
+        uint32_t elapsed = 0xFFFFFFFF - lapic_read(LAPIC_TIMER_CUR);
+        if ((ok && elapsed >= CALIB_MS && t1 > t0) || ref == REF_ASSUMED) {
+            timer_ticks_per_ms = elapsed / CALIB_MS;
+            tsc_hz = ref == REF_CPUID ? cpuid_hz : (t1 - t0) * (1000 / CALIB_MS);
+            break;
+        }
+        kprintf("lapic: calibration reference %s unusable (missing or not counting)\n", ref_names[ref]);
+    }
     lapic_write(LAPIC_LVT_TIMER, 0x10000);
-    timer_ticks_per_ms = elapsed / 50;
     extern void cpu_set_tsc_hz(uint64_t);
-    cpu_set_tsc_hz((t1 - t0) * 20);
-    kprintf("lapic: timer %u ticks/ms, tsc %lu MHz\n", timer_ticks_per_ms, cpu_tsc_hz() / 1000000);
+    cpu_set_tsc_hz(tsc_hz);
+    if (ref == REF_ASSUMED) kprintf("lapic: no reference clock, timekeeping may be off\n");
+    kprintf("lapic: timer %u ticks/ms, tsc %lu MHz (reference: %s)\n", timer_ticks_per_ms, cpu_tsc_hz() / 1000000, ref_names[ref]);
 program:;
     uint32_t count = timer_ticks_per_ms * 1000 / hz;
     if (count == 0) count = 1;

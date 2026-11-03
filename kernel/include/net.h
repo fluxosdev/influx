@@ -111,7 +111,9 @@ struct tcp_conn;
 void tcp_input(struct netif *n, uint32_t src, uint32_t dst, const uint8_t *pkt, size_t len);
 void tcp_timer(void);
 struct tcp_conn *tcp_connect(uint32_t ip, uint16_t port, int timeout_ms, volatile bool *cancel, int *err);
-int64_t tcp_send(struct tcp_conn *c, const void *data, size_t len);
+/* queues all of data; returns len, or -ETIMEDOUT (the send buffer stayed full for timeout_ms; < 0 = no
+ * limit), -ECANCELED or another -errno, in which case part of it may already be queued */
+int64_t tcp_send(struct tcp_conn *c, const void *data, size_t len, int timeout_ms, volatile bool *cancel);
 /* returns bytes read, 0 at end of stream, -ETIMEDOUT, -ECANCELED or another -errno */
 int64_t tcp_recv(struct tcp_conn *c, void *buf, size_t len, int timeout_ms, volatile bool *cancel);
 void tcp_close(struct tcp_conn *c);          /* graceful close; the connection is freed by the stack */

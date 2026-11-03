@@ -318,14 +318,47 @@ static void node_delete_raw(struct btrfs_fs *fs, struct tree_block *node, int sl
     btrfs_mark_dirty(fs, node);
 }
 
-/* insert a pointer into the parent at 'level' (creating a new root if needed). Path slots above are updated. */
-static int insert_ptr(struct btrfs_fs *fs, struct btrfs_path *p, int level, const struct btrfs_key *key, uint64_t blockptr) {
+/* Blocks for one leaf split: the new leaf, one per full node above it and a new root when every level is
+ * full. split_reserve allocates all of them before anything moves, so running out of metadata space (or of
+ * tree levels) fails the split with the tree untouched, and insert_ptr then has nothing left that can fail. */
+#define META_RESERVE 16   /* blocks a split outside a flush must leave free for the flush that records it */
+struct split_rsv { uint64_t b[BTRFS_MAX_LEVEL + 1 + META_RESERVE]; int n, used; };
+#define SPLIT_RETRY 1   /* split_leaf: a chunk allocation changed the trees under the path; search again */
+static void split_release(struct btrfs_fs *fs, struct btrfs_tree *tree, struct split_rsv *rsv) {
+    while (rsv->n > rsv->used) btrfs_free_tree_block(fs, rsv->b[--rsv->n], tree->objectid, 0);   /* unused: cancelled, or freed at the next flush */
+}
+static int split_reserve(struct btrfs_fs *fs, struct btrfs_path *p, struct split_rsv *rsv) {
+    int level = 1, need = 1;
+    while (level <= p->top && btrfs_nritems(p->blocks[level]) >= node_capacity(fs)) { need++; level++; }   /* mirrors insert_ptr */
+    if (level > p->top) { if (level >= BTRFS_MAX_LEVEL) return -ENOSPC; need++; }
+    /* Outside a flush, META_RESERVE more blocks must be free as well (they are given back right away):
+     * the flush after this operation records the new blocks in the extent tree, which can split its
+     * leaves, and a block that cannot be recorded would later be handed out a second time. */
+    int extra = fs->in_flush ? 0 : META_RESERVE;
+    rsv->n = rsv->used = 0;
+    int nchunks = fs->nchunks;
+    while (rsv->n < need + extra) {
+        uint64_t b = btrfs_alloc_tree_block(fs, rsv->n < need ? p->tree->objectid : BTRFS_EXTENT_TREE_OBJECTID);   /* the reserve is metadata even for chunk tree splits */
+        if (!b) { split_release(fs, p->tree, rsv); return -ENOSPC; }
+        rsv->b[rsv->n++] = b;
+    }
+    /* a new chunk inserted items into the chunk/dev/extent/free space trees (and flushed pending records),
+     * so the path may point at blocks that have since been split */
+    if (fs->nchunks != nchunks) { split_release(fs, p->tree, rsv); return SPLIT_RETRY; }
+    while (rsv->n > need) btrfs_free_tree_block(fs, rsv->b[--rsv->n], p->tree->objectid, 0);
+    fs->alloc_hint[1] = rsv->b[need - 1] + fs->nodesize;
+    return 0;
+}
+
+/* insert a pointer into the parent at 'level' (creating a new root if needed), taking new blocks from rsv.
+ * Path slots above are updated. Cannot fail when rsv came from split_reserve for this path. */
+static int insert_ptr(struct btrfs_fs *fs, struct btrfs_path *p, int level, const struct btrfs_key *key, uint64_t blockptr, struct split_rsv *rsv) {
     struct btrfs_tree *tree = p->tree;
     if (level >= BTRFS_MAX_LEVEL) return -ENOSPC;
     if (level > p->top) {
         /* grow the tree: new root with two pointers */
-        uint64_t nb = btrfs_alloc_tree_block(fs, tree->objectid);
-        if (!nb) return -ENOSPC;
+        if (rsv->used >= rsv->n) return -ENOSPC;
+        uint64_t nb = rsv->b[rsv->used++];
         struct tree_block *root = btrfs_new_block(fs, nb, tree->objectid, level);
         btrfs_set_metadata_level(fs, nb, level);
         struct tree_block *old = p->blocks[level - 1];
@@ -340,15 +373,15 @@ static int insert_ptr(struct btrfs_fs *fs, struct btrfs_path *p, int level, cons
     struct tree_block *node = p->blocks[level];
     if (btrfs_nritems(node) >= node_capacity(fs)) {
         /* split the node */
-        uint64_t nb = btrfs_alloc_tree_block(fs, tree->objectid);
-        if (!nb) return -ENOSPC;
+        if (rsv->used >= rsv->n) return -ENOSPC;
+        uint64_t nb = rsv->b[rsv->used++];
         struct tree_block *right = btrfs_new_block(fs, nb, tree->objectid, level);
         btrfs_set_metadata_level(fs, nb, level);
         int n = btrfs_nritems(node), mid = n / 2;
         memcpy(btrfs_node_ptr(right, 0), btrfs_node_ptr(node, mid), (n - mid) * sizeof(struct btrfs_key_ptr));
         hdr(right)->nritems = n - mid; hdr(node)->nritems = mid;
         btrfs_mark_dirty(fs, node);
-        int r = insert_ptr(fs, p, level + 1, &btrfs_node_ptr(right, 0)->key, nb);
+        int r = insert_ptr(fs, p, level + 1, &btrfs_node_ptr(right, 0)->key, nb, rsv);
         if (r < 0) return r;
         if (p->slots[level] >= mid) { p->slots[level] -= mid; p->blocks[level] = right; p->slots[level + 1]++; node = right; }
     }
@@ -362,9 +395,6 @@ static int split_leaf(struct btrfs_fs *fs, struct btrfs_path *p, const struct bt
     struct btrfs_tree *tree = p->tree;
     int n = btrfs_nritems(leaf);
     if (n == 0) return -EIO;
-    uint64_t nb = btrfs_alloc_tree_block(fs, tree->objectid);
-    if (!nb) return -ENOSPC;
-    struct tree_block *right = btrfs_new_block(fs, nb, tree->objectid, 0);
     bool ins_before_all = btrfs_cmp_key(ins_key, &btrfs_leaf_item(leaf, 0)->key) < 0;
     bool ins_after_all = btrfs_cmp_key(ins_key, &btrfs_leaf_item(leaf, n - 1)->key) > 0;
     int mid;
@@ -376,16 +406,26 @@ static int split_leaf(struct btrfs_fs *fs, struct btrfs_path *p, const struct bt
         if (ins_after_all) mid = n;          /* append: new leaf just for the insert keeps the left full */
         else if (ins_before_all) mid = 0;    /* prepend: move everything right, insert left */
     }
+    /* everything that can fail happens before an item moves: the half that gets the new item must have
+     * room for it, and every block the split needs up to the root is allocated */
+    bool to_right = mid != 0 && (mid == n || btrfs_cmp_key(ins_key, &btrfs_leaf_item(leaf, mid)->key) >= 0);
+    uint32_t used = 0;
+    for (int i = to_right ? mid : 0; i < (to_right ? n : mid); i++) used += btrfs_leaf_item(leaf, i)->size + sizeof(struct btrfs_item);
+    if (leaf_data_size(fs) - used < need) return -ENOSPC;
+    struct split_rsv rsv;
+    int r = split_reserve(fs, p, &rsv);
+    if (r) return r;
+    uint64_t nb = rsv.b[rsv.used++];
+    struct tree_block *right = btrfs_new_block(fs, nb, tree->objectid, 0);
     for (int i = mid; i < n; i++) {
         struct btrfs_item *it = btrfs_leaf_item(leaf, i);
         leaf_insert_raw(fs, right, i - mid, &it->key, leaf->data + sizeof(struct btrfs_header) + it->offset, it->size);
     }
     for (int i = n - 1; i >= mid; i--) leaf_delete_raw(fs, leaf, i);
-    bool to_right = (mid == 0) ? false : (btrfs_nritems(right) == 0 || btrfs_cmp_key(ins_key, &btrfs_leaf_item(right, 0)->key) >= 0);
-    if (mid == 0) to_right = false;
     struct btrfs_key right_key = btrfs_nritems(right) ? btrfs_leaf_item(right, 0)->key : *ins_key;
-    int r = insert_ptr(fs, p, 1, &right_key, nb);
-    if (r < 0) return r;
+    r = insert_ptr(fs, p, 1, &right_key, nb, &rsv);
+    split_release(fs, tree, &rsv);   /* only left over if insert_ptr bailed out, which the reservation rules out */
+    if (r < 0) { kprintf("btrfs: leaf split of tree %lu failed after reserving (%d)\n", tree->objectid, r); return r; }
     if (to_right) {
         p->blocks[0] = right; p->slots[1]++;
         int exact; p->slots[0] = bin_search(right, ins_key, &exact);
@@ -394,19 +434,21 @@ static int split_leaf(struct btrfs_fs *fs, struct btrfs_path *p, const struct bt
         int exact; p->slots[0] = bin_search(leaf, ins_key, &exact);
         if (btrfs_nritems(leaf) == 0) { btrfs_node_ptr(p->blocks[1], p->slots[1])->key = *ins_key; btrfs_mark_dirty(fs, p->blocks[1]); }
     }
-    if (btrfs_leaf_free_space(fs, p->blocks[0]) < need) return -ENOSPC;
     return 0;
 }
 
 int btrfs_insert_item(struct btrfs_fs *fs, struct btrfs_tree *tree, const struct btrfs_key *key, const void *data, uint32_t size, struct btrfs_path *out) {
     struct btrfs_path p;
-    int r = btrfs_search(fs, tree, key, &p);
-    if (r < 0) return r;
-    if (r == 0) return -EEXIST;
     uint32_t need = size + sizeof(struct btrfs_item);
-    if (btrfs_leaf_free_space(fs, p.blocks[0]) < need) {
-        r = split_leaf(fs, &p, key, need);
+    for (int tries = 0; ; tries++) {
+        int r = btrfs_search(fs, tree, key, &p);
         if (r < 0) return r;
+        if (r == 0) return -EEXIST;
+        if (btrfs_leaf_free_space(fs, p.blocks[0]) >= need) break;
+        r = split_leaf(fs, &p, key, need);   /* on failure the tree is unchanged */
+        if (r < 0) return r;
+        if (r == 0) break;
+        if (tries == 2) return -ENOSPC;      /* SPLIT_RETRY keeps coming back: give up */
     }
     leaf_insert_raw(fs, p.blocks[0], p.slots[0], key, data, size);
     if (p.slots[0] == 0) fixup_keys(fs, &p);
@@ -690,11 +732,13 @@ int btrfs_alloc_chunk(struct btrfs_fs *fs, uint64_t type, uint64_t want) {
     add_chunk(fs, logical, &ch.c, sizeof ch);
     struct btrfs_key k = { BTRFS_FIRST_CHUNK_TREE_OBJECTID, BTRFS_CHUNK_ITEM_KEY, logical };
     int r = btrfs_insert_item(fs, &fs->chunk_tree, &k, &ch, sizeof ch, NULL);
+    bool have_chunk = r == 0, have_dev = false;
+    struct btrfs_key dk = { fs->sb.dev_item.devid, BTRFS_DEV_EXTENT_KEY, phys };
     if (r == 0) {
         struct btrfs_dev_extent de = { BTRFS_CHUNK_TREE_OBJECTID, BTRFS_FIRST_CHUNK_TREE_OBJECTID, logical, len };
         memcpy(de.chunk_tree_uuid, fs->chunk_tree_uuid, 16);
-        struct btrfs_key dk = { fs->sb.dev_item.devid, BTRFS_DEV_EXTENT_KEY, phys };
         r = btrfs_insert_item(fs, &fs->dev_tree, &dk, &de, sizeof de, NULL);
+        have_dev = r == 0;
     }
     if (r == 0) {
         struct btrfs_tree *t; bg_tree_select(fs, &t);
@@ -707,7 +751,11 @@ int btrfs_alloc_chunk(struct btrfs_fs *fs, uint64_t type, uint64_t want) {
         struct btrfs_key ik = { logical, BTRFS_FREE_SPACE_INFO_KEY, len }, ek = { logical, BTRFS_FREE_SPACE_EXTENT_KEY, len };
         if (btrfs_insert_item(fs, &fs->fst, &ik, &info, sizeof info, NULL) < 0 || btrfs_insert_item(fs, &fs->fst, &ek, NULL, 0, NULL) < 0) fst_invalidate(fs, "chunk insert failed");
     }
-    fs->sb.dev_item.bytes_used += len;
+    if (r < 0) {   /* a chunk item without its block group stops Linux from mounting: take back what went in */
+        struct btrfs_path dp;
+        if (have_dev && btrfs_search(fs, &fs->dev_tree, &dk, &dp) == 0) btrfs_delete_item(fs, &dp);
+        if (have_chunk && btrfs_search(fs, &fs->chunk_tree, &k, &dp) == 0) btrfs_delete_item(fs, &dp);
+    } else fs->sb.dev_item.bytes_used += len;
     fs->sb.chunk_root_generation = fs->transid;
     fs->in_chunk_alloc = false;
     if (r < 0) { fs->nchunks--; kprintf("btrfs: chunk allocation failed (%d)\n", r); return r; }
@@ -716,6 +764,8 @@ int btrfs_alloc_chunk(struct btrfs_fs *fs, uint64_t type, uint64_t want) {
 }
 
 uint64_t btrfs_alloc_tree_block(struct btrfs_fs *fs, uint64_t owner) {
+    /* an allocation the pending list cannot hold would be handed out again by the next call */
+    if (fs->npending >= MAX_PENDING) { kprintf("btrfs: too many unrecorded tree blocks\n"); return 0; }
     uint64_t type = owner == BTRFS_CHUNK_TREE_OBJECTID ? BTRFS_BLOCK_GROUP_SYSTEM : BTRFS_BLOCK_GROUP_METADATA;
     /* metadata never goes into data chunks; chunk tree blocks only into SYSTEM chunks */
     uint64_t b = btrfs_alloc_extent(fs, fs->nodesize, type);
@@ -729,8 +779,8 @@ void btrfs_set_metadata_level(struct btrfs_fs *fs, uint64_t bytenr, int level) {
     for (int i = 0; i < fs->npending; i++) if (fs->pending[i].bytenr == bytenr && !fs->pending[i].free) { fs->pending[i].level = level; return; }
 }
 void btrfs_free_tree_block(struct btrfs_fs *fs, uint64_t bytenr, uint64_t owner, int level) {
-    /* cancel a pending allocation of the same block, otherwise queue the free */
-    for (int i = 0; i < fs->npending; i++) if (fs->pending[i].bytenr == bytenr && !fs->pending[i].free) { fs->pending[i] = fs->pending[--fs->npending]; btrfs_forget_block(fs, bytenr); return; }
+    /* cancel a pending allocation of the same block (unless its extent item is already going in), otherwise queue the free */
+    for (int i = 0; i < fs->npending; i++) if (fs->pending[i].bytenr == bytenr && !fs->pending[i].free && !fs->pending[i].recording) { fs->pending[i] = fs->pending[--fs->npending]; btrfs_forget_block(fs, bytenr); return; }
     pending_add(fs, bytenr, level, owner, true);
     btrfs_forget_block(fs, bytenr);
 }
@@ -776,8 +826,12 @@ void btrfs_flush_pending(struct btrfs_fs *fs) {
     fs->in_flush = true;
     while (fs->npending) {
         struct pending_block pb = fs->pending[0];
-        fs->pending[0] = fs->pending[--fs->npending];
-        if (pb.free) unrecord_tree_block(fs, &pb); else record_tree_block(fs, &pb);
+        if (pb.free) { fs->pending[0] = fs->pending[--fs->npending]; unrecord_tree_block(fs, &pb); continue; }
+        /* an allocation stays listed until its extent item exists: recording it can split an extent tree
+         * leaf, and the allocator (skip_reserved) must not hand the same block out for that split */
+        fs->pending[0].recording = true;
+        record_tree_block(fs, &pb);
+        for (int i = 0; i < fs->npending; i++) if (fs->pending[i].bytenr == pb.bytenr && fs->pending[i].recording) { fs->pending[i] = fs->pending[--fs->npending]; break; }
     }
     fs->in_flush = false;
 }
@@ -995,6 +1049,12 @@ static int load_chunk_tree(struct btrfs_fs *fs) {
     return 0;
 }
 
+/* a failed mount also drops the tree blocks it read */
+static struct btrfs_fs *open_fail(struct btrfs_fs *fs) {
+    for (int i = 0; i < CACHE_BUCKETS; i++) while (fs->cache[i]) cache_remove(fs, fs->cache[i]);
+    kfree(fs);
+    return NULL;
+}
 struct btrfs_fs *btrfs_open(struct blockdev *dev) {
     struct btrfs_fs *fs = kzalloc(sizeof *fs);
     fs->dev = dev;
@@ -1007,11 +1067,11 @@ struct btrfs_fs *btrfs_open(struct blockdev *dev) {
     fs->transid = fs->sb.generation + 1;
     fs->readonly = (fs->sb.incompat_flags & (BTRFS_FEATURE_INCOMPAT_RAID56 | BTRFS_FEATURE_INCOMPAT_ZONED | BTRFS_FEATURE_INCOMPAT_EXTENT_TREE_V2)) != 0;
     if (parse_sys_chunks(fs) < 0) { kprintf("btrfs: %s: no system chunks\n", dev->name); kfree(fs); return NULL; }
-    if (load_chunk_tree(fs) < 0) { kprintf("btrfs: %s: cannot read chunk tree\n", dev->name); kfree(fs); return NULL; }
+    if (load_chunk_tree(fs) < 0) { kprintf("btrfs: %s: cannot read chunk tree\n", dev->name); return open_fail(fs); }
     fs->root_tree = (struct btrfs_tree){ BTRFS_ROOT_TREE_OBJECTID, fs->sb.root, fs->sb.root_level, fs->sb.generation };
     fs->chunk_tree = (struct btrfs_tree){ BTRFS_CHUNK_TREE_OBJECTID, fs->sb.chunk_root, fs->sb.chunk_root_level, fs->sb.chunk_root_generation };
     if (btrfs_load_tree(fs, BTRFS_DEV_TREE_OBJECTID, &fs->dev_tree) < 0) { kprintf("btrfs: no dev tree\n"); fs->readonly = true; }
-    if (btrfs_load_tree(fs, BTRFS_EXTENT_TREE_OBJECTID, &fs->extent_tree) < 0) { kprintf("btrfs: no extent tree\n"); kfree(fs); return NULL; }
+    if (btrfs_load_tree(fs, BTRFS_EXTENT_TREE_OBJECTID, &fs->extent_tree) < 0) { kprintf("btrfs: no extent tree\n"); return open_fail(fs); }
     if (btrfs_load_tree(fs, BTRFS_CSUM_TREE_OBJECTID, &fs->csum_tree) < 0) { kprintf("btrfs: no csum tree\n"); fs->readonly = true; }
     if (fs->sb.incompat_flags & BTRFS_FEATURE_INCOMPAT_BLOCK_GROUP_TREE) { if (btrfs_load_tree(fs, BTRFS_BLOCK_GROUP_TREE_OBJECTID, &fs->bg_tree) < 0) fs->readonly = true; }
     if ((fs->sb.compat_ro_flags & (BTRFS_FEATURE_COMPAT_RO_FREE_SPACE_TREE | BTRFS_FEATURE_COMPAT_RO_FREE_SPACE_TREE_VALID)) == (BTRFS_FEATURE_COMPAT_RO_FREE_SPACE_TREE | BTRFS_FEATURE_COMPAT_RO_FREE_SPACE_TREE_VALID))
@@ -1021,9 +1081,22 @@ struct btrfs_fs *btrfs_open(struct blockdev *dev) {
     {
         struct btrfs_key k = { BTRFS_ROOT_TREE_DIR_OBJECTID, BTRFS_DIR_ITEM_KEY, crc32c((uint32_t)~1, "default", 7) };
         struct btrfs_path p;
-        if (btrfs_search(fs, &fs->root_tree, &k, &p) == 0) { struct btrfs_dir_item *di = btrfs_path_data(&p); if (di->location.objectid >= BTRFS_FIRST_FREE_OBJECTID || di->location.objectid == BTRFS_FS_TREE_OBJECTID) fs_id = di->location.objectid; }
+        if (btrfs_search(fs, &fs->root_tree, &k, &p) == 0) {
+            /* the hash bucket may hold several entries: bounds-check each like the other dir item readers */
+            uint8_t *d = btrfs_path_data(&p), *end = d + btrfs_path_size(&p);
+            if (btrfs_path_size(&p) < sizeof(struct btrfs_dir_item)) { kprintf("btrfs: %s: malformed default subvolume item\n", dev->name); return open_fail(fs); }
+            while (d + sizeof(struct btrfs_dir_item) <= end) {
+                struct btrfs_dir_item *di = (struct btrfs_dir_item *)d;
+                if (d + sizeof *di + di->name_len + di->data_len > end) { kprintf("btrfs: %s: malformed default subvolume item\n", dev->name); return open_fail(fs); }
+                if (di->name_len == 7 && !memcmp(di + 1, "default", 7)) {
+                    if (di->location.objectid >= BTRFS_FIRST_FREE_OBJECTID || di->location.objectid == BTRFS_FS_TREE_OBJECTID) fs_id = di->location.objectid;
+                    break;
+                }
+                d += sizeof *di + di->name_len + di->data_len;
+            }
+        }
     }
-    if (btrfs_load_tree(fs, fs_id, &fs->fs_tree) < 0) { kprintf("btrfs: no fs tree\n"); kfree(fs); return NULL; }
+    if (btrfs_load_tree(fs, fs_id, &fs->fs_tree) < 0) { kprintf("btrfs: no fs tree\n"); return open_fail(fs); }
     mutex_init(&fs->lock);
     char label[64]; strlcpy(label, fs->sb.label, sizeof label);
     kprintf("btrfs: %s: '%s' %lu MiB (%lu used), nodesize %u, gen %lu, %d chunks%s\n", dev->name, label, fs->sb.total_bytes >> 20, fs->sb.bytes_used >> 20, fs->nodesize, fs->sb.generation, fs->nchunks, fs->readonly ? ", read-only" : "");

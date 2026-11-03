@@ -159,10 +159,11 @@ GLcontext *glxCreateContext(int w, int h) {
     c->verts = GL_MALLOC(c->cap_verts * sizeof(struct vertex));
     c->cverts = GL_MALLOC(c->cap_verts * sizeof(struct cvert));
     c->textures = GL_MALLOC(MAX_TEXTURES * sizeof(struct texture));
+    /* zero the textures before any failure exit: glxDestroyContext frees every texture's levels */
+    if (c->textures) GL_MEMSET(c->textures, 0, MAX_TEXTURES * sizeof(struct texture));
     if (!c->color || !c->depth || !c->verts || !c->cverts || !c->textures) { glxDestroyContext(c); return 0; }
     GL_MEMSET(c->color, 0, (size_t)w * h * 4);
     for (size_t i = 0; i < (size_t)w * h; i++) c->depth[i] = 1.0f;
-    GL_MEMSET(c->textures, 0, MAX_TEXTURES * sizeof(struct texture));
     c->clear_depth = 1.0f;
     c->vp_w = w; c->vp_h = h; c->sc_w = w; c->sc_h = h; c->depth_far = 1;
     c->depth_func = GL_LESS; c->depth_write = 1; c->alpha_func = GL_ALWAYS;

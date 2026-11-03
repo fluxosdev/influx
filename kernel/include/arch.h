@@ -80,13 +80,17 @@ void ioapic_mask_irq(uint8_t irq, bool mask);
 
 /* Legacy timers / clocks */
 void pit_init(void);
-void pit_sleep_ms(uint32_t ms);    /* busy wait, early boot only */
+bool pit_sleep_ms(uint32_t ms);    /* busy wait, early boot only; false if the PIT is not counting */
 void timer_init(void);             /* starts the scheduling tick */
 struct rtc_time { int year, month, day, hour, minute, second; };
 void rtc_read(struct rtc_time *t);
 uint64_t rtc_to_unix(const struct rtc_time *t);
 void unix_to_datetime(uint64_t t, struct rtc_time *out);
 int day_of_week(int y, int m, int d);
+/* CMOS RAM: 0-127 at 0x70/0x71, 128-255 at 0x72/0x73; one lock for the RTC and
+ * AML CMOS regions, and the NMI-disable bit (bit 7 of port 0x70) kept clear */
+uint8_t cmos_read(uint8_t reg);
+void cmos_write(uint8_t reg, uint8_t v);
 
 void serial_init(void);
 void serial_putc(char c);

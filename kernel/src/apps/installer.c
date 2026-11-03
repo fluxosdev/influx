@@ -4,7 +4,7 @@
 #include "mm.h"
 #include "string.h"
 
-struct inst { struct window *w; int page; int selected; struct blockdev *disks[16]; int ndisks; int percent; char log[8][160]; int nlog; int pressed; int result; bool running; };
+struct inst { struct window *w; int page; int selected; struct blockdev *disks[16]; int ndisks; bool system_hidden; int percent; char log[8][160]; int nlog; int pressed; int result; bool running; };
 
 static void format_size(uint64_t b, char *out, size_t n) { if (b >= 1ull << 30) snprintf(out, n, "%lu.%lu GB", b >> 30, ((b >> 20) % 1024) / 103); else snprintf(out, n, "%lu MB", b >> 20); }
 static struct rect btn_next(struct inst *s) { return rect_make(s->w->frame.w - 130, s->w->frame.h - 44, 110, 30); }
@@ -39,7 +39,8 @@ static void draw(struct inst *s) {
             snprintf(buf, sizeof buf, "/dev/%s on %s", s->disks[i]->name, s->disks[i]->bus ? s->disks[i]->bus : "?");
             font_draw(c, font_ui_small, r.x + 44, r.y + 24, sel ? theme.accent_text : theme.text_secondary, buf);
         }
-        if (!s->ndisks) font_draw(c, font_ui, x, y + 80, theme.text_tertiary, "No disks found.");
+        if (!s->ndisks) font_draw(c, font_ui, x, y + 80, theme.text_tertiary, s->system_hidden ? "No other disks found." : "No disks found.");
+        if (s->system_hidden) font_draw(c, font_ui_small, x, y + 70 + MAX(s->ndisks, 1) * 48 + 6, theme.text_tertiary, "The disk holding the running system is not listed.");
         ui_button(c, btn_next(s), "Continue", BTN_DEFAULT, s->pressed == 1, s->selected >= 0);
         break;
     case 1: {
@@ -79,7 +80,13 @@ static void progress(void *ctx, int pct, const char *m) {
 
 static void refresh_disks(struct inst *s) {
     s->ndisks = 0;
-    for (int i = 0; i < blockdev_count() && s->ndisks < 16; i++) { struct blockdev *b = blockdev_at(i); if (b && !b->parent) s->disks[s->ndisks++] = b; }
+    s->system_hidden = false;
+    for (int i = 0; i < blockdev_count() && s->ndisks < 16; i++) {
+        struct blockdev *b = blockdev_at(i);
+        if (!b || b->parent) continue;
+        if (install_is_system_disk(b)) { s->system_hidden = true; continue; }   /* installing would erase the running system */
+        s->disks[s->ndisks++] = b;
+    }
     if (s->selected >= s->ndisks) s->selected = s->ndisks ? 0 : -1;
 }
 

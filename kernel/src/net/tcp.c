@@ -29,6 +29,7 @@ static const char *state_names[] = { "CLOSED", "SYN_SENT", "ESTABLISHED", "FIN_W
 #define SEQ_LT(a, b)  ((int32_t)((a) - (b)) < 0)
 #define SEQ_LEQ(a, b) ((int32_t)((a) - (b)) <= 0)
 #define SEQ_GT(a, b)  ((int32_t)((a) - (b)) > 0)
+#define SEQ_GEQ(a, b) ((int32_t)((a) - (b)) >= 0)
 
 struct tcp_conn {
     enum tcp_state state;
@@ -36,6 +37,7 @@ struct tcp_conn {
     uint16_t lport, rport;
     /* send side: sbuf[0] holds the byte at snd_una (once established) */
     uint32_t iss, snd_una, snd_nxt, snd_max, snd_wnd;
+    uint32_t snd_wl1, snd_wl2;  /* seq and ack of the segment that last set snd_wnd */
     uint16_t mss;
     uint8_t *sbuf; size_t slen;
     bool fin_queued, fin_assigned;   /* app closed / the FIN has a sequence number */
@@ -153,7 +155,9 @@ static void tcp_output(struct tcp_conn *c, bool probe) {
         size_t n = MIN(MIN((size_t)c->mss, c->slen - off), window - off);
         uint8_t flags = TCP_ACK | (off + n == c->slen ? TCP_PSH : 0);
         send_segment(c->lip, c->rip, c->lport, c->rport, c->snd_nxt, c->rcv_nxt, flags, rwnd(c), c->sbuf + off, n, 0);
-        if (!c->rtt_active) { c->rtt_active = true; c->rtt_seq = c->snd_nxt + n; c->rtt_start = time_ms(); }
+        /* Karn: time only new data; after a timeout rewind everything below snd_max is a retransmission
+         * whose ACK may belong to the original */
+        if (!c->rtt_active && SEQ_GEQ(c->snd_nxt, c->snd_max)) { c->rtt_active = true; c->rtt_seq = c->snd_nxt + n; c->rtt_start = time_ms(); }
         c->snd_nxt += n; off += n;
         if (SEQ_GT(c->snd_nxt, c->snd_max)) c->snd_max = c->snd_nxt;
         if (!c->rto_at) arm_rto(c);
@@ -230,7 +234,7 @@ void tcp_input(struct netif *n, uint32_t src, uint32_t dst, const uint8_t *pkt, 
         if (!(flags & TCP_SYN) || !ack_ok) return;
         c->rcv_nxt = seq + 1;
         c->snd_una = c->snd_nxt = c->snd_max = ack;
-        c->snd_wnd = win;
+        c->snd_wnd = win; c->snd_wl1 = seq; c->snd_wl2 = ack;
         parse_options(c, pkt + sizeof *h, hl - sizeof *h);
         c->cwnd = 10 * c->mss;
         c->rto_at = 0; c->retries = 0;
@@ -241,19 +245,23 @@ void tcp_input(struct netif *n, uint32_t src, uint32_t dst, const uint8_t *pkt, 
         return;
     }
 
-    /* acceptability: we only take segments that start at rcv_nxt (trimming retransmitted prefixes) */
     if (flags & TCP_RST) {
         if (SEQ_LEQ(c->rcv_nxt, seq) && SEQ_LT(seq, c->rcv_nxt + TCP_RBUF)) conn_fail(c, ECONNRESET);
         return;
     }
     if (flags & TCP_SYN) { send_ack(c); return; }   /* retransmitted SYN-ACK: our ACK was lost */
+    /* acceptability (RFC 9293 3.10.7.4): the segment must overlap the receive window, or an old
+     * duplicate or a forged/stray segment far outside it would get its ACK and window applied; it is
+     * answered with an ACK instead. A closed window still admits a segment that reaches rcv_nxt, so
+     * ACKs, window updates and a FIN get through (deliver() drops the data) */
+    uint32_t wnd = MAX((uint32_t)rwnd(c), 1u), seglen = (uint32_t)dlen + ((flags & TCP_FIN) ? 1 : 0);
+    bool acceptable = seglen ? SEQ_LT(seq, c->rcv_nxt + wnd) && SEQ_GT(seq + seglen, c->rcv_nxt)
+                             : SEQ_LEQ(c->rcv_nxt, seq) && SEQ_LT(seq, c->rcv_nxt + wnd);
+    if (!acceptable) { send_ack(c); return; }
     if (SEQ_LT(seq, c->rcv_nxt)) {
+        /* trim the retransmitted prefix we already have; it is shorter than seglen, so at most dlen */
         uint32_t dup = c->rcv_nxt - seq;
-        if (dup >= dlen + ((flags & TCP_FIN) ? 1 : 0)) {
-            if (dlen || (flags & TCP_FIN)) send_ack(c);   /* entirely old: re-acknowledge */
-            dlen = 0; flags &= ~TCP_FIN;
-            seq = c->rcv_nxt;
-        } else { data += dup; dlen -= dup; seq = c->rcv_nxt; }
+        data += dup; dlen -= dup; seq = c->rcv_nxt;
     }
     if (!(flags & TCP_ACK)) return;
 
@@ -280,8 +288,10 @@ void tcp_input(struct netif *n, uint32_t src, uint32_t dst, const uint8_t *pkt, 
         }
         wake(c);
     }
-    if (SEQ_LEQ(c->snd_una, ack)) {
-        c->snd_wnd = win;
+    /* window update (RFC 9293 SND.WL1/WL2): only from a segment at least as new as the one that last
+     * set it, so a reordered older ACK cannot shrink (or reopen) the window */
+    if (SEQ_LEQ(c->snd_una, ack) && (SEQ_LT(c->snd_wl1, seq) || (c->snd_wl1 == seq && SEQ_LEQ(c->snd_wl2, ack)))) {
+        c->snd_wnd = win; c->snd_wl1 = seq; c->snd_wl2 = ack;
         /* the peer answered a zero-window probe (or otherwise ACKed while its window stays closed): it is
          * alive, so keep probing for as long as it keeps answering (RFC 9293 3.8.6.1); the probes only
          * count towards giving up while nothing comes back */
@@ -337,7 +347,7 @@ void tcp_timer(void) {
             c->rto_at = 0;
             if (++c->retries > (c->state == TCP_SYN_SENT ? TCP_SYN_RETRIES : TCP_MAX_RETRIES)) { conn_fail(c, ETIMEDOUT); continue; }
             c->rto = MIN(c->rto * 2, TCP_RTO_MAX);
-            c->rtt_active = false;   /* Karn: no samples from retransmitted data */
+            c->rtt_active = false;   /* Karn: no samples from retransmitted data (tcp_output re-arms only on new data) */
             if (c->state == TCP_SYN_SENT) { send_ctl(c, c->iss, TCP_SYN); arm_rto(c); continue; }
             uint32_t flight = c->snd_nxt - c->snd_una;
             c->ssthresh = MAX(flight / 2, 2u * c->mss);
@@ -406,15 +416,18 @@ struct tcp_conn *tcp_connect(uint32_t ip, uint16_t port, int timeout_ms, volatil
     }
 }
 
-int64_t tcp_send(struct tcp_conn *c, const void *data, size_t len) {
+int64_t tcp_send(struct tcp_conn *c, const void *data, size_t len, int timeout_ms, volatile bool *cancel) {
     const uint8_t *p = data;
     size_t done = 0;
+    /* the timeout runs while the send buffer stays full, like tcp_recv's while nothing arrives: a peer
+     * that stops reading but keeps answering window probes never makes the connection itself fail */
+    uint64_t deadline = time_ms() + (timeout_ms < 0 ? 0 : timeout_ms);
     while (done < len) {
         mutex_lock(&net_lock);
         if (c->err || c->fin_queued || (c->state != TCP_ESTABLISHED && c->state != TCP_CLOSE_WAIT)) {
             int e = c->err ? c->err : ENOTCONN;
             mutex_unlock(&net_lock);
-            return done ? (int64_t)done : -e;
+            return -e;
         }
         size_t n = MIN(len - done, TCP_SBUF - c->slen);
         if (n) {
@@ -423,7 +436,11 @@ int64_t tcp_send(struct tcp_conn *c, const void *data, size_t len) {
             tcp_output(c, false);
         }
         mutex_unlock(&net_lock);
-        if (!n) { if (thread_should_exit()) return done ? (int64_t)done : -ECANCELED; sem_wait_timeout(&c->sem, 100); }
+        uint64_t now = time_ms();
+        if (n) { deadline = now + (timeout_ms < 0 ? 0 : timeout_ms); continue; }
+        if ((cancel && *cancel) || thread_should_exit()) return -ECANCELED;
+        if (timeout_ms >= 0 && now >= deadline) return -ETIMEDOUT;
+        sem_wait_timeout(&c->sem, timeout_ms >= 0 ? MIN(100, deadline - now) : 100);
     }
     return done;
 }

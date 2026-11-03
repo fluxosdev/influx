@@ -316,18 +316,20 @@ void window_minimize(struct window *w) {
     mutex_unlock(&wm_lock);
 }
 
-void window_post_event(struct window *w, const struct event *ev) {
+/* false when the queue was full and the event dropped: the caller still owns anything it points to (EV_OPEN's path) */
+bool window_post_event(struct window *w, const struct event *ev) {
     spin_lock(&w->evq_lock);
     int next = (w->evq_tail + 1) % EVQ_SIZE;
     if (ev->type == EV_MOUSE_MOVE && w->evq_tail != w->evq_head) {
         int last = (w->evq_tail + EVQ_SIZE - 1) % EVQ_SIZE;
-        if (w->evq[last].type == EV_MOUSE_MOVE) { w->evq[last] = *ev; spin_unlock(&w->evq_lock); return; }
+        if (w->evq[last].type == EV_MOUSE_MOVE) { w->evq[last] = *ev; spin_unlock(&w->evq_lock); return true; }
     }
-    if (next == w->evq_head) { spin_unlock(&w->evq_lock); return; }   /* full: drop */
+    if (next == w->evq_head) { spin_unlock(&w->evq_lock); return false; }   /* full: drop */
     w->evq[w->evq_tail] = *ev;
     w->evq_tail = next;
     spin_unlock(&w->evq_lock);
     sem_post(&w->evq_sem);
+    return true;
 }
 
 bool window_wait_event(struct window *w, struct event *ev, int timeout_ms) {
@@ -343,8 +345,10 @@ bool window_wait_event(struct window *w, struct event *ev, int timeout_ms) {
                 if (!got) { w->next_timer = system_ticks + w->timer_ms; memset(ev, 0, sizeof *ev); ev->type = EV_TIMER; return true; }
             } else if (wait < 0 || until < wait) wait = (int)until;
         }
-        if (!got) got = wait < 0 ? (sem_wait(&w->evq_sem), true) : sem_wait_timeout(&w->evq_sem, wait);
+        /* killable: a Force Quit must not wait for the window's next event */
+        if (!got) got = sem_wait_killable(&w->evq_sem, wait);
         if (!got) {
+            if (thread_should_exit()) continue;   /* the top of the loop reports EV_QUIT */
             if (w->timer_ms > 0 && (int64_t)system_ticks >= (int64_t)w->next_timer) continue;
             return false;
         }
@@ -367,7 +371,7 @@ static struct window *top_of_process_locked(struct process *p) {
 struct window *window_top_of_process(struct process *p) { mutex_lock(&wm_lock); struct window *w = top_of_process_locked(p); mutex_unlock(&wm_lock); return w; }
 /* look up and act on a process's top window under wm_lock, so it can't be destroyed in between */
 bool window_focus_process(struct process *p) { mutex_lock(&wm_lock); struct window *w = top_of_process_locked(p); if (w) focus_locked(w); mutex_unlock(&wm_lock); return w != NULL; }
-bool window_post_process(struct process *p, const struct event *ev) { mutex_lock(&wm_lock); struct window *w = top_of_process_locked(p); if (w) window_post_event(w, ev); mutex_unlock(&wm_lock); return w != NULL; }
+bool window_post_process(struct process *p, const struct event *ev) { mutex_lock(&wm_lock); struct window *w = top_of_process_locked(p); bool ok = w && window_post_event(w, ev); mutex_unlock(&wm_lock); return ok; }
 
 void clipboard_set(const char *text, size_t n) {
     mutex_lock(&wm_lock);

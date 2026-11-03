@@ -16,6 +16,8 @@
 #define MAX_ARGS 128
 #define MAX_HIST 500
 #define LINE_MAX 2048
+#define WALK_DEPTH 64   /* directory levels cp -r, rm -r and du descend: their frames are small (struct walk is on the heap) */
+#define ETOODEEP 40     /* ELOOP: the tree nests deeper than WALK_DEPTH */
 
 struct shell;
 struct ctx { struct shell *sh; struct file *in, *out, *err; char rbuf[512]; int rlen, rpos; };
@@ -33,9 +35,14 @@ struct shell {
     int cur_row, cur_col;   /* where the terminal cursor sits within the wrapped prompt + line */
     bool exiting;
     int depth;
+    int bg_jobs;            /* detached builtin threads (cmd &) still using this struct */
 };
 struct shell_start { struct tty *tty; char *cwd; char *cmd; };
 
+/* Ctrl+C (sh->cancel), or the thread was killed: the Terminal closed or the shell is exiting.
+ * Every builtin loop that can run long checks this; calls that take a cancel pointer get
+ * &sh->cancel, which Terminal and shell_main also raise when they stop the shell */
+static bool cancelled(struct ctx *c) { return c->sh->cancel || thread_should_exit(); }
 static void cwrite(struct ctx *c, const char *s, size_t n) { if (c->out) vfs_write(c->out, s, n); }
 static void cputs(struct ctx *c, const char *s) { cwrite(c, s, strlen(s)); }
 static void cprintf(struct ctx *c, const char *fmt, ...) __attribute__((format(printf, 2, 3)));
@@ -43,7 +50,7 @@ static void cprintf(struct ctx *c, const char *fmt, ...) { char buf[1024]; va_li
 static void eprintf(struct ctx *c, const char *fmt, ...) __attribute__((format(printf, 2, 3)));
 static void eprintf(struct ctx *c, const char *fmt, ...) { char buf[512]; va_list ap; va_start(ap, fmt); int n = vsnprintf(buf, sizeof buf, fmt, ap); va_end(ap); if (c->err) vfs_write(c->err, buf, MIN(n, (int)sizeof buf - 1)); }
 static int cgetc(struct ctx *c) {
-    if (c->rpos >= c->rlen) { if (!c->in) return -1; int64_t n = vfs_read(c->in, c->rbuf, sizeof c->rbuf); if (n <= 0) return -1; c->rlen = n; c->rpos = 0; }
+    if (c->rpos >= c->rlen) { if (!c->in || cancelled(c)) return -1; int64_t n = vfs_read(c->in, c->rbuf, sizeof c->rbuf); if (n <= 0) return -1; c->rlen = n; c->rpos = 0; }
     return (unsigned char)c->rbuf[c->rpos++];
 }
 static bool cgetline(struct ctx *c, char *buf, size_t n) {
@@ -197,7 +204,7 @@ static int run_line(struct shell *sh, struct ctx *c, const char *line);
 
 static void resolve(struct shell *sh, const char *p, char *out, size_t n) { vfs_normalize(sh->proc->cwd, p, out, n); }
 static const char *errstr(int e) {
-    switch (-e) { case ENOENT: return "no such file or directory"; case EEXIST: return "file exists"; case ENOTDIR: return "not a directory"; case EISDIR: return "is a directory"; case ENOTEMPTY: return "directory not empty"; case EROFS: return "read-only file system"; case EACCES: return "permission denied"; case ENOSPC: return "no space left on device"; case EIO: return "input/output error"; case EBUSY: return "device or resource busy"; case EFBIG: return "file too large"; default: return "error"; }
+    switch (-e) { case ENOENT: return "no such file or directory"; case EEXIST: return "file exists"; case ENOTDIR: return "not a directory"; case EISDIR: return "is a directory"; case ENOTEMPTY: return "directory not empty"; case EROFS: return "read-only file system"; case EACCES: return "permission denied"; case ENOSPC: return "no space left on device"; case EIO: return "input/output error"; case EBUSY: return "device or resource busy"; case EFBIG: return "file too large"; case ENAMETOOLONG: return "file name too long"; case ECANCELED: return "interrupted"; case ETOODEEP: return "too deeply nested"; default: return "error"; }
 }
 static void format_size_h(uint64_t sz, char *out, size_t n) {
     if (sz < 1024) snprintf(out, n, "%luB", sz);
@@ -316,7 +323,7 @@ static int b_cat(struct ctx *c, int argc, char **argv) {
         if (f->vn->type == VN_DIR) { eprintf(c, "cat: %s: is a directory\n", argv[i]); vfs_close(f); status = 1; continue; }
         char *buf = kmalloc(8192); int64_t n;
         if (number) { struct ctx fc = { c->sh, f, c->out, c->err }; char line[LINE_MAX]; while (cgetline(&fc, line, sizeof line)) { cprintf(c, "%6d\t%s\n", ln++, line); } }
-        else while ((n = vfs_read(f, buf, 8192)) > 0) cwrite(c, buf, n);
+        else while (!cancelled(c) && (n = vfs_read(f, buf, 8192)) > 0) cwrite(c, buf, n);
         kfree(buf); vfs_close(f);
     }
     return status;
@@ -332,12 +339,18 @@ static int b_mkdir(struct ctx *c, int argc, char **argv) {
     }
     return status;
 }
-static int remove_recursive(struct ctx *c, const char *p) {
+/* Recursive walks keep their paths and dirent on the heap and stop at WALK_DEPTH levels: with
+ * PATH_MAX buffers in every frame, ~50 nested directories would overflow the kernel stack */
+struct walk { char a[PATH_MAX], b[PATH_MAX]; struct dirent de; };
+static bool path_join(char *out, const char *dir, const char *name) { return (size_t)snprintf(out, PATH_MAX, "%s/%s", !strcmp(dir, "/") ? "" : dir, name) < PATH_MAX; }   /* false: too long (a cut path names another file) */
+static int remove_recursive(struct ctx *c, const char *p, int depth) {
     struct stat st; if (vfs_stat(p, &st) < 0) return -ENOENT;
     if (st.type == VN_DIR) {
-        struct vnode *d = vfs_lookup(p); struct dirent de;
-        while (d && vfs_readdir(d, 0, &de) == 0) { char sub[PATH_MAX]; snprintf(sub, sizeof sub, "%s/%s", p, de.name); int r = remove_recursive(c, sub); if (r < 0) { vnode_unref(d); return r; } }
-        if (d) vnode_unref(d);
+        if (depth >= WALK_DEPTH) return -ETOODEEP;
+        struct vnode *d = vfs_lookup(p); struct walk *w = kmalloc(sizeof *w); int r = 0;
+        while (d && !r && vfs_readdir(d, 0, &w->de) == 0) r = cancelled(c) ? -ECANCELED : !path_join(w->a, p, w->de.name) ? -ENAMETOOLONG : remove_recursive(c, w->a, depth + 1);
+        kfree(w); if (d) vnode_unref(d);
+        if (r < 0) return r;
     }
     return vfs_unlink(p);
 }
@@ -349,7 +362,7 @@ static int b_rm(struct ctx *c, int argc, char **argv) {
         struct stat st;
         if (vfs_stat(p, &st) < 0) { if (!force) { eprintf(c, "rm: %s: no such file or directory\n", argv[i]); status = 1; } continue; }
         if (st.type == VN_DIR && !rec) { eprintf(c, "rm: %s: is a directory\n", argv[i]); status = 1; continue; }
-        int r = rec ? remove_recursive(c, p) : vfs_unlink(p);
+        int r = rec ? remove_recursive(c, p, 0) : vfs_unlink(p);
         if (r < 0) { eprintf(c, "rm: %s: %s\n", argv[i], errstr(r)); status = 1; }
     }
     return status;
@@ -369,14 +382,19 @@ static int b_touch(struct ctx *c, int argc, char **argv) {
     }
     return status;
 }
-static int copy_path(struct ctx *c, const char *src, const char *dst, bool rec) {
+static int copy_path(struct ctx *c, const char *src, const char *dst, bool rec, int depth) {
     struct stat st; if (vfs_stat(src, &st) < 0) return -ENOENT;
     if (st.type == VN_DIR) {
         if (!rec) return -EISDIR;
+        if (depth >= WALK_DEPTH) return -ETOODEEP;
         int r = vfs_mkdir(dst); if (r < 0 && r != -EEXIST) return r;
-        struct vnode *d = vfs_lookup(src); struct dirent de; int res = d ? 0 : -ENOENT;
-        for (int i = 0; d && vfs_readdir(d, i, &de) == 0; i++) { char a[PATH_MAX], b[PATH_MAX]; snprintf(a, sizeof a, "%s/%s", src, de.name); snprintf(b, sizeof b, "%s/%s", dst, de.name); int e = copy_path(c, a, b, true); if (e < 0) res = e; }
-        if (d) vnode_unref(d);
+        struct vnode *d = vfs_lookup(src); struct walk *w = kmalloc(sizeof *w); int res = d ? 0 : -ENOENT;
+        for (int i = 0; d && vfs_readdir(d, i, &w->de) == 0; i++) {
+            if (cancelled(c)) { res = -ECANCELED; break; }
+            int e = path_join(w->a, src, w->de.name) && path_join(w->b, dst, w->de.name) ? copy_path(c, w->a, w->b, true, depth + 1) : -ENAMETOOLONG;
+            if (e < 0) res = e;
+        }
+        kfree(w); if (d) vnode_unref(d);
         return res;
     }
     void *data; size_t sz; int r = vfs_read_file(src, &data, &sz); if (r < 0) return r;
@@ -401,7 +419,7 @@ static int b_cp(struct ctx *c, int argc, char **argv) {
         char src[PATH_MAX], target[PATH_MAX]; resolve(c->sh, args[i], src, sizeof src);
         if (dst_dir) snprintf(target, sizeof target, "%s/%s", dst, vfs_basename(src)); else strlcpy(target, dst, sizeof target);
         if (!copy_target_ok(c, "cp", args[i], src, target)) { status = 1; continue; }
-        int r = copy_path(c, src, target, rec);
+        int r = copy_path(c, src, target, rec, 0);
         if (r < 0) { eprintf(c, "cp: %s: %s\n", args[i], errstr(r)); status = 1; }
     }
     return status;
@@ -415,8 +433,8 @@ static int b_mv(struct ctx *c, int argc, char **argv) {
         char src[PATH_MAX], target[PATH_MAX]; resolve(c->sh, argv[i], src, sizeof src);
         if (dst_dir) snprintf(target, sizeof target, "%s/%s", dst, vfs_basename(src)); else strlcpy(target, dst, sizeof target);
         if (!copy_target_ok(c, "mv", argv[i], src, target)) { status = 1; continue; }
-        int r = copy_path(c, src, target, true);
-        if (r == 0) r = remove_recursive(c, src);
+        int r = copy_path(c, src, target, true, 0);
+        if (r == 0) r = remove_recursive(c, src, 0);
         if (r < 0) { eprintf(c, "mv: %s: %s\n", argv[i], errstr(r)); status = 1; }
     }
     return status;
@@ -510,7 +528,7 @@ static int b_seq(struct ctx *c, int argc, char **argv) {
     long a = 1, b = 0, step = 1;
     if (argc == 2) b = strtol(argv[1], NULL, 10); else if (argc == 3) { a = strtol(argv[1], NULL, 10); b = strtol(argv[2], NULL, 10); } else if (argc >= 4) { a = strtol(argv[1], NULL, 10); step = strtol(argv[2], NULL, 10); b = strtol(argv[3], NULL, 10); }
     if (step == 0) return 1;
-    for (long i = a; step > 0 ? i <= b : i >= b; i += step) { if (c->sh->cancel) break; cprintf(c, "%ld\n", i); }
+    for (long i = a; step > 0 ? i <= b : i >= b; i += step) { if (cancelled(c)) break; cprintf(c, "%ld\n", i); }
     return 0;
 }
 static int b_clear(struct ctx *c, int argc, char **argv) { cputs(c, "\033[H\033[2J\033[3J"); return 0; }
@@ -611,10 +629,18 @@ static int b_lsgpu(struct ctx *c, int argc, char **argv) {
 }
 static void install_progress(void *ctx, int pct, const char *m) { cprintf((struct ctx *)ctx, "[%3d%%] %s\n", pct, m); }
 static int b_install(struct ctx *c, int argc, char **argv) {
-    if (argc < 2) { cputs(c, "usage: install /dev/<disk>   (erases the whole disk; see also the Install inFlux app)\n"); return 1; }
-    const char *n = argv[1]; if (!strncmp(n, "/dev/", 5)) n += 5;
+    bool yes = false; const char *dev = NULL;
+    for (int i = 1; i < argc; i++) { if (!strcmp(argv[i], "-y")) yes = true; else dev = argv[i]; }
+    if (!dev) { cputs(c, "usage: install [-y] /dev/<disk>   (erases the whole disk after asking; -y: don't ask. See also the Install inFlux app)\n"); return 1; }
+    const char *n = dev; if (!strncmp(n, "/dev/", 5)) n += 5;
     struct blockdev *d = blockdev_find(n);
-    if (!d || d->parent) { eprintf(c, "install: %s is not a whole disk\n", argv[1]); return 1; }
+    if (!d || d->parent) { eprintf(c, "install: %s is not a whole disk\n", dev); return 1; }
+    if (install_is_system_disk(d)) { eprintf(c, "install: %s holds the running system (mounted at /home); choose another disk\n", dev); return 1; }
+    if (!yes) {   /* read the answer like any builtin reads its input: a line from the terminal (cooked) or a pipe */
+        char sz[16], ans[16]; format_size_h(d->sectors * d->sector_size, sz, sizeof sz);
+        cprintf(c, "Everything on /dev/%s (%s, %s) will be erased.\nType yes to install inFlux on it: ", d->name, d->model[0] ? d->model : "disk", sz);
+        if (!cgetline(c, ans, sizeof ans) || strcmp(ans, "yes")) { eprintf(c, "install: cancelled, nothing was written\n"); return 1; }
+    }
     int r = install_run(d, install_progress, c);
     c->sh->last_status = r < 0 ? 1 : 0;
     return r < 0 ? 1 : 0;
@@ -674,7 +700,7 @@ static int b_lsusb(struct ctx *c, int argc, char **argv) {
 static int b_play(struct ctx *c, int argc, char **argv) {
     if (argc < 2) { cputs(c, "usage: play file.wav ...\n"); return 1; }
     int status = 0;
-    for (int i = 1; i < argc && !c->sh->cancel; i++) {
+    for (int i = 1; i < argc && !cancelled(c); i++) {
         char p[PATH_MAX]; resolve(c->sh, argv[i], p, sizeof p);
         struct vnode *v = vfs_lookup(p);
         if (!v) { eprintf(c, "play: %s: no such file or directory\n", argv[i]); status = 1; continue; }
@@ -691,7 +717,7 @@ static int b_play(struct ctx *c, int argc, char **argv) {
         uint8_t *buf = kmalloc(cap);
         uint64_t shown = ~0ULL;
         bool gone = false;
-        for (uint64_t off = 0; off < w.data_len && !c->sh->cancel; ) {
+        for (uint64_t off = 0; off < w.data_len && !cancelled(c); ) {
             int64_t got = vfs_pread(v, w.data_off + off, buf, MIN((uint64_t)cap, w.data_len - off));
             if (got <= 0) break;
             got -= got % fb;
@@ -703,8 +729,8 @@ static int b_play(struct ctx *c, int argc, char **argv) {
         }
         if (gone) { cputs(c, "\n"); eprintf(c, "play: the audio device was disconnected"); status = 1; }
         else {
-            audio_stream_drain(s, &c->sh->cancel);
-            if (c->sh->cancel) audio_stream_stop(s);
+            if (!cancelled(c)) audio_stream_drain(s, &c->sh->cancel);
+            if (cancelled(c)) audio_stream_stop(s);
             else cprintf(c, "\r  %lu:%02lu / %lu:%02lu", total / 60, total % 60, total / 60, total % 60);
         }
         cputs(c, "\n");
@@ -781,7 +807,7 @@ static int b_ping(struct ctx *c, int argc, char **argv) {
     cprintf(c, "PING %s (%s): 56 data bytes\n", host, ips);
     int sent = 0, received = 0; int64_t min = -1, max = 0, total = 0;
     for (int seq = 0; count <= 0 || seq < count; seq++) {
-        if (c->sh->cancel) break;
+        if (cancelled(c)) break;
         uint64_t start = time_ms();
         int ttl = 0;
         int64_t us = icmp_ping(ip, seq, 56, 2000, &ttl);
@@ -791,7 +817,7 @@ static int b_ping(struct ctx *c, int argc, char **argv) {
             cprintf(c, "64 bytes from %s: icmp_seq=%d ttl=%d time=%ld.%03ld ms\n", ips, seq, ttl, us / 1000, us % 1000);
         } else if (us == -ETIMEDOUT) cprintf(c, "Request timeout for icmp_seq %d\n", seq);
         else { eprintf(c, "ping: sendto: %s\n", us == -ENETUNREACH ? "network unreachable" : "error"); break; }
-        while (time_ms() - start < 1000 && !c->sh->cancel && (count <= 0 || seq + 1 < count)) thread_sleep_ms(20);
+        while (time_ms() - start < 1000 && !cancelled(c) && (count <= 0 || seq + 1 < count)) thread_sleep_ms(20);
     }
     cprintf(c, "--- %s ping statistics ---\n%d packets transmitted, %d packets received, %d%% packet loss\n", host, sent, received, sent ? (sent - received) * 100 / sent : 0);
     if (received) cprintf(c, "round-trip min/avg/max = %ld.%03ld/%ld.%03ld/%ld.%03ld ms\n", min / 1000, min % 1000, total / received / 1000, total / received % 1000, max / 1000, max % 1000);
@@ -870,7 +896,7 @@ static int b_sleep(struct ctx *c, int argc, char **argv) {
     if (argc < 2) return 1;
     long ms = strtol(argv[1], NULL, 10) * 1000; char *dot = strchr(argv[1], '.'); if (dot) { int f = atoi(dot + 1); while (f >= 1000) f /= 10; int digits = strlen(dot + 1); if (digits == 1) f *= 100; else if (digits == 2) f *= 10; ms += f; }
     uint64_t end = system_ticks + ms;
-    while (system_ticks < end && !c->sh->cancel) thread_sleep_ms(MIN(50, end - system_ticks));
+    while (system_ticks < end && !cancelled(c)) thread_sleep_ms(MIN(50, end - system_ticks));
     return 0;
 }
 static int b_history(struct ctx *c, int argc, char **argv) {
@@ -956,7 +982,7 @@ static void tree_walk(struct ctx *c, const char *path, const char *prefix, int d
     struct dirent *ents = kmalloc(256 * sizeof *ents); int n = 0;   /* 75 KiB: not on the stack of a recursive function */
     for (int i = 0; n < 256 && vfs_readdir(d, i, &ents[n]) == 0; i++) if (ents[n].name[0] != '.') n++;
     vnode_unref(d);
-    for (int i = 0; i < n; i++) {
+    for (int i = 0; i < n && !cancelled(c); i++) {
         bool last = i == n - 1;
         cprintf(c, "%s%s%s%s%s\n", prefix, last ? "\u2514\u2500\u2500 " : "\u251c\u2500\u2500 ", ents[i].type == VN_DIR ? "\033[1;34m" : "", ents[i].name, ents[i].type == VN_DIR ? "\033[0m" : "");
         if (ents[i].type == VN_DIR) { (*dirs)++; if (depth < 8) { char sub[PATH_MAX], np[256]; snprintf(sub, sizeof sub, "%s/%s", !strcmp(path, "/") ? "" : path, ents[i].name); snprintf(np, sizeof np, "%s%s", prefix, last ? "    " : "\u2502   "); tree_walk(c, sub, np, depth + 1, dirs, files); } }
@@ -976,7 +1002,7 @@ static void find_walk(struct ctx *c, const char *path, const char *pat, int dept
         char sub[PATH_MAX]; snprintf(sub, sizeof sub, "%s/%s", !strcmp(path, "/") ? "" : path, de.name);
         if (!pat || glob_match(pat, de.name)) cprintf(c, "%s\n", sub);
         if (de.type == VN_DIR && depth < 16 && strcmp(de.name, ".") && strcmp(de.name, "..")) find_walk(c, sub, pat, depth + 1);
-        if (c->sh->cancel) break;
+        if (cancelled(c)) break;
     }
     vnode_unref(d);
 }
@@ -987,18 +1013,27 @@ static int b_find(struct ctx *c, int argc, char **argv) {
     if (!pat) cprintf(c, "%s\n", start);
     find_walk(c, p, pat, 0); return 0;
 }
-static uint64_t du_walk(const char *path) {
+static int du_walk(struct ctx *c, const char *path, int depth, uint64_t *total) {
     struct stat st; if (vfs_stat(path, &st) < 0) return 0;
-    if (st.type != VN_DIR) return st.size;
-    uint64_t total = 0; struct vnode *d = vfs_lookup(path); struct dirent de;
-    for (int i = 0; d && vfs_readdir(d, i, &de) == 0; i++) { char sub[PATH_MAX]; snprintf(sub, sizeof sub, "%s/%s", !strcmp(path, "/") ? "" : path, de.name); total += du_walk(sub); }
-    if (d) vnode_unref(d); return total;
+    if (st.type != VN_DIR) { *total += st.size; return 0; }
+    if (depth >= WALK_DEPTH) return -ETOODEEP;
+    struct vnode *d = vfs_lookup(path); struct walk *w = kmalloc(sizeof *w); int r = 0;
+    for (int i = 0; d && !r && vfs_readdir(d, i, &w->de) == 0; i++) r = cancelled(c) ? -ECANCELED : !path_join(w->a, path, w->de.name) ? -ENAMETOOLONG : du_walk(c, w->a, depth + 1, total);
+    kfree(w); if (d) vnode_unref(d);
+    return r;
+}
+static int du_one(struct ctx *c, const char *path, const char *shown, bool h) {
+    uint64_t t = 0; int r = du_walk(c, path, 0, &t);
+    if (r < 0) eprintf(c, "du: %s: %s\n", shown, errstr(r));
+    char s[16]; if (h) format_size_h(t, s, 16); else snprintf(s, 16, "%lu", (t + 1023) / 1024);
+    cprintf(c, "%s\t%s\n", s, shown);
+    return r < 0;
 }
 static int b_du(struct ctx *c, int argc, char **argv) {
-    bool h = false; int n = 0;
-    for (int i = 1; i < argc; i++) { if (argv[i][0] == '-') { if (strchr(argv[i], 'h')) h = true; continue; } char p[PATH_MAX]; resolve(c->sh, argv[i], p, sizeof p); uint64_t t = du_walk(p); char s[16]; if (h) format_size_h(t, s, 16); else snprintf(s, 16, "%lu", (t + 1023) / 1024); cprintf(c, "%s\t%s\n", s, argv[i]); n++; }
-    if (!n) { uint64_t t = du_walk(c->sh->proc->cwd); char s[16]; if (h) format_size_h(t, s, 16); else snprintf(s, 16, "%lu", (t + 1023) / 1024); cprintf(c, "%s\t.\n", s); }
-    return 0;
+    bool h = false; int n = 0, status = 0;
+    for (int i = 1; i < argc; i++) { if (argv[i][0] == '-') { if (strchr(argv[i], 'h')) h = true; continue; } char p[PATH_MAX]; resolve(c->sh, argv[i], p, sizeof p); status |= du_one(c, p, argv[i], h); n++; }
+    if (!n) status = du_one(c, c->sh->proc->cwd, ".", h);
+    return status;
 }
 static int b_whoami(struct ctx *c, int argc, char **argv) { cputs(c, "flux\n"); return 0; }
 static int b_hostname(struct ctx *c, int argc, char **argv) { if (argc > 1) strlcpy(system_hostname, argv[1], sizeof system_hostname); else cprintf(c, "%s\n", system_hostname); return 0; }
@@ -1011,7 +1046,7 @@ static int b_source(struct ctx *c, int argc, char **argv) {
     if (c->sh->depth >= 3) { kfree(data); eprintf(c, "source: nested too deeply\n"); return 1; }   /* each level costs a run_line frame on the 128 KiB stack */
     c->sh->depth++;
     char *save, *line = strtok_r(data, "\n", &save); int st = 0;
-    while (line) { st = run_line(c->sh, c, line); line = strtok_r(NULL, "\n", &save); }
+    while (line && !cancelled(c)) { st = run_line(c->sh, c, line); line = strtok_r(NULL, "\n", &save); }
     c->sh->depth--;
     kfree(data); return st;
 }
@@ -1059,7 +1094,7 @@ static const struct builtin builtins[] = {
     { "grep", b_grep, "search for a pattern (-i -v -c -n)" }, { "head", b_head, "first lines of input (-n N)" },
     { "help", b_help, "this list" }, { "hexdump", b_hexdump, "hex dump of a file (-n bytes)" },
     { "history", b_history, "show command history (-c clears)" }, { "host", b_nslookup, "look up a host name" }, { "hostname", b_hostname, "print the host name" },
-    { "id", b_id, "print user identity" }, { "ifconfig", b_ifconfig, "show or configure network adapters" }, { "install", b_install, "install inFlux to a disk" }, { "kill", b_kill, "terminate a process: kill [-9] pid" },
+    { "id", b_id, "print user identity" }, { "ifconfig", b_ifconfig, "show or configure network adapters" }, { "install", b_install, "install inFlux to a disk, erasing it (asks first; -y doesn't)" }, { "kill", b_kill, "terminate a process: kill [-9] pid" },
     { "ls", b_ls, "list directory contents (-l -a -h)" }, { "lsblk", b_lsblk, "list block devices" }, { "lsgpu", b_lsgpu, "show graphics adapters" },
     { "lspci", b_lspci, "list PCI devices" }, { "lsusb", b_lsusb, "list USB devices (-v: interfaces and endpoints)" }, { "mkdir", b_mkdir, "create directories (-p)" },
     { "mount", b_mount, "list mounted filesystems" }, { "mv", b_mv, "move or rename files" }, { "netstat", b_netstat, "list TCP connections" },
@@ -1091,8 +1126,10 @@ static void job_thread(void *p) {
     job_close(j);
     if (!j->detached) { sem_post(&j->done); return; }
     /* background job: nobody waits, it owns its copy of the job and argv */
+    struct shell *sh = j->ctx.sh;
     for (int i = 0; i < j->argc; i++) kfree(j->argv[i]);
     kfree(j->argv); kfree(j);
+    __atomic_sub_fetch(&sh->bg_jobs, 1, __ATOMIC_SEQ_CST);   /* last access to sh: shell_main frees it once no job is left */
 }
 
 static int run_pipeline(struct shell *sh, struct ctx *base, struct stage *st, int n, bool background) {
@@ -1123,6 +1160,7 @@ static int run_pipeline(struct shell *sh, struct ctx *base, struct stage *st, in
                 bj->argv = kzalloc((s->argc + 1) * sizeof(char *));
                 for (int k = 0; k < s->argc; k++) bj->argv[k] = strdup(s->argv[k]);
                 j->ctx.in = j->ctx.out = j->ctx.err = NULL; j->b = NULL;
+                __atomic_add_fetch(&sh->bg_jobs, 1, __ATOMIC_SEQ_CST);   /* it uses sh: shell_main waits for it */
                 thread_create(sh->proc, b->name, job_thread, bj);
             }
             else { thread_create(sh->proc, b->name, job_thread, j); }
@@ -1163,7 +1201,7 @@ static int run_line(struct shell *sh, struct ctx *c, const char *line) {
     int i = 0, status = 0; int connector = 0;   /* 0 none, 1 &&, 2 || */
     bool skip = false;
     struct stage *st = kmalloc(16 * sizeof *st);   /* 17 KiB: heap, so nested `source` fits the stack */
-    while (i < nt && !sh->exiting) {
+    while (i < nt && !sh->exiting && !thread_should_exit()) {   /* killed: start nothing more */
         int ns = 0; memset(st, 0, 16 * sizeof *st);
         bool background = false;
         /* parse one pipeline */
@@ -1349,7 +1387,7 @@ void shell_main(void *arg) {
     struct shell *sh = kzalloc(sizeof *sh);
     sh->tty = ss->tty; sh->proc = current_thread->proc;
     sh->tty_f = tty_file(sh->tty);
-    sh->tty->intr_flag = &sh->cancel;   /* Ctrl+C stops ping, play, sleep, ... */
+    spin_lock(&sh->tty->lock); sh->tty->intr_flag = &sh->cancel; spin_unlock(&sh->tty->lock);   /* Ctrl+C stops ping, play, sleep, ... */
     env_set(sh, "HOME", "/home/flux"); env_set(sh, "USER", "flux"); env_set(sh, "SHELL", "/bin/zsh"); env_set(sh, "PATH", "/bin");
     env_set(sh, "TERM", "xterm-256color"); env_set(sh, "PWD", sh->proc->cwd); env_set(sh, "HOSTNAME", "influx"); env_set(sh, "EDITOR", "editor");
     alias_set(sh, "ll", "ls -l"); alias_set(sh, "la", "ls -la"); alias_set(sh, "l", "ls -lah"); alias_set(sh, "..", "cd .."); alias_set(sh, "cls", "clear");
@@ -1380,7 +1418,14 @@ void shell_main(void *arg) {
         char line_copy[LINE_MAX]; strcpy(line_copy, sh->line);
         run_line(sh, &c, line_copy);
     }
-    sh->tty->intr_flag = NULL;
+    /* background builtins are threads of this process and use sh: stop them like a closing Terminal
+     * does (raise the cancel flag, kill them out of pipe and terminal reads), wait until they are gone */
+    sh->exiting = true; sh->cancel = true;
+    procs_lock();
+    struct thread *t; list_for_each_entry(t, &sh->proc->threads, proc_link) if (t != current_thread) thread_kill(t);
+    procs_unlock();
+    while (__atomic_load_n(&sh->bg_jobs, __ATOMIC_SEQ_CST)) thread_sleep_ms(10);
+    spin_lock(&sh->tty->lock); sh->tty->intr_flag = NULL; spin_unlock(&sh->tty->lock);   /* Terminal raises it under this lock */
     vfs_close(sh->tty_f);
     for (int i = 0; i < sh->nhist; i++) kfree(sh->history[i]);
     kfree(ss->cwd); kfree(ss->cmd); kfree(ss);

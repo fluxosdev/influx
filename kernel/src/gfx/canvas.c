@@ -360,9 +360,30 @@ void gfx_shadow(struct canvas *c, int x, int y, int w, int h, int radius, int sp
 
 /* Blur r but keep the pixels outside a rounded rectangle (corner radius cr) untouched,
  * blending with anti-aliased coverage along the corner arcs. */
+/* Like every other primitive, a blur may only change pixels inside the clip: outside it the
+ * canvas already holds composed output (the dock's tint), and blurring that again over-blurs it.
+ * The result still depends on all of r, so when the clip cuts r, blur a copy of r and write
+ * back the clipped part. True when that handled it (or there was nothing to do). */
+static bool blur_clipped(struct canvas *c, struct rect r, int radius, int cr /* < 0: square */) {
+    struct rect w = rect_intersect(r, c->clip);
+    if (rect_empty(w)) return true;
+    if (w.x == r.x && w.y == r.y && w.w == r.w && w.h == r.h) return false;   /* uncut: blur in place */
+    uint32_t *buf = kmalloc((size_t)r.w * r.h * 4);
+    for (int y = 0; y < r.h; y++) memcpy(buf + (size_t)y * r.w, c->px + (size_t)(r.y + y) * c->stride + r.x, (size_t)r.w * 4);
+    struct canvas t = { 0 };
+    canvas_init(&t, buf, r.w, r.h, r.w);
+    if (cr >= 0) gfx_blur_rect_rounded(&t, rect_make(0, 0, r.w, r.h), radius, cr);
+    else gfx_blur_rect(&t, rect_make(0, 0, r.w, r.h), radius);
+    for (int y = w.y; y < w.y + w.h; y++) memcpy(c->px + (size_t)y * c->stride + w.x, buf + (size_t)(y - r.y) * r.w + (w.x - r.x), (size_t)w.w * 4);
+    kfree(buf);
+    return true;
+}
+
 void gfx_blur_rect_rounded(struct canvas *c, struct rect r, int radius, int cr) {
     r = rect_intersect(r, rect_make(0, 0, c->w, c->h));
     if (rect_empty(r)) return;
+    if (cr < 0) cr = 0;
+    if (blur_clipped(c, r, radius, cr)) return;
     if (cr * 2 > r.w) cr = r.w / 2; if (cr * 2 > r.h) cr = r.h / 2;
     /* save the four corner squares */
     uint32_t *save = kmalloc((size_t)4 * cr * cr * 4 + 4);
@@ -402,6 +423,7 @@ static void blur_v_band(void *ctx, int i) {
 void gfx_blur_rect(struct canvas *c, struct rect r, int radius) {
     r = rect_intersect(r, rect_make(0, 0, c->w, c->h));
     if (rect_empty(r) || radius <= 0) return;
+    if (blur_clipped(c, r, radius, -1)) return;
     uint32_t *tmp = kmalloc((size_t)r.w * r.h * 4);
     if (radius <= SIMD_BLUR_MAX_RADIUS && simd_ok()) {
         void *sums = kmalloc((size_t)r.w * 16);

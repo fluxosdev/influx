@@ -38,16 +38,7 @@ struct player {
 };
 
 /* ---- playback thread ---- */
-static void play_thread(void *arg) {
-    struct player *p = arg;
-    int err;
-    struct audio_stream *s = audio_open(p->wav.rate, p->wav.channels, p->wav.bits, p->wav.is_float, &err);
-    if (!s) {
-        strlcpy(p->error, err == -ENODEV ? "No sound hardware was found." : err == -EBUSY ? "The audio device is in use." : "This format cannot be played.", sizeof p->error);
-        p->playing = false;
-        struct event e = { .type = EV_USER }; window_post_event(p->w, &e);
-        return;
-    }
+static void play_stream(struct player *p, struct audio_stream *s) {
     size_t fb = p->wav.channels * p->wav.bits / 8, cap = 32768 / fb * fb;
     uint8_t *buf = kmalloc(cap);
     uint64_t base = p->pos;
@@ -69,6 +60,14 @@ static void play_thread(void *arg) {
     else p->pos = 0;   /* played to the end: rewind */
     audio_stream_close(s);
     kfree(buf);
+}
+static void play_thread(void *arg) {
+    struct player *p = arg;
+    int err;
+    struct audio_stream *s = audio_open(p->wav.rate, p->wav.channels, p->wav.bits, p->wav.is_float, &err);
+    if (s) play_stream(p, s);
+    else strlcpy(p->error, err == -ENODEV ? "No sound hardware was found." : err == -EBUSY ? "The audio device is in use." : "This format cannot be played.", sizeof p->error);
+    /* one exit for every outcome: start() counted this thread, player_main waits for the count to drop */
     p->playing = false;
     struct event e = { .type = EV_USER }; window_post_event(p->w, &e);
     __atomic_sub_fetch(&p->threads, 1, __ATOMIC_SEQ_CST);   /* last access to p */

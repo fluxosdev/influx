@@ -243,6 +243,16 @@ static int64_t b_read(struct vnode *v, uint64_t off, void *buf, size_t n) {
     return (int64_t)n;   /* holes/NO_HOLES gaps read as zeros */
 }
 
+/* header of the EXTENT_DATA item at p, copied before the item is deleted or rewritten */
+static struct btrfs_file_extent_item extent_head(struct btrfs_path *p) {
+    struct btrfs_file_extent_item fe = { 0 }; memcpy(&fe, btrfs_path_data(p), MIN(sizeof fe, btrfs_path_size(p)));
+    return fe;
+}
+/* release the data reference held by a (now removed or rewritten) EXTENT_DATA item at file_off */
+static void drop_extent_ref(struct btrfs_fs *fs, uint64_t ino, uint64_t file_off, const struct btrfs_file_extent_item *fe) {
+    if (fe->type != 0 && fe->disk_bytenr) btrfs_free_data_extent(fs, fe->disk_bytenr, fe->disk_num_bytes, fs->fs_tree.objectid, ino, file_off - fe->offset);
+}
+
 /* free every data extent of an inode and delete its EXTENT_DATA items */
 static int remove_extents(struct btrfs_fs *fs, uint64_t ino) {
     for (int guard = 0; guard < 100000; guard++) {
@@ -253,40 +263,106 @@ static int remove_extents(struct btrfs_fs *fs, uint64_t ino) {
         if (btrfs_path_normalize(fs, &p)) return 0;
         struct btrfs_key *ik = btrfs_path_key(&p);
         if (ik->objectid != ino || ik->type != BTRFS_EXTENT_DATA_KEY) return 0;
-        struct btrfs_file_extent_item fe = { 0 }; memcpy(&fe, btrfs_path_data(&p), MIN(sizeof fe, btrfs_path_size(&p)));
+        struct btrfs_file_extent_item fe = extent_head(&p);
         uint64_t file_off = ik->offset;
         btrfs_delete_item(fs, &p);
-        if (fe.type != 0 && fe.disk_bytenr) btrfs_free_data_extent(fs, fe.disk_bytenr, fe.disk_num_bytes, fs->fs_tree.objectid, ino, file_off - fe.offset);
+        drop_extent_ref(fs, ino, file_off, &fe);
     }
     return 0;
 }
 
-/* replace the inode's data. Regular extents are written and recorded before the old ones are
- * dropped, so ENOSPC/EIO leaves the old contents in place. */
+/* Switch the inode over to new EXTENT_DATA items (sorted by offset) so that a failure keeps the old ones:
+ * 1: insert the items whose key is free and grow old items whose key gets reused. Only this step can run
+ *    out of space, and it is undone by deleting/shrinking those items again, which cannot.
+ * 2: rewrite the reused items in place (shrinking is in place too), 3: delete the old items nothing replaced.
+ * Old data extents are released only in 2 and 3, once the switch can no longer fail. */
+struct new_extent { uint64_t off; const void *item; uint32_t size; };
+#define KEY_WAS_FREE ((uint32_t)-1)
+static int replace_extents(struct btrfs_fs *fs, uint64_t ino, const struct new_extent *ne, int n) {
+    uint32_t *old = kmalloc_try(n * sizeof *old);   /* size of the old item at ne[i].off, or KEY_WAS_FREE */
+    if (!old) return -ENOMEM;
+    int i, r = 0;
+    for (i = 0; i < n; i++) {
+        struct btrfs_key k = { ino, BTRFS_EXTENT_DATA_KEY, ne[i].off };
+        struct btrfs_path p;
+        int s = btrfs_search(fs, &fs->fs_tree, &k, &p);
+        if (s < 0) { r = s; break; }
+        if (s == 1) { old[i] = KEY_WAS_FREE; if ((r = btrfs_insert_item(fs, &fs->fs_tree, &k, ne[i].item, ne[i].size, NULL)) < 0) break; continue; }
+        old[i] = btrfs_path_size(&p);
+        /* a shorter old item (inline) grows now: in place when its leaf has room, otherwise
+         * btrfs_resize_item moves it and puts it back if that fails */
+        if (old[i] < ne[i].size && (r = btrfs_resize_item(fs, &p, ne[i].size)) < 0) break;
+    }
+    if (r < 0) {
+        for (int j = 0; j < i; j++) {
+            struct btrfs_key k = { ino, BTRFS_EXTENT_DATA_KEY, ne[j].off };
+            struct btrfs_path p;
+            if (btrfs_search(fs, &fs->fs_tree, &k, &p) != 0) continue;
+            if (old[j] == KEY_WAS_FREE) btrfs_delete_item(fs, &p);
+            else if (btrfs_path_size(&p) > old[j]) btrfs_resize_item(fs, &p, old[j]);   /* keeps the head: the old item again */
+        }
+        kfree(old);
+        return r;
+    }
+    for (i = 0; i < n; i++) {
+        if (old[i] == KEY_WAS_FREE) continue;
+        struct btrfs_key k = { ino, BTRFS_EXTENT_DATA_KEY, ne[i].off };
+        struct btrfs_path p;
+        if (btrfs_search(fs, &fs->fs_tree, &k, &p) != 0 || btrfs_path_size(&p) < ne[i].size) continue;   /* found (and grown) in step 1: cannot happen */
+        struct btrfs_file_extent_item fe = extent_head(&p);
+        if (btrfs_path_size(&p) > ne[i].size) btrfs_resize_item(fs, &p, ne[i].size);
+        memcpy(btrfs_path_data(&p), ne[i].item, ne[i].size);
+        btrfs_mark_dirty(fs, p.blocks[0]);
+        drop_extent_ref(fs, ino, ne[i].off, &fe);
+    }
+    kfree(old);
+    uint64_t from = 0; int j = 0;
+    for (int guard = 0; guard < 1000000; guard++) {
+        struct btrfs_key k = { ino, BTRFS_EXTENT_DATA_KEY, from };
+        struct btrfs_path p;
+        if (btrfs_search(fs, &fs->fs_tree, &k, &p) < 0 || btrfs_path_normalize(fs, &p)) break;
+        struct btrfs_key *ik = btrfs_path_key(&p);
+        if (ik->objectid != ino || ik->type != BTRFS_EXTENT_DATA_KEY) break;
+        uint64_t off = ik->offset;
+        while (j < n && ne[j].off < off) j++;
+        if (j == n || ne[j].off != off) {
+            struct btrfs_file_extent_item fe = extent_head(&p);
+            btrfs_delete_item(fs, &p);
+            drop_extent_ref(fs, ino, off, &fe);
+        }
+        if (off == (uint64_t)-1) break;
+        from = off + 1;
+    }
+    return 0;
+}
+
+/* replace the inode's data. Regular extents are written and recorded first, and replace_extents only
+ * drops the old items once the new ones are in, so ENOSPC/EIO leaves the old contents in place. */
 static int write_content(struct btrfs_fs *fs, uint64_t ino, const uint8_t *data, uint64_t size, bool nodatasum, uint64_t *nbytes_out) {
     uint64_t nbytes = 0, root = fs->fs_tree.objectid;
     *nbytes_out = 0;
     if (size == 0) return remove_extents(fs, ino);
     if (size <= MAX_INLINE && size < fs->sectorsize) {
-        int r = remove_extents(fs, ino);
-        if (r < 0) return r;
-        uint8_t *item = kmalloc(BTRFS_FILE_EXTENT_INLINE_DATA_START + size);
+        uint32_t isz = BTRFS_FILE_EXTENT_INLINE_DATA_START + size;
+        uint8_t *item = kmalloc(isz);
         struct btrfs_file_extent_item *fe = (struct btrfs_file_extent_item *)item;
         memset(fe, 0, BTRFS_FILE_EXTENT_INLINE_DATA_START);
         fe->generation = fs->transid; fe->ram_bytes = size; fe->type = 0;
         memcpy(item + BTRFS_FILE_EXTENT_INLINE_DATA_START, data, size);
-        struct btrfs_key k = { ino, BTRFS_EXTENT_DATA_KEY, 0 };
-        r = btrfs_insert_item(fs, &fs->fs_tree, &k, item, BTRFS_FILE_EXTENT_INLINE_DATA_START + size, NULL);
+        struct new_extent ne = { 0, item, isz };
+        int r = replace_extents(fs, ino, &ne, 1);
         kfree(item);
         if (r < 0) return r;
         *nbytes_out = size;
         return 0;
     }
     #define PIECE_ALEN(i) ALIGN_UP(MIN(size - (i) * EXTENT_MAX, (uint64_t)EXTENT_MAX), fs->sectorsize)
-    uint64_t npieces = (size + EXTENT_MAX - 1) / EXTENT_MAX, i, done = 0;
+    uint64_t npieces = (size + EXTENT_MAX - 1) / EXTENT_MAX, i;
     uint64_t *ext = kmalloc_try(npieces * sizeof *ext);
     uint8_t *tmp = kmalloc_try(EXTENT_MAX);
-    if (!ext || !tmp) { kfree(ext); kfree(tmp); return -ENOMEM; }
+    struct btrfs_file_extent_item *fes = kmalloc_try(npieces * sizeof *fes);
+    struct new_extent *ne = kmalloc_try(npieces * sizeof *ne);
+    if (!ext || !tmp || !fes || !ne) { kfree(ext); kfree(tmp); kfree(fes); kfree(ne); return -ENOMEM; }
     int r = 0;
     for (i = 0; i < npieces; i++) {   /* 1: allocate, write and record the new extents */
         uint64_t off = i * EXTENT_MAX, len = MIN(size - off, (uint64_t)EXTENT_MAX), alen = PIECE_ALEN(i);
@@ -299,18 +375,20 @@ static int write_content(struct btrfs_fs *fs, uint64_t ino, const uint8_t *data,
         if (!nodatasum && (r = btrfs_csum_insert(fs, bytenr, tmp, alen)) < 0) { i++; break; }
     }
     kfree(tmp);
-    if (r == 0) r = remove_extents(fs, ino);   /* 2: drop the old ones */
-    if (r == 0) for (; done < npieces; done++) {   /* 3: point the file at the new ones */
-        uint64_t alen = PIECE_ALEN(done);
-        struct btrfs_file_extent_item fe = { 0 };
-        fe.generation = fs->transid; fe.ram_bytes = alen; fe.type = 1; fe.disk_bytenr = ext[done]; fe.disk_num_bytes = alen; fe.offset = 0; fe.num_bytes = alen;
-        struct btrfs_key k = { ino, BTRFS_EXTENT_DATA_KEY, done * EXTENT_MAX };
-        if ((r = btrfs_insert_item(fs, &fs->fs_tree, &k, &fe, sizeof fe, NULL)) < 0) break;
-        nbytes += alen;
+    if (r == 0) {   /* 2: point the file at the new extents in place of the old ones */
+        for (uint64_t j = 0; j < npieces; j++) {
+            uint64_t alen = PIECE_ALEN(j);
+            struct btrfs_file_extent_item *fe = &fes[j];
+            memset(fe, 0, sizeof *fe);
+            fe->generation = fs->transid; fe->ram_bytes = alen; fe->type = 1; fe->disk_bytenr = ext[j]; fe->disk_num_bytes = alen; fe->offset = 0; fe->num_bytes = alen;
+            ne[j] = (struct new_extent){ j * EXTENT_MAX, fe, sizeof *fe };
+            nbytes += alen;
+        }
+        r = replace_extents(fs, ino, ne, (int)npieces);
     }
-    if (r < 0) for (uint64_t j = done; j < i; j++) btrfs_free_data_extent(fs, ext[j], PIECE_ALEN(j), root, ino, j * EXTENT_MAX);
+    if (r < 0) { for (uint64_t j = 0; j < i; j++) btrfs_free_data_extent(fs, ext[j], PIECE_ALEN(j), root, ino, j * EXTENT_MAX); nbytes = 0; }   /* the file still uses the old ones */
     #undef PIECE_ALEN
-    kfree(ext);
+    kfree(ext); kfree(fes); kfree(ne);
     *nbytes_out = nbytes;
     return r;
 }
@@ -414,6 +492,7 @@ static void touch_dir(struct btrfs_fs *fs, uint64_t dir, int64_t size_delta) {
     write_inode(fs, dir, &ii);
 }
 
+static void undo_create(struct btrfs_fs *fs, uint64_t dir, const char *name, uint64_t ino, uint64_t index);
 static struct vnode *b_create(struct vnode *dirv, const char *name, int type) {
     struct bnode *dir = (struct bnode *)dirv; struct btrfs_fs *fs = dir->fs;
     if (fs->readonly) return NULL;
@@ -431,9 +510,13 @@ static struct vnode *b_create(struct vnode *dirv, const char *name, int type) {
     uint64_t t = now_sec();
     ii.atime.sec = ii.ctime.sec = ii.mtime.sec = ii.otime.sec = t;
     struct btrfs_key k = { ino, BTRFS_INODE_ITEM_KEY, 0 };
+    uint64_t index = next_dir_index(fs, dir->ino);
     int r = btrfs_insert_item(fs, &fs->fs_tree, &k, &ii, sizeof ii, NULL);
-    if (r == 0) r = add_dir_entry(fs, dir->ino, name, ino, type == VN_DIR ? BTRFS_FT_DIR : BTRFS_FT_REG_FILE, next_dir_index(fs, dir->ino));
-    if (r == 0) touch_dir(fs, dir->ino, 2 * nl);
+    if (r == 0) {
+        r = add_dir_entry(fs, dir->ino, name, ino, type == VN_DIR ? BTRFS_FT_DIR : BTRFS_FT_REG_FILE, index);
+        if (r == 0) touch_dir(fs, dir->ino, 2 * nl);
+        else undo_create(fs, dir->ino, name, ino, index);   /* the commit below must not write a half-made entry */
+    }
     /* a failed commit keeps the blocks dirty for the next one, and the next sync/close reports it */
     int cr = btrfs_commit(fs);
     if (cr < 0) kprintf("btrfs: commit after creating %s failed (%d); will retry\n", name, cr);
@@ -450,7 +533,8 @@ static int delete_key(struct btrfs_fs *fs, const struct btrfs_key *k) {
     if (r != 0) return r < 0 ? r : -ENOENT;
     return btrfs_delete_item(fs, &p);
 }
-static int remove_dir_item_entry(struct btrfs_fs *fs, uint64_t dir, const char *name) {
+/* remove the entry 'name' pointing at 'ino' from its DIR_ITEM hash bucket */
+static int remove_dir_item_entry(struct btrfs_fs *fs, uint64_t dir, const char *name, uint64_t ino) {
     size_t nl = strlen(name);
     struct btrfs_key k = { dir, BTRFS_DIR_ITEM_KEY, name_hash(name, nl) };
     struct btrfs_path p;
@@ -460,7 +544,7 @@ static int remove_dir_item_entry(struct btrfs_fs *fs, uint64_t dir, const char *
         struct btrfs_dir_item *di = (struct btrfs_dir_item *)(d + pos);
         uint32_t esz = sizeof *di + di->name_len + di->data_len;
         if (pos + esz > size) return -EIO;
-        if (di->name_len == nl && !memcmp(di + 1, name, nl)) {
+        if (di->name_len == nl && !memcmp(di + 1, name, nl) && di->location.objectid == ino) {
             if (esz >= size) return btrfs_delete_item(fs, &p);
             memmove(d + pos, d + pos + esz, size - pos - esz);
             btrfs_mark_dirty(fs, p.blocks[0]);
@@ -469,6 +553,16 @@ static int remove_dir_item_entry(struct btrfs_fs *fs, uint64_t dir, const char *
         pos += esz;
     }
     return -ENOENT;
+}
+/* take back a create that failed half way. Only deletions and shrinks, which need no new space; the
+ * index and dir entry are matched by inode so nothing that existed before is touched. */
+static void undo_create(struct btrfs_fs *fs, uint64_t dir, const char *name, uint64_t ino, uint64_t index) {
+    struct btrfs_key xk = { dir, BTRFS_DIR_INDEX_KEY, index }, rk = { ino, BTRFS_INODE_REF_KEY, dir }, ik = { ino, BTRFS_INODE_ITEM_KEY, 0 };
+    struct btrfs_path p;
+    if (btrfs_search(fs, &fs->fs_tree, &xk, &p) == 0 && btrfs_path_size(&p) >= sizeof(struct btrfs_dir_item) && ((struct btrfs_dir_item *)btrfs_path_data(&p))->location.objectid == ino) btrfs_delete_item(fs, &p);
+    remove_dir_item_entry(fs, dir, name, ino);
+    delete_key(fs, &rk);
+    delete_key(fs, &ik);
 }
 
 static int b_unlink(struct vnode *dirv, const char *name) {
@@ -512,7 +606,7 @@ static int b_unlink(struct vnode *dirv, const char *name) {
             if (btrfs_next_item(fs, &p)) break;
         }
     }
-    remove_dir_item_entry(fs, dir->ino, name);
+    remove_dir_item_entry(fs, dir->ino, name, ino);
     if (have_index) { struct btrfs_key ik = { dir->ino, BTRFS_DIR_INDEX_KEY, index }; delete_key(fs, &ik); }
     struct btrfs_inode_item ii;
     if (read_inode(fs, ino, &ii, NULL) == 0) {

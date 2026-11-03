@@ -18,8 +18,10 @@ static int stbi_abs(int v) { return v < 0 ? -v : v; }
 #define STBI_ONLY_GIF
 #define STBI_ONLY_BMP
 #define STBI_ASSERT(x) ((void)0)
-#define STBI_MALLOC(sz) kmalloc(sz)
-#define STBI_REALLOC(p, sz) krealloc(p, sz)
+/* the input is untrusted (web pages): a 4096x4096 image needs several 64 MiB contiguous
+ * buffers, and running out must fail the image, not panic the kernel like kmalloc does */
+#define STBI_MALLOC(sz) kmalloc_try(sz)
+#define STBI_REALLOC(p, sz) krealloc_try(p, sz)
 #define STBI_FREE(p) kfree(p)
 #define STB_IMAGE_STATIC
 #define STB_IMAGE_IMPLEMENTATION
@@ -34,7 +36,8 @@ struct canvas *image_decode(const void *data, size_t size) {
     if (w <= 0 || h <= 0 || w > MAX_DIM || h > MAX_DIM) return NULL;
     unsigned char *px = stbi_load_from_memory(data, (int)size, &w, &h, &comp, 4);
     if (!px) return NULL;
-    struct canvas *c = canvas_create(w, h);
+    struct canvas *c = canvas_create_try(w, h);
+    if (!c) { stbi_image_free(px); return NULL; }
     for (int i = 0; i < w * h; i++) {
         const unsigned char *p = px + i * 4;
         c->px[i] = ((uint32_t)p[3] << 24) | ((uint32_t)p[0] << 16) | ((uint32_t)p[1] << 8) | p[2];

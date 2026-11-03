@@ -85,6 +85,7 @@ struct ne2000 {
     bool word;            /* 16-bit data transfers */
     uint8_t next_pkt;     /* next receive ring page to read */
     int idle_polls;
+    bool backlog;         /* the last drain stopped at its budget: frames may still be in the ring */
     bool irq;             /* interrupt driven */
     uint64_t irqs;
     spinlock_t page_lock; /* held while register page 1 is selected, and by ne_irq */
@@ -216,9 +217,11 @@ static int ne_drain(struct netif *n) {
     struct ne2000 *ne = n->priv;
     uint8_t isr = ne_in(ne, NE_ISR);
     /* idle polls cost a single register read; the ring is still checked now and then in case
-     * a receive status was missed */
-    if (!(isr & (ISR_PRX | ISR_RXE | ISR_OVW | ISR_PTX | ISR_TXE | ISR_CNT)) && ++ne->idle_polls < 100) return 0;
+     * a receive status was missed. PRX was acknowledged before the last drain, so frames that it
+     * left behind (backlog) raise no new status and must not wait for that occasional check */
+    if (!ne->backlog && !(isr & (ISR_PRX | ISR_RXE | ISR_OVW | ISR_PTX | ISR_TXE | ISR_CNT)) && ++ne->idle_polls < 100) return 0;
     ne->idle_polls = 0;
+    ne->backlog = false;
     if (isr & ISR_OVW) {
         /* receive ring overflow: reset the chip and start over with an empty ring */
         kprintf("%s: receive ring overflow, resetting\n", n->name);
@@ -232,10 +235,13 @@ static int ne_drain(struct netif *n) {
     /* acknowledge before draining: a frame that lands after this sets the bit again */
     ne_out(ne, NE_ISR, ISR_PRX);
 
+    /* count is every ring entry consumed, bad ones included, so a budget-limited drain always
+     * reports work and the network thread polls again at once instead of sleeping */
     int count = 0;
-    for (int budget = 0; budget < 32; budget++) {
+    for (int budget = 0;; budget++) {
         uint8_t curr = ne_curr(ne);
         if (ne->next_pkt == curr) break;
+        if (budget == 32) { ne->backlog = true; break; }
         uint8_t hdr[4];
         ne_read_mem(ne, ne->next_pkt << 8, hdr, 4);
         uint8_t status = hdr[0], next = hdr[1];
@@ -261,12 +267,12 @@ static int ne_drain(struct netif *n) {
              * IPv4 and ARP carry their own lengths, so trailing bytes are harmless */
             n->rx_packets++; n->rx_bytes += plen;
             eth_input(n, ne->rxbuf, plen);
-            count++;
         } else {
             n->rx_errors++;
         }
         ne->next_pkt = next;
         ne_out(ne, NE_BNRY, next == RX_START ? RX_STOP - 1 : next - 1);
+        count++;
     }
     return count;
 }

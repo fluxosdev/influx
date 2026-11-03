@@ -8,6 +8,7 @@
 struct vnode *btrfs_mount(struct blockdev *d);
 struct vnode *fat32_mount(struct blockdev *d);
 int btrfs_unmount(struct vnode *root);   /* final write-back, leaves the background flusher */
+void fat32_free(struct vnode *root);     /* frees a FAT volume that never got mounted */
 
 void drivers_init(void) { gpu_init(); audio_init(); }
 
@@ -38,7 +39,11 @@ static int mount_one(struct blockdev *d) {
     }
     int r = vfs_mount(mp, root);
     if (r == 0) root->priv = d;
-    else { kprintf("storage: mounting %s on %s failed\n", d->name, mp); btrfs_unmount(root); }
+    else {
+        kprintf("storage: mounting %s on %s failed\n", d->name, mp);
+        if (!strcmp(root->fs_name, "fat32")) fat32_free(root);   /* its cached FAT can be 32 MiB */
+        else btrfs_unmount(root);
+    }
     return r;
 }
 

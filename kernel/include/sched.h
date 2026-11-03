@@ -57,6 +57,7 @@ struct process {
     int exit_code;
     bool exited;                  /* every thread gone and resources released: ready to reap */
     bool reaping;                 /* a process_wait() has claimed it */
+    bool orphan;                  /* its creator has exited: nobody will wait for it, so it frees itself (exit_lock) */
     int nthreads;                 /* threads not yet in thread_exit */
     struct waitq exit_wq;
     uint64_t heap_bytes;          /* kernel heap bytes owned by this process */
@@ -127,6 +128,7 @@ struct semaphore { spinlock_t lock; int count; struct waitq wq; };
 void sem_init(struct semaphore *s, int count);
 void sem_wait(struct semaphore *s);
 bool sem_wait_timeout(struct semaphore *s, uint64_t ms);
+bool sem_wait_killable(struct semaphore *s, int64_t ms);   /* ms < 0: no limit; false on timeout or when the thread is killed */
 bool sem_trywait(struct semaphore *s);
 void sem_post(struct semaphore *s);
 

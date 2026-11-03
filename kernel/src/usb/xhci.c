@@ -310,6 +310,7 @@ static void ring_skip(struct xhci *x, struct xslot *s, int dci, int status) {
     uint64_t f = irq_save();
     spin_lock(&x->lock);
     struct ring *r = s->ring[dci];
+    if (!r) { spin_unlock(&x->lock); irq_restore(f); return; }   /* given up: see ep_recover */
     uint64_t deq = r->phys + r->enq * sizeof(struct trb) + r->cycle;
     spin_unlock(&x->lock);
     irq_restore(f);
@@ -423,6 +424,9 @@ static int ep_state(struct xhci *x, struct xslot *s, int dci) { return octx(x, s
  * dropped and re-added, the only other way to reset its toggle (4.6.8).
  * The caller holds ep_lock. */
 static void ep_recover(struct xhci *x, struct usb_device *d, struct xslot *s, int dci, int status, bool toggle) {
+    /* an earlier recovery gave this endpoint up (both Configure Endpoints failed): its ring is gone
+     * and everything queued on it has already failed, so there is nothing to stop or skip */
+    if (!s->ring[dci]) return;
     int st = ep_state(x, s, dci);
     if (st == EP_HALTED) xhci_cmd(x, 0, TYPE(TRB_RESET_EP) | SLOT_EP(s->id, dci), NULL);
     else if (st == EP_RUNNING) xhci_cmd(x, 0, TYPE(TRB_STOP_EP) | SLOT_EP(s->id, dci), NULL);

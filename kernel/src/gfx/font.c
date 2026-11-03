@@ -21,8 +21,11 @@ struct font *font_ui, *font_ui_small, *font_ui_medium, *font_ui_medium_small, *f
 struct font *font_ui_large, *font_ui_title, *font_ui_semibold_large, *font_ui_semibold_xl, *font_ui_display, *font_ui_huge;
 struct font *font_mono, *font_mono_bold;
 
-uint32_t utf8_decode(const char **sp) {
+/* one character; never reads at or past end (NULL: the string's NUL stops it). A sequence
+ * cut short by end decodes as U+FFFD and consumes only the bytes before end. */
+uint32_t utf8_decode_n(const char **sp, const char *end) {
     const uint8_t *s = (const uint8_t *)*sp;
+    size_t avail = end ? (size_t)(end - *sp) : 4;
     uint32_t cp; int extra;
     if (s[0] < 0x80) { cp = s[0]; extra = 0; }
     else if ((s[0] & 0xE0) == 0xC0) { cp = s[0] & 0x1F; extra = 1; }
@@ -30,12 +33,13 @@ uint32_t utf8_decode(const char **sp) {
     else if ((s[0] & 0xF8) == 0xF0) { cp = s[0] & 0x07; extra = 3; }
     else { *sp += 1; return 0xFFFD; }
     for (int i = 1; i <= extra; i++) {
-        if ((s[i] & 0xC0) != 0x80) { *sp += i; return 0xFFFD; }
+        if ((size_t)i >= avail || (s[i] & 0xC0) != 0x80) { *sp += i; return 0xFFFD; }
         cp = (cp << 6) | (s[i] & 0x3F);
     }
     *sp += extra + 1;
     return cp;
 }
+uint32_t utf8_decode(const char **sp) { return utf8_decode_n(sp, NULL); }
 int utf8_encode(uint32_t cp, char *out) {
     if (cp < 0x80) { out[0] = cp; return 1; }
     if (cp < 0x800) { out[0] = 0xC0 | (cp >> 6); out[1] = 0x80 | (cp & 0x3F); return 2; }
@@ -74,7 +78,7 @@ int font_char_width(const struct font *f, uint32_t cp) { const struct fnt_glyph 
 int font_text_width_n(const struct font *f, const char *s, size_t n) {
     const char *end = s + n; int pen = 0;
     while (s < end && *s) {
-        uint32_t cp = utf8_decode(&s);
+        uint32_t cp = utf8_decode_n(&s, end);
         const struct fnt_glyph *g = glyph(f, cp); if (!g) g = glyph(f, '?');
         if (g) pen += g->advance_q8;
     }
@@ -90,7 +94,7 @@ int font_draw_n(struct canvas *c, const struct font *f, int x, int y, color_t co
     uint32_t ca = ALPHA(col);
     bool simd = simd_ok();
     while (s < end && *s) {
-        uint32_t cp = utf8_decode(&s);
+        uint32_t cp = utf8_decode_n(&s, end);
         const struct fnt_glyph *g = glyph(f, cp); if (!g) g = glyph(f, '?');
         if (!g) continue;
         if (g->w && g->h) {
@@ -123,7 +127,7 @@ int font_draw_oblique_n(struct canvas *c, const struct font *f, int x, int y, co
     uint32_t ca = ALPHA(col);
     bool simd = simd_ok();
     while (s < end && *s) {
-        uint32_t cp = utf8_decode(&s);
+        uint32_t cp = utf8_decode_n(&s, end);
         const struct fnt_glyph *g = glyph(f, cp); if (!g) g = glyph(f, '?');
         if (!g) continue;
         if (g->w && g->h) {

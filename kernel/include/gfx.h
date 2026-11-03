@@ -97,6 +97,7 @@ void font_draw_centered(struct canvas *c, const struct font *f, struct rect r, c
 void font_draw_aligned(struct canvas *c, const struct font *f, struct rect r, color_t col, const char *s, int align); /* 0 left,1 center,2 right; vertically centered */
 int font_fit_chars(const struct font *f, const char *s, int maxw);   /* bytes that fit */
 uint32_t utf8_decode(const char **s);
+uint32_t utf8_decode_n(const char **s, const char *end);   /* never reads at or past end */
 int utf8_encode(uint32_t cp, char *out);
 
 /* standard UI fonts, loaded at desktop start */
