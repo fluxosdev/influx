@@ -3,6 +3,7 @@
 #include "list.h"
 #include "spinlock.h"
 #include "arch.h"
+#include "signal.h"
 
 #define MAX_FDS 64
 #define KSTACK_SIZE (128 * 1024)   /* the shell's command path alone needs about 90 KiB */
@@ -40,6 +41,19 @@ struct thread {
     bool is_user;
     bool on_cpu;                  /* running, or its CPU has not finished switching away (sched_lock) */
     bool wake_pending;            /* woken while not waiting: its next wait returns at once (sched_lock) */
+    /* user threads */
+    struct regs *start_regs;      /* first entry to user mode with this full context (kfree'd once used) */
+    uint64_t fs_base;             /* TLS (arch_prctl ARCH_SET_FS) */
+    uint64_t sigmask;             /* blocked signals (bit sig-1) */
+    uint64_t sig_pending;         /* sent to this thread (tgkill, faults) */
+    uint64_t clear_child_tid;     /* user address zeroed and futex-woken when the thread exits */
+    uint64_t alt_sp, alt_size;    /* sigaltstack */
+    bool alt_flags_disable;
+    struct regs *uregs;           /* this thread's user frame on its kernel stack (in a syscall/interrupt from user mode) */
+    bool iret_return;             /* the syscall return must restore the full frame (iretq) */
+    int64_t sys_nr;               /* system call in progress (restart after a signal) */
+    uint64_t saved_sigmask;       /* sigsuspend/ppoll: the mask to restore after the handler */
+    bool restore_sigmask;
 };
 
 struct process {
@@ -66,8 +80,22 @@ struct process {
     void *app_data;
     int exit_signal;
     struct window *uwin[8];       /* windows owned by a user process */
+    /* user address space (uvm.h) */
+    struct list_head vmas;
+    spinlock_t vm_lock;
+    /* POSIX */
+    uint64_t fd_cloexec;          /* bit per descriptor: closed by execve */
+    struct k_sigaction sigact[NSIG + 1];
+    uint64_t sig_pending;         /* sent to the process: any thread not blocking it takes it */
+    struct waitq child_wq;        /* a child exited or changed state (wait4) */
+    int uid, gid, euid, egid;
+    uint32_t umask;
+    int pgid, sid;
+    bool execed;                  /* has called execve (setpgid rules) */
+    uint64_t child_gen;           /* bumped when a child exits (exit_lock) */
 };
 void process_close_windows(struct process *p);
+static inline bool process_has_signal(struct process *p, struct thread *t) { return ((p->sig_pending | t->sig_pending) & ~t->sigmask) != 0; }
 
 /* current_thread is per CPU (percpu.h) */
 extern struct process *kernel_process;
@@ -78,6 +106,8 @@ void sched_create_idle(struct cpu *c);
 void sched_ap_enter(void) NORETURN;   /* an AP, set up, starts scheduling */
 struct thread *thread_create(struct process *p, const char *name, void (*entry)(void *), void *arg);
 struct thread *thread_create_user(struct process *p, const char *name, uint64_t rip, uint64_t rsp);
+struct thread *thread_create_user_regs(struct process *p, const char *name, const struct regs *r, uint64_t fs_base, uint64_t sigmask, const uint8_t *fpu);
+int process_wait_child(int pid, int *status, bool nohang);   /* wait4 */
 void thread_exit(int code) NORETURN;
 void thread_yield(void);
 void thread_sleep_ms(uint64_t ms);
@@ -134,4 +164,5 @@ void sem_post(struct semaphore *s);
 
 /* user process execution (exec.c) */
 int process_spawn(const char *path, int argc, char **argv, struct file *stdio[3], const char *cwd);
+int process_spawn_app(const char *path, int argc, char **argv, const char *cwd, int app_id);
 void syscall_init(void);

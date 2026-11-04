@@ -50,6 +50,10 @@ struct netif {
     char driver[32];
     uint8_t mac[ETH_ALEN];
     uint32_t ip, netmask, gateway, dns;
+    uint32_t ntp;                  /* NTP server from DHCP (0 = none) */
+    uint32_t dhcp_server;          /* server that granted the lease */
+    uint64_t lease_expires_ms;     /* time_ms() when the lease runs out (0 = no lease or infinite) */
+    uint32_t dhcp_gen;             /* bumped on every reconfiguration; stops superseded lease threads */
     bool up, configured, dhcp;
     uint32_t rx_window;            /* bytes the adapter can buffer; caps TCP's advertised window (0 = no limit) */
     uint64_t rx_packets, tx_packets, rx_bytes, tx_bytes, rx_errors, tx_errors, rx_dropped;
@@ -105,6 +109,9 @@ int udp_sendto(struct udp_sock *s, uint32_t dst, uint16_t port, const void *data
 int udp_sendto_if(struct udp_sock *s, struct netif *n, uint32_t src, uint32_t dst, uint16_t port, const void *data, size_t len);
 int udp_recvfrom(struct udp_sock *s, void *buf, size_t len, uint32_t *src, uint16_t *sport, int timeout_ms);
 void udp_close(struct udp_sock *s);
+int udp_poll(struct udp_sock *s);
+uint16_t udp_port(struct udp_sock *s);
+int udp_pending_bytes(struct udp_sock *s);
 
 /* TCP */
 struct tcp_conn;
@@ -118,14 +125,36 @@ int64_t tcp_send(struct tcp_conn *c, const void *data, size_t len, int timeout_m
 int64_t tcp_recv(struct tcp_conn *c, void *buf, size_t len, int timeout_ms, volatile bool *cancel);
 void tcp_close(struct tcp_conn *c);          /* graceful close; the connection is freed by the stack */
 void tcp_abort(struct tcp_conn *c);          /* send RST and free */
+struct tcp_conn *tcp_connect_start(uint32_t ip, uint16_t port, uint16_t lport, int *err);   /* non-blocking */
+struct tcp_listener;
+struct tcp_listener *tcp_listen(uint32_t ip, uint16_t port, int backlog, int *err);   /* port 0: ephemeral */
+struct tcp_conn *tcp_accept(struct tcp_listener *l, int timeout_ms, int *err);
+void tcp_unlisten(struct tcp_listener *l);
+uint16_t tcp_listener_port(struct tcp_listener *l);
+bool tcp_listener_ready(struct tcp_listener *l);
+int tcp_poll(struct tcp_conn *c);           /* POLLIN/POLLOUT/POLLHUP/POLLERR */
+int tcp_error(struct tcp_conn *c);
+bool tcp_connecting(struct tcp_conn *c);
+void tcp_endpoints(struct tcp_conn *c, uint32_t *lip, uint16_t *lport, uint32_t *rip, uint16_t *rport);
+void tcp_shutdown_write(struct tcp_conn *c);
 struct tcp_conn_info { uint32_t lip, rip; uint16_t lport, rport; const char *state; uint32_t rx_queued, tx_queued; };
 int tcp_list(struct tcp_conn_info *out, int max);
 
 /* DHCP / DNS */
 int dhcp_configure(struct netif *n, int timeout_ms);   /* blocking; 0 on success */
-void dhcp_start(struct netif *n);                      /* in a background thread */
+void dhcp_start(struct netif *n);                      /* in a background thread, which then keeps the lease */
+void dhcp_stop(struct netif *n);                       /* stop renewing (a static address was set) */
 int dns_resolve(const char *name, uint32_t *ip, int timeout_ms, volatile bool *cancel);
 void dns_flush(void);
+
+/* SNTP (RFC 4330) */
+/* queries server (0: the DHCP-supplied one, else pool.ntp.org) and sets the clock; returns the
+ * correction applied in ms, or -errno in *err */
+int64_t sntp_sync(uint32_t server, int timeout_ms, int *err);
+void sntp_start(void);                                 /* background thread: syncs now and every few hours */
+extern bool sntp_enabled;                              /* Settings: set the time automatically */
+extern uint64_t sntp_last_sync;                        /* time_unix() of the last successful sync (0 = never) */
+extern char sntp_last_server[64];
 
 /* HTTP client */
 struct http_response {

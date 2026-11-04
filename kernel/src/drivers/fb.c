@@ -84,7 +84,7 @@ static const void *tar_find(const char *name, size_t *size) {
 }
 
 static struct canvas *splash_logo;
-static struct font *splash_font;
+static struct font *splash_font, *splash_mono;
 static int splash_y;
 
 void fb_boot_splash(void) {
@@ -92,6 +92,7 @@ void fb_boot_splash(void) {
     size_t sz; const void *d;
     if ((d = tar_find("sys/icons/logo-256.img", &sz))) splash_logo = image_from_memory(d, sz);
     if ((d = tar_find("sys/fonts/inter-regular-13.fnt", &sz))) splash_font = font_from_memory(d, sz);
+    if ((d = tar_find("sys/fonts/scp-regular-14.fnt", &sz))) splash_mono = font_from_memory(d, sz);   /* the panic screen's log */
     int lw = 120;
     if (splash_logo) gfx_blit_scaled_tinted(screen, (fbw - lw) / 2, fbh / 2 - lw / 2 - 40, lw, lw, splash_logo, RGB(255, 255, 255));
     splash_y = fbh / 2 + lw / 2 - 20;
@@ -99,6 +100,8 @@ void fb_boot_splash(void) {
     gfx_fill_rounded_rect(screen, fbw / 2 - 90, splash_y, 180, 6, 3, RGB(0x3a, 0x3a, 0x40));
     fb_flush_all();
 }
+
+struct font *fb_panic_font(bool mono) { return mono && splash_mono ? splash_mono : splash_font; }
 
 /* replaces the progress bar with an error, for failures that stop the boot */
 void fb_boot_error(const char *msg) {

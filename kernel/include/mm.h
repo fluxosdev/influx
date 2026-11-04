@@ -9,6 +9,9 @@ uint64_t pmm_alloc_page(void);
 uint64_t pmm_alloc_pages_low(size_t count); /* below 4 GiB, zeroed; 0 if none */
 void pmm_free_pages(uint64_t phys, size_t count);
 void pmm_free_page(uint64_t phys);
+void pmm_page_ref(uint64_t phys);           /* one more mapping of a user page */
+void pmm_page_unref(uint64_t phys);         /* one fewer; frees the page with its last mapping */
+bool pmm_page_shared(uint64_t phys);        /* mapped more than once (copy-on-write) */
 uint64_t pmm_total_bytes(void);
 uint64_t pmm_free_bytes(void);
 uint64_t pmm_used_bytes(void);
@@ -21,6 +24,8 @@ uint64_t pmm_used_bytes(void);
 #define PTE_PCD      (1ULL << 4)
 #define PTE_HUGE     (1ULL << 7)
 #define PTE_GLOBAL   (1ULL << 8)
+#define PTE_COW      (1ULL << 9)    /* software: write fault copies the page */
+#define PTE_SPECIAL  (1ULL << 10)   /* software: not a refcounted RAM page (device memory) */
 #define PTE_NX       (1ULL << 63)
 #define PTE_ADDR_MASK 0x000ffffffffff000ULL
 

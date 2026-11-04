@@ -129,12 +129,13 @@ uint64_t vmm_new_pml4(void) {
     return p;
 }
 
+/* user half only: leaf pages may be shared copy-on-write (pmm refcounts) or device memory */
 static void free_level(uint64_t table, int level) {
     uint64_t *t = table_of(table);
     for (int i = 0; i < 512; i++) {
         if (!(t[i] & PTE_PRESENT)) continue;
         if (level > 0 && !(t[i] & PTE_HUGE)) free_level(t[i] & PTE_ADDR_MASK, level - 1);
-        else pmm_free_page(t[i] & PTE_ADDR_MASK);
+        else if (!(t[i] & PTE_SPECIAL)) pmm_page_unref(t[i] & PTE_ADDR_MASK);
     }
     pmm_free_page(table);
 }

@@ -190,6 +190,7 @@ static void mouse_up(struct player *p, int x, int y) {
     if (p->pressed == 1 && rect_contains(play_rect(), x, y)) { if (p->playing) stop(p); else start(p); }
     else if (p->pressed == 2 && rect_contains(stop_rect(), x, y)) { stop(p); p->pos = 0; }
     else if (p->drag == DRAG_SEEK) { struct rect tr = track_rect(); seek(p, (int64_t)CLAMP(x - tr.x, 0, tr.w) * p->wav.frames / tr.w); }
+    else if (p->drag == DRAG_VOLUME) prefs_save();
     p->pressed = 0; p->drag = DRAG_NONE;
 }
 
@@ -200,8 +201,8 @@ static void command(struct player *p, int cmd) {
     case PCMD_STOP: stop(p); p->pos = 0; break;
     case PCMD_BACK: seek(p, (int64_t)p->pos - step); break;
     case PCMD_FWD: seek(p, (int64_t)p->pos + step); break;
-    case PCMD_VOLUP: audio_set_volume(audio_volume() + 5); break;
-    case PCMD_VOLDOWN: audio_set_volume(audio_volume() - 5); break;
+    case PCMD_VOLUP: audio_set_volume(audio_volume() + 5); prefs_save(); break;
+    case PCMD_VOLDOWN: audio_set_volume(audio_volume() - 5); prefs_save(); break;
     }
 }
 

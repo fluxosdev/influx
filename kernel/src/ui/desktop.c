@@ -5,6 +5,14 @@
 
 void power_button_pressed(void);
 
+static void crash_notice(void *arg) {
+    thread_sleep_ms(1500);
+    char msg[PATH_MAX + 160];
+    const char *name = strrchr(crashlog_previous, '/');
+    snprintf(msg, sizeof msg, "inFlux restarted because of a kernel panic. The report, \"%s\", is in the Crash Reports folder of your home folder.", name ? name + 1 : crashlog_previous);
+    dialog_message("Your computer was restarted because of a problem", msg);
+}
+
 void desktop_main(void *arg) {
     fb_boot_progress("Loading fonts");
     fonts_init();
@@ -18,6 +26,7 @@ void desktop_main(void *arg) {
     acpi_set_power_button_handler(power_button_pressed);
     fb_boot_progress("Starting Files");
     app_launch(APP_FILES, NULL);
+    if (crashlog_previous[0]) thread_create(kernel_process, "crash-notice", crash_notice, NULL);
     thread_sleep_ms(50);
     current_thread->proc->name[0] = 0; strcpy(current_thread->proc->name, "kernel");
     strcpy(current_thread->name, "WindowServer");

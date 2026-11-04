@@ -247,6 +247,7 @@ void window_destroy(struct window *w) {
     canvas_destroy(w->canvas);
     w->canvas = NULL;
     mutex_unlock(&w->lock);
+    kfree(w->owned_menus);
     kfree(w);
     wm_notify_app_state();
 }
@@ -1001,6 +1002,7 @@ void wm_init(void) {
     scr_w = fb_width(); scr_h = fb_height();
     mouse_x = scr_w / 2; mouse_y = scr_h / 2;
     theme_apply(false, 0);
+    prefs_load();   /* saved appearance, wallpaper, clock and time zone */
     wallpaper_build();
     cursor_init();
     hw_cursor_init();

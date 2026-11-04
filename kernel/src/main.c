@@ -1,3 +1,4 @@
+#include "random.h"
 #include "kernel.h"
 #include "arch.h"
 #include "mm.h"
@@ -34,6 +35,22 @@ void storage_init(void);
 void net_init(void);
 void fb_boot_progress(const char *msg);
 
+/* boot option 'selftest' (CI): run /bin/systest with its output on the serial port, then power off */
+static void selftest_thread(void *arg) {
+    thread_sleep_ms(kernel_cmdline_has("selftest-net") ? 8000 : 500);   /* DHCP first for the network checks */
+    struct file *con;
+    if (vfs_open("/dev/console", O_RDWR, &con) < 0) return;
+    struct file *stdio[3] = { con, con, con };
+    char *argv[] = { "systest", kernel_cmdline_has("selftest-net") ? "net" : NULL, NULL };
+    int pid = process_spawn("/bin/systest", argv[1] ? 2 : 1, argv, stdio, "/");
+    int status = -1;
+    if (pid > 0) process_wait(pid, &status);
+    kprintf("SELFTEST: %s (status %d)\n", pid > 0 && status == 0 ? "PASSED" : "FAILED", pid > 0 ? status : pid);
+    vfs_close(con);
+    thread_sleep_ms(200);
+    acpi_shutdown();
+}
+
 static void init_thread(void *arg) {
     kprintf("init: running as thread %d\n", current_thread->tid);
     pci_init();
@@ -43,12 +60,16 @@ static void init_thread(void *arg) {
     drivers_init();
     storage_init();
     usb_init();              /* after the disks: a USB stick does not take /home from an installed disk */
+    crashlog_init();         /* the installed system's EFI partition is mounted by now */
     net_init();
     syscall_init();
+    vfs_mkdir("/tmp"); vfs_mkdir("/etc");
+    if (kernel_cmdline_has("selftest")) thread_create(kernel_process, "selftest", selftest_thread, NULL);
     desktop_main(NULL);
 }
 
 void syscall_init_cpu(void);
+void devices_init(void);
 
 void kmain(void) {
     percpu_init(&cpus[0], 0);   /* before anything reads current_thread */
@@ -86,9 +107,11 @@ void kmain(void) {
     pit_init();
     sched_init();
     timer_init();
+    random_init();
     sti();
     smp_init();
     vfs_init();
+    devices_init();
     if (boot_info.initrd) initrd_unpack(boot_info.initrd, boot_info.initrd_size, "/");
     /* the initrd module memory is bootloader-reclaimable; we copied it, leave it */
 

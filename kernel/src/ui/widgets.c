@@ -126,7 +126,7 @@ void textfield_draw(struct canvas *c, struct textfield *t, struct rect r) {
         gfx_fill_rect(&sub, sx - t->scroll, 2, ex - sx, r.h - 4, color_with_alpha(theme.accent, 0x60));
     }
     font_draw(&sub, font_ui, -t->scroll, ty, theme.text, t->buf);
-    if (t->focused && ((system_ticks / 500) & 1) == 0) gfx_fill_rect(&sub, cx - t->scroll, 4, 1, r.h - 8, theme.text);
+    if (t->focused && ((time_ms() / 500) & 1) == 0) gfx_fill_rect(&sub, cx - t->scroll, 4, 1, r.h - 8, theme.text);
 }
 
 bool textfield_key(struct textfield *t, const struct event *ev) {

@@ -54,6 +54,7 @@ void net_init(void) {
     if (!nifaces) { kprintf("net: no network adapters found\n"); return; }
     thread_create(kernel_process, "net", net_thread, NULL);
     for (int i = 0; i < nifaces; i++) dhcp_start(ifaces[i]);
+    sntp_start();
 }
 
 /* ---- helpers ---- */

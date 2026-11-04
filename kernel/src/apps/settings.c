@@ -6,6 +6,7 @@
 #include "gpu.h"
 #include "installer.h"
 #include "simd.h"
+#include "net.h"
 
 #define SIDEBAR_W 200
 enum { PANE_GENERAL, PANE_APPEARANCE, PANE_WALLPAPER, PANE_DISPLAYS, PANE_DATETIME, PANE_STORAGE, PANE_ABOUT, NPANES };
@@ -293,7 +294,17 @@ static void draw(struct settings *s) {
         int64_t off = tz_offset_minutes; snprintf(buf, sizeof buf, "UTC%s%02ld:%02ld", off < 0 ? "−" : "+", (off < 0 ? -off : off) / 60, (off < 0 ? -off : off) % 60);
         font_draw_centered(c, font_ui, rect_make(cx + cw - 16 - 146, cy + 100, 110, 26), theme.text, buf);
         ui_button(c, rect_make(cx + cw - 16 - 30, cy + 100, 30, 26), "+", BTN_NORMAL, s->pressed == 3, true);
-        font_draw(c, font_ui_small, cx, cy + 156, theme.text_secondary, "The hardware clock is read at boot and assumed to be in UTC.");
+        ui_panel(c, rect_make(cx, cy + 156, cw, 60), theme.bg_secondary);
+        font_draw(c, font_ui_semibold, cx + 16, cy + 166, theme.text, "Set time automatically");
+        if (!sntp_enabled) snprintf(buf, sizeof buf, "Off: the clock keeps the hardware clock's time.");
+        else if (!sntp_last_sync) snprintf(buf, sizeof buf, "Waiting for a network connection to reach a time server.");
+        else {
+            struct rtc_time ls; unix_to_datetime(sntp_last_sync + tz_offset_minutes * 60, &ls);
+            snprintf(buf, sizeof buf, "Last synchronised with %s at %02d:%02d.", sntp_last_server, ls.hour, ls.minute);
+        }
+        font_draw(c, font_ui_small, cx + 16, cy + 188, theme.text_secondary, buf);
+        ui_switch(c, cx + cw - 16 - 38, cy + 175, sntp_enabled);
+        font_draw(c, font_ui_small, cx, cy + 228, theme.text_secondary, "The hardware clock is kept in UTC; it is set whenever the time is synchronised.");
         break; }
     case PANE_STORAGE: {
         int sy = cy;
@@ -347,13 +358,13 @@ static void click(struct settings *s, int x, int y) {
         if (rect_contains(rect_make(cx + cw - 16 - 90, cy + 92, 90, 26), x, y)) s->pressed = 1;
         break;
     case PANE_APPEARANCE:
-        if (rect_contains(rect_make(cx, cy + 24, 120, 80), x, y)) { theme_apply(false, theme.accent_index); wm_theme_changed(); }
-        if (rect_contains(rect_make(cx + 140, cy + 24, 120, 80), x, y)) { theme_apply(true, theme.accent_index); wm_theme_changed(); }
-        for (int i = 0; i < 8; i++) if (rect_contains(rect_make(cx + i * 30, cy + 172, 22, 22), x, y)) { theme_apply(theme.dark, i); wm_theme_changed(); }
-        if (rect_contains(rect_make(cx + 200, cy + 210, 40, 24), x, y)) { clock_24h = !clock_24h; wm_dirty_all(); }
+        if (rect_contains(rect_make(cx, cy + 24, 120, 80), x, y)) { theme_apply(false, theme.accent_index); wm_theme_changed(); prefs_save(); }
+        if (rect_contains(rect_make(cx + 140, cy + 24, 120, 80), x, y)) { theme_apply(true, theme.accent_index); wm_theme_changed(); prefs_save(); }
+        for (int i = 0; i < 8; i++) if (rect_contains(rect_make(cx + i * 30, cy + 172, 22, 22), x, y)) { theme_apply(theme.dark, i); wm_theme_changed(); prefs_save(); }
+        if (rect_contains(rect_make(cx + 200, cy + 210, 40, 24), x, y)) { clock_24h = !clock_24h; wm_dirty_all(); prefs_save(); }
         break;
     case PANE_WALLPAPER:
-        for (size_t i = 0; i < ARRAY_LEN(wallpapers); i++) { int wx = cx + (i % 4) * 130, wy = cy + 30 + (i / 4) * 110; if (rect_contains(rect_make(wx, wy, 120, 80), x, y)) { theme_set_wallpaper(wallpapers[i].top, wallpapers[i].bottom); wm_theme_changed(); } }
+        for (size_t i = 0; i < ARRAY_LEN(wallpapers); i++) { int wx = cx + (i % 4) * 130, wy = cy + 30 + (i / 4) * 110; if (rect_contains(rect_make(wx, wy, 120, 80), x, y)) { theme_set_wallpaper(wallpapers[i].top, wallpapers[i].bottom); wm_theme_changed(); prefs_save(); } }
         break;
     case PANE_DISPLAYS: {
         struct disp_layout L; displays_layout(s, &L);
@@ -372,6 +383,7 @@ static void click(struct settings *s, int x, int y) {
     case PANE_DATETIME:
         if (rect_contains(rect_make(cx + cw - 16 - 180, cy + 100, 30, 26), x, y)) s->pressed = 2;
         if (rect_contains(rect_make(cx + cw - 16 - 30, cy + 100, 30, 26), x, y)) s->pressed = 3;
+        if (rect_contains(rect_make(cx + cw - 16 - 38, cy + 175, 38, 22), x, y)) { sntp_enabled = !sntp_enabled; prefs_save(); wm_dirty_all(); }
         break;
     }
 }
@@ -384,9 +396,9 @@ static void release(struct settings *s, int x, int y) {
         else if (p == DPRESS_REVERT && rect_contains(L.revert, x, y)) disp_revert(s, false);
         return;
     }
-    if (s->pressed == 1 && rect_contains(rect_make(cx + cw - 16 - 90, cy + 92, 90, 26), x, y)) { strlcpy(system_hostname, s->hostname.buf, sizeof system_hostname); }
-    if (s->pressed == 2 && rect_contains(rect_make(cx + cw - 16 - 180, cy + 100, 30, 26), x, y)) { tz_offset_minutes -= 30; if (tz_offset_minutes < -12 * 60) tz_offset_minutes = -12 * 60; wm_dirty_all(); }
-    if (s->pressed == 3 && rect_contains(rect_make(cx + cw - 16 - 30, cy + 100, 30, 26), x, y)) { tz_offset_minutes += 30; if (tz_offset_minutes > 14 * 60) tz_offset_minutes = 14 * 60; wm_dirty_all(); }
+    if (s->pressed == 1 && rect_contains(rect_make(cx + cw - 16 - 90, cy + 92, 90, 26), x, y)) { strlcpy(system_hostname, s->hostname.buf, sizeof system_hostname); prefs_save(); }
+    if (s->pressed == 2 && rect_contains(rect_make(cx + cw - 16 - 180, cy + 100, 30, 26), x, y)) { tz_offset_minutes -= 30; if (tz_offset_minutes < -12 * 60) tz_offset_minutes = -12 * 60; wm_dirty_all(); prefs_save(); }
+    if (s->pressed == 3 && rect_contains(rect_make(cx + cw - 16 - 30, cy + 100, 30, 26), x, y)) { tz_offset_minutes += 30; if (tz_offset_minutes > 14 * 60) tz_offset_minutes = 14 * 60; wm_dirty_all(); prefs_save(); }
     s->pressed = 0;
 }
 

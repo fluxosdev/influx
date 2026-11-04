@@ -3,16 +3,20 @@
  * RFC 6298 timers and Karn's rule, slow start / congestion avoidance,
  * zero-window probing, orderly release and TIME_WAIT. Segments that arrive
  * after a hole are kept (up to TCP_OOO_MAX) and acknowledged with duplicate
- * ACKs so the sender fast-retransmits the missing one; there is no listening
- * side (the stack is a client).
+ * ACKs so the sender fast-retransmits the missing one. Listening sockets
+ * answer a SYN with a connection in SYN_RECEIVED, which joins the
+ * listener's accept queue once the handshake completes.
  */
 #include "net.h"
 #include "net_internal.h"
 #include "mm.h"
 #include "string.h"
+#include "fs.h"
+#include "signal.h"
+#include "random.h"
 
-enum tcp_state { TCP_CLOSED, TCP_SYN_SENT, TCP_ESTABLISHED, TCP_FIN_WAIT_1, TCP_FIN_WAIT_2, TCP_CLOSING, TCP_TIME_WAIT, TCP_CLOSE_WAIT, TCP_LAST_ACK };
-static const char *state_names[] = { "CLOSED", "SYN_SENT", "ESTABLISHED", "FIN_WAIT_1", "FIN_WAIT_2", "CLOSING", "TIME_WAIT", "CLOSE_WAIT", "LAST_ACK" };
+enum tcp_state { TCP_CLOSED, TCP_SYN_SENT, TCP_ESTABLISHED, TCP_FIN_WAIT_1, TCP_FIN_WAIT_2, TCP_CLOSING, TCP_TIME_WAIT, TCP_CLOSE_WAIT, TCP_LAST_ACK, TCP_SYN_RCVD };
+static const char *state_names[] = { "CLOSED", "SYN_SENT", "ESTABLISHED", "FIN_WAIT_1", "FIN_WAIT_2", "CLOSING", "TIME_WAIT", "CLOSE_WAIT", "LAST_ACK", "SYN_RECEIVED" };
 
 #define TCP_MSS        1460
 #define TCP_RBUF       65535
@@ -59,13 +63,24 @@ struct tcp_conn {
     int err;
     bool app_closed;
     struct semaphore sem;
+    struct tcp_listener *listener;   /* SYN_RECEIVED: where it goes once established */
 };
+
+#define LISTEN_QUEUE_MAX 32
+struct tcp_listener {
+    uint32_t ip; uint16_t port;      /* ip 0: any address */
+    int backlog;
+    struct tcp_conn *queue[LISTEN_QUEUE_MAX]; int qlen;   /* established, not yet accepted */
+    int pending;                     /* in SYN_RECEIVED */
+    struct semaphore sem;
+};
+static struct tcp_listener *listeners[16];
 
 static struct tcp_conn *conns[64];
 static uint16_t next_port;
 
 static void set_state(struct tcp_conn *c, enum tcp_state s) { c->state = s; c->state_since = time_ms(); }
-static void wake(struct tcp_conn *c) { sem_post(&c->sem); }
+static void wake(struct tcp_conn *c) { sem_post(&c->sem); poll_notify(); }
 static size_t rwnd(struct tcp_conn *c) { return c->app_closed ? c->rcv_wnd_max : MIN((size_t)c->rcv_wnd_max, TCP_RBUF - c->rlen); }
 
 static struct tcp_conn *lookup(uint32_t rip, uint16_t rport, uint32_t lip, uint16_t lport) {
@@ -206,6 +221,58 @@ static void parse_options(struct tcp_conn *c, const uint8_t *o, size_t len) {
     }
 }
 
+static struct tcp_conn *conn_alloc(struct netif *n) {
+    int slot = -1;
+    for (size_t i = 0; i < ARRAY_LEN(conns); i++) if (!conns[i]) { slot = i; break; }
+    if (slot < 0) return NULL;
+    struct tcp_conn *c = kzalloc_try(sizeof *c);
+    if (c) { c->sbuf = kmalloc_try(TCP_SBUF); c->rbuf = kmalloc_try(TCP_RBUF); }
+    if (!c || !c->sbuf || !c->rbuf) { if (c) { kfree(c->sbuf); kfree(c->rbuf); kfree(c); } return NULL; }
+    sem_init(&c->sem, 0);
+    c->rcv_wnd_max = n && n->rx_window ? MIN((uint32_t)TCP_RBUF, MAX(n->rx_window, (uint32_t)TCP_MSS)) : TCP_RBUF;
+    c->mss = 536; c->ssthresh = 65535; c->cwnd = 10 * TCP_MSS; c->rto = TCP_RTO_INIT;
+    c->iss = (uint32_t)(rdtsc() >> 4) ^ (uint32_t)random_u64();
+    conns[slot] = c;
+    return c;
+}
+
+static struct tcp_listener *find_listener(uint32_t ip, uint16_t port) {
+    for (size_t i = 0; i < ARRAY_LEN(listeners); i++) {
+        struct tcp_listener *l = listeners[i];
+        if (l && l->port == port && (!l->ip || l->ip == ip)) return l;
+    }
+    return NULL;
+}
+
+/* a SYN for a listening port: answer with SYN-ACK from a new connection in SYN_RECEIVED */
+static struct tcp_conn *passive_open(struct netif *n, uint32_t src, uint16_t sport, uint32_t dst, uint16_t dport, uint32_t seq, uint16_t win, const uint8_t *opt, size_t optlen) {
+    struct tcp_listener *l = find_listener(dst, dport);
+    if (!l) return NULL;
+    if (l->qlen + l->pending >= l->backlog) return (struct tcp_conn *)1;   /* full: drop, the peer retries */
+    struct tcp_conn *c = conn_alloc(n);
+    if (!c) return (struct tcp_conn *)1;
+    c->lip = dst; c->rip = src; c->lport = dport; c->rport = sport;
+    c->rcv_nxt = seq + 1;
+    c->snd_una = c->iss; c->snd_nxt = c->snd_max = c->iss + 1;
+    c->snd_wnd = win; c->snd_wl1 = seq;
+    parse_options(c, opt, optlen);
+    c->listener = l; l->pending++;
+    set_state(c, TCP_SYN_RCVD);
+    c->rtt_active = true; c->rtt_start = time_ms();
+    send_ctl(c, c->iss, TCP_SYN | TCP_ACK);
+    arm_rto(c);
+    return c;
+}
+static void listener_drop(struct tcp_conn *c) { if (c->listener) { c->listener->pending--; c->listener = NULL; } }
+static void listener_established(struct tcp_conn *c) {
+    struct tcp_listener *l = c->listener;
+    if (!l) return;
+    l->pending--;
+    c->listener = NULL;
+    if (l->qlen < LISTEN_QUEUE_MAX) { l->queue[l->qlen++] = c; sem_post(&l->sem); poll_notify(); }
+    else { send_ctl(c, c->snd_nxt, TCP_RST | TCP_ACK); set_state(c, TCP_CLOSED); c->app_closed = true; }
+}
+
 void tcp_input(struct netif *n, uint32_t src, uint32_t dst, const uint8_t *pkt, size_t len) {
     if (len < sizeof(struct tcp_hdr)) return;
     if (net_checksum(pkt, len, ip_pseudo_sum(src, dst, IP_PROTO_TCP, len)) != 0) { n->rx_errors++; return; }
@@ -219,6 +286,9 @@ void tcp_input(struct netif *n, uint32_t src, uint32_t dst, const uint8_t *pkt, 
     uint16_t win = ntohs(h->win);
 
     struct tcp_conn *c = lookup(src, ntohs(h->sport), dst, ntohs(h->dport));
+    if (!c && (flags & TCP_SYN) && !(flags & (TCP_ACK | TCP_RST))) {
+        if (passive_open(n, src, ntohs(h->sport), dst, ntohs(h->dport), seq, win, pkt + sizeof *h, hl - sizeof *h)) return;
+    }
     if (!c) {
         /* nobody here: reset the sender (never answer a reset) */
         if (flags & TCP_RST) return;
@@ -245,6 +315,18 @@ void tcp_input(struct netif *n, uint32_t src, uint32_t dst, const uint8_t *pkt, 
         return;
     }
 
+    if (c->state == TCP_SYN_RCVD) {
+        if (flags & TCP_RST) { listener_drop(c); set_state(c, TCP_CLOSED); c->app_closed = true; return; }
+        if (flags & TCP_SYN) { send_ctl(c, c->iss, TCP_SYN | TCP_ACK); return; }   /* our SYN-ACK was lost */
+        if (!(flags & TCP_ACK) || ack != c->iss + 1) return;
+        c->snd_una = ack;
+        c->snd_wnd = win; c->snd_wl1 = seq; c->snd_wl2 = ack;
+        c->rto_at = 0; c->retries = 0;
+        if (c->rtt_active) { rtt_sample(c, (int)(time_ms() - c->rtt_start)); c->rtt_active = false; }
+        set_state(c, TCP_ESTABLISHED);
+        listener_established(c);
+        /* the ACK may carry data: carry on below */
+    }
     if (flags & TCP_RST) {
         if (SEQ_LEQ(c->rcv_nxt, seq) && SEQ_LT(seq, c->rcv_nxt + TCP_RBUF)) conn_fail(c, ECONNRESET);
         return;
@@ -345,10 +427,14 @@ void tcp_timer(void) {
         if (c->state == TCP_FIN_WAIT_2 && c->app_closed && now - c->state_since >= TCP_FIN_WAIT_2_MS) { set_state(c, TCP_CLOSED); continue; }
         if (c->rto_at && now >= c->rto_at) {
             c->rto_at = 0;
-            if (++c->retries > (c->state == TCP_SYN_SENT ? TCP_SYN_RETRIES : TCP_MAX_RETRIES)) { conn_fail(c, ETIMEDOUT); continue; }
+            if (++c->retries > (c->state == TCP_SYN_SENT || c->state == TCP_SYN_RCVD ? TCP_SYN_RETRIES : TCP_MAX_RETRIES)) {
+                if (c->state == TCP_SYN_RCVD) { listener_drop(c); c->app_closed = true; }
+                conn_fail(c, ETIMEDOUT); continue;
+            }
             c->rto = MIN(c->rto * 2, TCP_RTO_MAX);
             c->rtt_active = false;   /* Karn: no samples from retransmitted data (tcp_output re-arms only on new data) */
             if (c->state == TCP_SYN_SENT) { send_ctl(c, c->iss, TCP_SYN); arm_rto(c); continue; }
+            if (c->state == TCP_SYN_RCVD) { send_ctl(c, c->iss, TCP_SYN | TCP_ACK); arm_rto(c); continue; }
             uint32_t flight = c->snd_nxt - c->snd_una;
             c->ssthresh = MAX(flight / 2, 2u * c->mss);
             c->cwnd = c->mss;
@@ -362,45 +448,42 @@ void tcp_timer(void) {
     }
 }
 
-struct tcp_conn *tcp_connect(uint32_t ip, uint16_t port, int timeout_ms, volatile bool *cancel, int *err) {
-    *err = 0;
-    mutex_lock(&net_lock);
-    uint32_t hop;
-    struct netif *n = ip_route(ip, &hop);
-    if (!n || (ip >> 24) == 127 || ip == 0) { mutex_unlock(&net_lock); *err = ENETUNREACH; return NULL; }
-    int slot = -1;
-    for (size_t i = 0; i < ARRAY_LEN(conns); i++) if (!conns[i]) { slot = i; break; }
-    if (slot < 0) { mutex_unlock(&net_lock); *err = EBUSY; return NULL; }
-    struct tcp_conn *c = kzalloc_try(sizeof *c);
-    if (c) { c->sbuf = kmalloc_try(TCP_SBUF); c->rbuf = kmalloc_try(TCP_RBUF); }
-    if (!c || !c->sbuf || !c->rbuf) {
-        if (c) { kfree(c->sbuf); kfree(c->rbuf); kfree(c); }
-        mutex_unlock(&net_lock); *err = ENOMEM; return NULL;
-    }
-    sem_init(&c->sem, 0);
-    c->lip = n->ip; c->rip = ip; c->rport = port;
-    c->rcv_wnd_max = n->rx_window ? MIN((uint32_t)TCP_RBUF, MAX(n->rx_window, (uint32_t)TCP_MSS)) : TCP_RBUF;
+static uint16_t ephemeral_port(void) {
     if (!next_port) next_port = 49152 + (uint16_t)(rdtsc() % 16000);
     for (int tries = 0; tries < 16384; tries++) {
         uint16_t p = next_port++;
         if (next_port < 49152) next_port = 49152;
         bool used = false;
         for (size_t i = 0; i < ARRAY_LEN(conns); i++) if (conns[i] && conns[i]->lport == p) used = true;
-        if (!used) { c->lport = p; break; }
+        for (size_t i = 0; i < ARRAY_LEN(listeners); i++) if (listeners[i] && listeners[i]->port == p) used = true;
+        if (!used) return p;
     }
-    c->iss = (uint32_t)(rdtsc() >> 4);
+    return 0;
+}
+
+/* sends the SYN and returns at once; the connection reports its outcome through tcp_poll */
+struct tcp_conn *tcp_connect_start(uint32_t ip, uint16_t port, uint16_t lport, int *err) {
+    *err = 0;
+    mutex_lock(&net_lock);
+    uint32_t hop;
+    struct netif *n = ip_route(ip, &hop);
+    if (!n || (ip >> 24) == 127 || ip == 0) { mutex_unlock(&net_lock); *err = ENETUNREACH; return NULL; }
+    struct tcp_conn *c = conn_alloc(n);
+    if (!c) { mutex_unlock(&net_lock); *err = ENOMEM; return NULL; }
+    c->lip = n->ip; c->rip = ip; c->rport = port;
+    c->lport = lport ? lport : ephemeral_port();
     c->snd_una = c->iss; c->snd_nxt = c->snd_max = c->iss + 1;
-    c->mss = 536;
-    c->ssthresh = 65535;
-    c->cwnd = 10 * TCP_MSS;
-    c->rto = TCP_RTO_INIT;
-    conns[slot] = c;
     set_state(c, TCP_SYN_SENT);
     c->rtt_active = true; c->rtt_start = time_ms();
     send_ctl(c, c->iss, TCP_SYN);
     arm_rto(c);
     mutex_unlock(&net_lock);
+    return c;
+}
 
+struct tcp_conn *tcp_connect(uint32_t ip, uint16_t port, int timeout_ms, volatile bool *cancel, int *err) {
+    struct tcp_conn *c = tcp_connect_start(ip, port, 0, err);
+    if (!c) return NULL;
     uint64_t deadline = time_ms() + timeout_ms;
     for (;;) {
         mutex_lock(&net_lock);
@@ -409,7 +492,8 @@ struct tcp_conn *tcp_connect(uint32_t ip, uint16_t port, int timeout_ms, volatil
         if (s == TCP_ESTABLISHED || s == TCP_CLOSE_WAIT) return c;
         int fail = 0;
         if (s == TCP_CLOSED) fail = e ? e : ECONNRESET;
-        else if (cancel && *cancel) fail = ECANCELED;
+        else if ((cancel && *cancel) || thread_should_exit()) fail = ECANCELED;
+        else if (signal_interrupted()) fail = EINTR;
         else if (time_ms() >= deadline) fail = ETIMEDOUT;
         if (fail) { tcp_abort(c); *err = fail; return NULL; }
         sem_wait_timeout(&c->sem, MIN(100, deadline - time_ms() + 1));
@@ -439,7 +523,9 @@ int64_t tcp_send(struct tcp_conn *c, const void *data, size_t len, int timeout_m
         uint64_t now = time_ms();
         if (n) { deadline = now + (timeout_ms < 0 ? 0 : timeout_ms); continue; }
         if ((cancel && *cancel) || thread_should_exit()) return -ECANCELED;
-        if (timeout_ms >= 0 && now >= deadline) return -ETIMEDOUT;
+        if (signal_interrupted()) return done ? (int64_t)done : -ERESTARTSYS;
+        if (timeout_ms == 0) return done ? (int64_t)done : -EAGAIN;
+        if (timeout_ms >= 0 && now >= deadline) return done ? (int64_t)done : -ETIMEDOUT;
         sem_wait_timeout(&c->sem, timeout_ms >= 0 ? MIN(100, deadline - now) : 100);
     }
     return done;
@@ -466,6 +552,8 @@ int64_t tcp_recv(struct tcp_conn *c, void *buf, size_t len, int timeout_ms, vola
         if (e) return -e;
         if (eof) return 0;
         if ((cancel && *cancel) || thread_should_exit()) return -ECANCELED;
+        if (signal_interrupted()) return -ERESTARTSYS;
+        if (timeout_ms == 0) return -EAGAIN;
         uint64_t now = time_ms();
         if (timeout_ms >= 0 && now >= deadline) return -ETIMEDOUT;
         sem_wait_timeout(&c->sem, timeout_ms >= 0 ? MIN(100, deadline - now) : 100);
@@ -505,4 +593,81 @@ int tcp_list(struct tcp_conn_info *out, int max) {
     }
     mutex_unlock(&net_lock);
     return k;
+}
+
+/* ---- listening and polling (sockets) ---- */
+struct tcp_listener *tcp_listen(uint32_t ip, uint16_t port, int backlog, int *err) {
+    mutex_lock(&net_lock);
+    *err = 0;
+    if (!port) port = ephemeral_port();
+    if (find_listener(ip, port)) { mutex_unlock(&net_lock); *err = EADDRINUSE; return NULL; }
+    int slot = -1;
+    for (size_t i = 0; i < ARRAY_LEN(listeners); i++) if (!listeners[i]) { slot = i; break; }
+    struct tcp_listener *l = slot >= 0 ? kzalloc_try(sizeof *l) : NULL;
+    if (!l) { mutex_unlock(&net_lock); *err = slot < 0 ? EBUSY : ENOMEM; return NULL; }
+    l->ip = ip; l->port = port; l->backlog = CLAMP(backlog, 1, LISTEN_QUEUE_MAX);
+    sem_init(&l->sem, 0);
+    listeners[slot] = l;
+    mutex_unlock(&net_lock);
+    return l;
+}
+uint16_t tcp_listener_port(struct tcp_listener *l) { return l->port; }
+
+/* timeout_ms 0: don't wait; < 0: no limit */
+struct tcp_conn *tcp_accept(struct tcp_listener *l, int timeout_ms, int *err) {
+    uint64_t deadline = time_ms() + (timeout_ms < 0 ? 0 : timeout_ms);
+    for (;;) {
+        mutex_lock(&net_lock);
+        if (l->qlen) {
+            struct tcp_conn *c = l->queue[0];
+            memmove(l->queue, l->queue + 1, (size_t)(--l->qlen) * sizeof l->queue[0]);
+            mutex_unlock(&net_lock);
+            *err = 0;
+            return c;
+        }
+        mutex_unlock(&net_lock);
+        if (thread_should_exit()) { *err = ECANCELED; return NULL; }
+        if (signal_interrupted()) { *err = ERESTARTSYS; return NULL; }
+        if (timeout_ms == 0) { *err = EAGAIN; return NULL; }
+        uint64_t now = time_ms();
+        if (timeout_ms > 0 && now >= deadline) { *err = ETIMEDOUT; return NULL; }
+        sem_wait_timeout(&l->sem, timeout_ms > 0 ? MIN(100, deadline - now) : 100);
+    }
+}
+
+void tcp_unlisten(struct tcp_listener *l) {
+    mutex_lock(&net_lock);
+    for (size_t i = 0; i < ARRAY_LEN(listeners); i++) if (listeners[i] == l) listeners[i] = NULL;
+    for (int i = 0; i < l->qlen; i++) {   /* reset what was never accepted */
+        struct tcp_conn *c = l->queue[i];
+        send_segment(c->lip, c->rip, c->lport, c->rport, c->snd_nxt, c->rcv_nxt, TCP_RST | TCP_ACK, 0, NULL, 0, 0);
+        c->app_closed = true; set_state(c, TCP_CLOSED);
+    }
+    for (size_t i = 0; i < ARRAY_LEN(conns); i++) if (conns[i] && conns[i]->listener == l) conns[i]->listener = NULL;
+    mutex_unlock(&net_lock);
+    kfree(l);
+}
+bool tcp_listener_ready(struct tcp_listener *l) { return l->qlen > 0; }
+
+/* POLLIN / POLLOUT / POLLHUP / POLLERR for a connection */
+int tcp_poll(struct tcp_conn *c) {
+    mutex_lock(&net_lock);
+    int r = 0;
+    if (c->rlen || c->rx_fin) r |= POLLIN | POLLRDNORM;
+    if ((c->state == TCP_ESTABLISHED || c->state == TCP_CLOSE_WAIT) && !c->fin_queued && c->slen < TCP_SBUF) r |= POLLOUT | POLLWRNORM;
+    if (c->state == TCP_CLOSED) r |= POLLHUP | POLLIN | (c->err ? POLLERR : 0);
+    if (c->rx_fin && c->fin_queued) r |= POLLHUP;
+    mutex_unlock(&net_lock);
+    return r;
+}
+int tcp_error(struct tcp_conn *c) { return c->err; }
+bool tcp_connecting(struct tcp_conn *c) { return c->state == TCP_SYN_SENT; }
+void tcp_endpoints(struct tcp_conn *c, uint32_t *lip, uint16_t *lport, uint32_t *rip, uint16_t *rport) {
+    if (lip) *lip = c->lip; if (lport) *lport = c->lport; if (rip) *rip = c->rip; if (rport) *rport = c->rport;
+}
+/* shutdown(SHUT_WR): send our FIN, keep receiving */
+void tcp_shutdown_write(struct tcp_conn *c) {
+    mutex_lock(&net_lock);
+    if ((c->state == TCP_ESTABLISHED || c->state == TCP_CLOSE_WAIT) && !c->fin_queued) { c->fin_queued = true; tcp_output(c, false); }
+    mutex_unlock(&net_lock);
 }

@@ -1007,7 +1007,7 @@ static void paint_field(struct canvas *c, struct display_item *it, int y, struct
             }
         } else if (!shown[0] && ph) font_draw(&sub, font_ui, 0, (sub.h - font_height(font_ui)) / 2, RGB(0x9A, 0x9A, 0xA0), ph);
         else font_draw(&sub, font_ui, sx, (sub.h - font_height(font_ui)) / 2, text, shown);
-        if (focused && ((system_ticks / 500) & 1) == 0 && f->kind != FF_TEXTAREA) gfx_fill_rect(&sub, sx + tw + 1, 3, 1, sub.h - 6, text);
+        if (focused && ((time_ms() / 500) & 1) == 0 && f->kind != FF_TEXTAREA) gfx_fill_rect(&sub, sx + tw + 1, 3, 1, sub.h - 6, text);
         return; }
     }
 }

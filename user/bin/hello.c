@@ -1,6 +1,6 @@
 #include <stdio.h>
 #include <unistd.h>
-#include <influx.h>
+#include <sys/utsname.h>
 
 int main(int argc, char **argv) {
     struct utsname u; uname(&u);

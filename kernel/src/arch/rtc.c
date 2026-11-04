@@ -40,6 +40,28 @@ void rtc_read(struct rtc_time *t) {
     t->second = s; t->minute = m; t->hour = h; t->day = d; t->month = mo; t->year = 2000 + y;
 }
 
+static uint8_t to_bcd(int v) { return (uint8_t)(((v / 10) << 4) | (v % 10)); }
+
+void rtc_write(const struct rtc_time *t) {
+    if (t->year < 2000 || t->year > 2099) return;
+    uint8_t b = cmos_read(0x0B);
+    if (b == 0xFF) return;   /* no RTC */
+    bool is_bcd = !(b & 4), is_12h = !(b & 2);
+    int h = t->hour;
+    uint8_t hv;
+    if (is_12h) {
+        bool pm = h >= 12; int h12 = h % 12 ? h % 12 : 12;
+        hv = (uint8_t)((is_bcd ? to_bcd(h12) : h12) | (pm ? 0x80 : 0));
+    } else hv = (uint8_t)(is_bcd ? to_bcd(h) : h);
+#define V(x) ((uint8_t)(is_bcd ? to_bcd(x) : (x)))
+    cmos_write(0x0B, b | 0x80);   /* SET: halt updates while the fields change */
+    cmos_write(0x00, V(t->second)); cmos_write(0x02, V(t->minute)); cmos_write(0x04, hv);
+    cmos_write(0x07, V(t->day)); cmos_write(0x08, V(t->month)); cmos_write(0x09, V(t->year - 2000));
+    if (t->day >= 1 && t->month >= 1) cmos_write(0x06, (uint8_t)(day_of_week(t->year, t->month, t->day) + 1));
+#undef V
+    cmos_write(0x0B, b & ~0x80);
+}
+
 static int days_from_civil(int y, int m, int d) {
     y -= m <= 2;
     int era = (y >= 0 ? y : y - 399) / 400;

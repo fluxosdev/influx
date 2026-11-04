@@ -483,6 +483,26 @@ static int f_unlink(struct vnode *dirv, const char *name) {
     return r;
 }
 static int f_sync(struct vnode *v) { struct fnode *n = (struct fnode *)v; mutex_lock(&n->fs->lock); int r = fat_flush(n->fs); if (r == 0) r = blockdev_flush(n->fs->dev); mutex_unlock(&n->fs->lock); return r; }   /* FAT + dirents, then the disk's write cache */
+/* the disk ranges a file's clusters occupy, merged where contiguous (the crash log writes them
+ * directly); returns the count, or -1 when there are more than max */
+int fat32_extents(struct vnode *v, struct blockdev **dev, uint64_t *lba, uint32_t *count, int max) {
+    if (v->ops != &fat_ops) return -1;
+    struct fnode *n = (struct fnode *)v;
+    struct fat *f = n->fs;
+    mutex_lock(&f->lock);
+    int ne = 0;
+    uint32_t guard = 0;
+    for (uint32_t c = n->cluster; CLUS_OK(f, c) && guard < f->nclusters; c = fat_get(f, c), guard++) {
+        uint64_t l = cluster_lba(f, c);
+        if (ne && lba[ne - 1] + count[ne - 1] == l) count[ne - 1] += f->spc;
+        else if (ne == max) { ne = -1; break; }
+        else { lba[ne] = l; count[ne] = f->spc; ne++; }
+    }
+    mutex_unlock(&f->lock);
+    *dev = f->dev;
+    return ne;
+}
+
 static const struct vnode_ops fat_ops = { f_read, f_write, f_truncate, f_lookup, f_readdir, f_create, f_unlink, NULL, f_release, f_sync, f_append };
 
 struct vnode *fat32_mount(struct blockdev *d) {

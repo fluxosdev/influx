@@ -746,6 +746,7 @@ static int b_volume(struct ctx *c, int argc, char **argv) {
     if (argc > 1) {
         if (!isdigit(argv[1][0])) { cputs(c, "usage: volume [0-100]\n"); return 1; }
         audio_set_volume(atoi(argv[1]));
+        prefs_save();
     }
     cprintf(c, "%s\n%s\nvolume %d%%\n", d->name, d->detail, audio_volume());
     return 0;
@@ -768,6 +769,7 @@ static int b_ifconfig(struct ctx *c, int argc, char **argv) {
         mutex_lock(&net_lock);
         n->ip = ip; n->netmask = mask; n->gateway = gw; n->dns = dns ? dns : gw; n->configured = true; n->dhcp = false; n->up = true;
         mutex_unlock(&net_lock);
+        dhcp_stop(n);
         dns_flush();
         return 0;
     }
@@ -794,6 +796,30 @@ static int b_dhcp(struct ctx *c, int argc, char **argv) {
     if (r < 0) { eprintf(c, "dhcp: no lease (%s)\n", r == -ETIMEDOUT ? "no answer" : r == -ECONNREFUSED ? "refused" : "error"); return 1; }
     char ip[16], gw[16]; ip_to_str(n->ip, ip); ip_to_str(n->gateway, gw);
     cprintf(c, "%s: %s, gateway %s\n", n->name, ip, gw);
+    return 0;
+}
+static int b_dmesg(struct ctx *c, int argc, char **argv) {
+    size_t max = 128 * 1024;
+    char *buf = kmalloc(max + 1);
+    if (!buf) return 1;
+    size_t n = klog_snapshot(buf, max);
+    /* start at a line boundary once the ring has wrapped */
+    size_t s = 0;
+    if (n == max) { while (s < n && buf[s] != '\n') s++; if (s < n) s++; }
+    cwrite(c, buf + s, n - s);
+    kfree(buf);
+    return 0;
+}
+static int b_ntpdate(struct ctx *c, int argc, char **argv) {
+    uint32_t ip = 0;
+    if (argc > 1 && !str_to_ip(argv[1], &ip)) {
+        int r = dns_resolve(argv[1], &ip, 5000, NULL);
+        if (r < 0) { eprintf(c, "ntpdate: %s: host not found\n", argv[1]); return 1; }
+    }
+    int err;
+    int64_t ms = sntp_sync(ip, 6000, &err);
+    if (err) { eprintf(c, "ntpdate: %s\n", err == -ETIMEDOUT ? "no answer from the time server" : err == -EPROTO ? "the server is not synchronised" : "cannot reach a time server"); return 1; }
+    cprintf(c, "clock set from %s (corrected by %ld.%03ld s)\n", sntp_last_server, ms / 1000, (ms < 0 ? -ms : ms) % 1000);
     return 0;
 }
 static int b_ping(struct ctx *c, int argc, char **argv) {
@@ -1085,7 +1111,7 @@ static const struct builtin builtins[] = {
     { "acpi", b_acpi, "ACPI information, namespace dump and evaluation" }, { "alias", b_alias, "define or list aliases: alias ll='ls -l'" }, { "arp", b_arp, "show the ARP cache" }, { "basename", b_basename, "strip directory from a path" },
     { "cat", b_cat, "concatenate files (-n numbers lines)" }, { "cd", b_cd, "change directory (cd -, cd ~)" },
     { "clear", b_clear, "clear the screen" }, { "cp", b_cp, "copy files (-r for directories)" }, { "curl", b_curl, "fetch a URL over HTTP (-I headers, -i, -o file)" },
-    { "date", b_date, "show the current date and time" }, { "df", b_df, "show filesystem usage (-h)" }, { "dhcp", b_dhcp, "request an address for an adapter" },
+    { "date", b_date, "show the current date and time" }, { "df", b_df, "show filesystem usage (-h)" }, { "dmesg", b_dmesg, "print the kernel log" }, { "dhcp", b_dhcp, "request an address for an adapter" },
     { "dirname", b_dirname, "strip the last component from a path" }, { "display", b_display, "show or set the display resolution" }, { "du", b_du, "disk usage (-h)" },
     { "echo", b_echo, "print arguments (-n, -e)" }, { "env", b_env, "list environment variables" },
     { "exit", b_exit, "exit the shell" }, { "export", b_export, "set environment variables" },
@@ -1098,7 +1124,7 @@ static const struct builtin builtins[] = {
     { "ls", b_ls, "list directory contents (-l -a -h)" }, { "lsblk", b_lsblk, "list block devices" }, { "lsgpu", b_lsgpu, "show graphics adapters" },
     { "lspci", b_lspci, "list PCI devices" }, { "lsusb", b_lsusb, "list USB devices (-v: interfaces and endpoints)" }, { "mkdir", b_mkdir, "create directories (-p)" },
     { "mount", b_mount, "list mounted filesystems" }, { "mv", b_mv, "move or rename files" }, { "netstat", b_netstat, "list TCP connections" },
-    { "nproc", b_nproc, "number of processors" }, { "nslookup", b_nslookup, "query DNS for a host name" }, { "open", b_open, "open a file or folder in the desktop (-a App)" },
+    { "nproc", b_nproc, "number of processors" }, { "nslookup", b_nslookup, "query DNS for a host name" }, { "ntpdate", b_ntpdate, "set the clock from a time server (SNTP)" }, { "open", b_open, "open a file or folder in the desktop (-a App)" },
     { "ping", b_ping, "send ICMP echo requests (-c count)" }, { "play", b_play, "play WAV files (Ctrl+C stops)" }, { "printf", b_printf, "formatted output" }, { "ps", b_ps, "list processes (-T shows threads)" },
     { "pwd", b_pwd, "print the working directory" }, { "reboot", b_reboot, "restart the computer" },
     { "rev", b_rev, "reverse each line" }, { "rm", b_rm, "remove files (-r -f)" },
@@ -1236,6 +1262,7 @@ static int run_line(struct shell *sh, struct ctx *c, const char *line) {
         if (!skip && (st[0].argc || n > 1)) {
             sh->cancel = false;
             status = run_pipeline(sh, c, st, n, background);
+            if (sh->cancel && !background && status == 0) status = 130;   /* a builtin stopped by Ctrl+C, as zsh reports it */
             sh->last_status = status;
         }
         for (int k = 0; k < n; k++) { for (int a = 0; a < st[k].argc; a++) kfree(st[k].argv[a]); kfree(st[k].redir_out); kfree(st[k].redir_in); kfree(st[k].redir_err); }

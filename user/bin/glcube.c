@@ -21,9 +21,9 @@ static void cube(void) {
 
 int main(int argc, char **argv) {
     int win = win_create(W, H, "glcube (user mode)");
-    if (win < 0) { fprintf(2, "glcube: cannot create a window\n"); return 1; }
+    if (win < 0) { fprintf(stderr, "glcube: cannot create a window\n"); return 1; }
     GLcontext *gl = glxCreateContext(W, H);
-    if (!gl) { fprintf(2, "glcube: cannot create a GL context\n"); return 1; }
+    if (!gl) { fprintf(stderr, "glcube: cannot create a GL context\n"); return 1; }
     glxMakeCurrent(gl);
     printf("glcube: %s %s on %s\n", glGetString(GL_VENDOR), glGetString(GL_VERSION), glGetString(GL_RENDERER));
     float angle = 0; int frames = 0; long t0 = uptime_ms();
@@ -40,7 +40,7 @@ int main(int argc, char **argv) {
             glxDestroyContext(gl);
             GLcontext *n = glxCreateContext(rw, rh);
             if (n) { W = rw; H = rh; } else n = glxCreateContext(W, H);
-            if (!n) { fprintf(2, "glcube: out of memory for a %dx%d GL context\n", rw, rh); return 1; }
+            if (!n) { fprintf(stderr, "glcube: out of memory for a %dx%d GL context\n", rw, rh); return 1; }
             gl = n; glxMakeCurrent(gl);
         }
         glViewport(0, 0, W, H);
@@ -55,7 +55,7 @@ int main(int argc, char **argv) {
         win_present_size(win, glxGetPixels(gl), glxGetWidth(gl), glxGetHeight(gl));   /* the size of the buffer actually rendered */
         angle += 1.5f; frames++;
         if (uptime_ms() - t0 >= 5000) { char t[64]; snprintf(t, sizeof t, "glcube (user mode) — %ld fps", frames * 1000 / (uptime_ms() - t0)); win_set_title(win, t); frames = 0; t0 = uptime_ms(); }
-        sleep_ms(16);
+        usleep(16000);
     }
 done:
     glxDestroyContext(gl);

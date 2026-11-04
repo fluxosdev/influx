@@ -69,6 +69,18 @@ int app_launch(int id, const char *arg) {
         }
         return 0;
     }
+    if (app_table[id].exec) {
+        /* a user program: its windows are tagged with the app through the process */
+        char *argv[3] = { (char *)vfs_basename(app_table[id].exec), (char *)arg, NULL };
+        int pid = process_spawn_app(app_table[id].exec, arg ? 2 : 1, argv, "/home/flux", id);
+        if (pid < 0) { kprintf("apps: cannot start %s: %d\n", app_table[id].exec, pid); return pid; }
+        procs_lock();
+        struct process *up = process_find(pid);
+        if (up) reap_when_done(up);
+        procs_unlock();
+        wm_notify_app_state();
+        return pid;
+    }
     struct process *p = process_create(app_table[id].name, false);
     p->app_id = id;
     strcpy(p->cwd, "/home/flux");

@@ -6,6 +6,7 @@
 extern volatile struct limine_memmap_request memmap_request;
 
 static uint8_t *bitmap;      /* 1 bit per page, 1 = used */
+static uint16_t *refs;       /* user page sharing (fork, copy-on-write): mappings beyond the first */
 static uint64_t bitmap_pages; /* number of pages tracked */
 static uint64_t total_pages, free_pages;
 static uint64_t hint;
@@ -37,14 +38,27 @@ void pmm_init(void) {
     }
     ASSERT(bitmap);
     memset(bitmap, 0xFF, bm_size);
+    /* reference counts right after the bitmap, in the same region if it fits, else the next big one */
+    uint64_t rc_size = PAGE_ALIGN_UP(bitmap_pages * sizeof(uint16_t));
+    uint64_t bm_phys0 = V2P(bitmap);
+    for (uint64_t i = 0; i < mm->entry_count && !refs; i++) {
+        struct limine_memmap_entry *e = mm->entries[i];
+        if (e->type != LIMINE_MEMMAP_USABLE) continue;
+        uint64_t base = e->base, len = e->length;
+        if (base == bm_phys0) { base += bm_size; len = len > bm_size ? len - bm_size : 0; }
+        if (len >= rc_size) refs = P2V(base);
+    }
+    ASSERT(refs);
+    memset(refs, 0, rc_size);
     for (uint64_t i = 0; i < mm->entry_count; i++) {
         struct limine_memmap_entry *e = mm->entries[i];
         if (e->type != LIMINE_MEMMAP_USABLE) continue;
         for (uint64_t p = e->base / PAGE_SIZE; p < (e->base + e->length) / PAGE_SIZE; p++) { bm_clear(p); free_pages++; }
     }
-    /* reserve the bitmap itself and page 0 */
-    uint64_t bm_phys = V2P(bitmap);
+    /* reserve the bitmap, the reference counts and page 0 */
+    uint64_t bm_phys = V2P(bitmap), rc_phys = V2P(refs);
     for (uint64_t p = bm_phys / PAGE_SIZE; p < (bm_phys + bm_size) / PAGE_SIZE; p++) { bm_set(p); free_pages--; }
+    for (uint64_t p = rc_phys / PAGE_SIZE; p < (rc_phys + rc_size) / PAGE_SIZE; p++) if (!bm_test(p)) { bm_set(p); free_pages--; }
     if (!bm_test(0)) { bm_set(0); free_pages--; }
     boot_info.mem_total = total_pages * PAGE_SIZE;
     kprintf("pmm: %lu MiB usable, bitmap %lu KiB at %lx\n", (uint64_t)(total_pages * PAGE_SIZE / (1024 * 1024)), (uint64_t)(bm_size / 1024), bm_phys);
@@ -109,6 +123,28 @@ void pmm_free_pages(uint64_t phys, size_t count) {
     spin_unlock(&lock);
 }
 void pmm_free_page(uint64_t phys) { pmm_free_pages(phys, 1); }
+
+/* Shared user pages: refs[] counts the mappings beyond the first, so a page fresh from
+ * pmm_alloc_page has one owner and pmm_page_unref frees it. */
+void pmm_page_ref(uint64_t phys) {
+    spin_lock(&lock);
+    uint64_t p = phys / PAGE_SIZE;
+    if (p < bitmap_pages) { ASSERT(refs[p] < 0xFFFF); refs[p]++; }
+    spin_unlock(&lock);
+}
+void pmm_page_unref(uint64_t phys) {
+    spin_lock(&lock);
+    uint64_t p = phys / PAGE_SIZE;
+    if (p < bitmap_pages) {
+        if (refs[p]) refs[p]--;
+        else if (bm_test(p)) { bm_clear(p); free_pages++; if (p < hint) hint = p; }
+    }
+    spin_unlock(&lock);
+}
+bool pmm_page_shared(uint64_t phys) {
+    uint64_t p = phys / PAGE_SIZE;
+    return p < bitmap_pages && __atomic_load_n(&refs[p], __ATOMIC_RELAXED) != 0;
+}
 uint64_t pmm_total_bytes(void) { return total_pages * PAGE_SIZE; }
 uint64_t pmm_free_bytes(void) { return free_pages * PAGE_SIZE; }
 uint64_t pmm_used_bytes(void) { return (total_pages - free_pages) * PAGE_SIZE; }

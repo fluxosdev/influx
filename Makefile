@@ -14,7 +14,7 @@ LIMINE  := third_party/limine
 KCFLAGS := -std=gnu11 -ffreestanding -fno-stack-protector -fno-stack-check \
            -fno-lto -fno-pic -fno-pie -m64 -march=x86-64 -mabi=sysv \
            -mno-80387 -mno-mmx -mno-sse -mno-sse2 -mno-red-zone \
-           -mcmodel=kernel -mgeneral-regs-only -O2 -g \
+           -mcmodel=kernel -mgeneral-regs-only -O2 -g -fno-omit-frame-pointer \
            -Wall -Wextra -Wno-unused-parameter -Wno-unused-function -Wno-misleading-indentation -Wno-type-limits -Wno-missing-field-initializers -Wno-sign-compare -Wno-address-of-packed-member \
            -Ikernel/include -Ithird_party/limine -MMD -MP
 # Code that may use vector registers: the OpenGL software renderer and its demo,
@@ -31,14 +31,21 @@ KOBJ   := $(patsubst kernel/src/%.c,$(BUILD)/kernel/%.o,$(KSRC_C)) \
           $(patsubst kernel/src/%.S,$(BUILD)/kernel/%.o,$(KSRC_S))
 
 # ---- userland ----
-UCFLAGS := -std=gnu11 -ffreestanding -fno-stack-protector -fno-pic -fno-pie \
-           -m64 -mavx -mno-red-zone -O2 -g -Wall -Wextra -Wno-unused-parameter \
-           -Iuser/libc/include -Igl -Wno-misleading-indentation
-ULDFLAGS := -nostdlib -static -z max-page-size=0x1000 -Wl,--build-id=none \
-            -T user/libc/user.ld
-ULIBC_SRC := $(wildcard user/libc/*.c) $(wildcard user/libc/*.S)
-ULIBC_OBJ := $(patsubst user/libc/%,$(BUILD)/user/libc/%.o,$(ULIBC_SRC))
+# musl libc (third_party/musl, Linux x86-64 ABI, which the kernel implements) is built out of
+# tree into $(BUILD)/musl; programs are linked statically against it and libinflux.
+MUSL_SRC  := third_party/musl
+MUSL      := $(abspath $(BUILD))/musl
+MUSL_LIBC := $(MUSL)/lib/libc.a
+MUSL_GCC  := $(MUSL)/bin/musl-gcc
+UCFLAGS := -std=gnu11 -static -O2 -g -mavx -Wall -Wextra -Wno-unused-parameter -Wno-misleading-indentation \
+           -Iuser/include -Igl
+ULIB_SRC  := $(wildcard user/lib/*.c)
+ULIB_OBJ  := $(patsubst user/lib/%.c,$(BUILD)/user/lib/%.o,$(ULIB_SRC))
+ULIB      := $(BUILD)/user/libinflux.a
 UPROGS    := $(patsubst user/bin/%.c,$(BUILD)/sysroot/bin/%,$(wildcard user/bin/*.c))
+# dynamically linked programs (user/dyn): musl's libc.so is also its dynamic linker, /lib/ld-musl-x86_64.so.1
+UPROGS_DYN := $(patsubst user/dyn/%.c,$(BUILD)/sysroot/bin/%,$(wildcard user/dyn/*.c))
+LDSO      := $(BUILD)/sysroot/lib/ld-musl-x86_64.so.1
 
 # ---- assets ----
 FONTGEN := $(BUILD)/tools/fontgen
@@ -61,7 +68,7 @@ FONT_FILES := $(foreach s,$(FONT_SPECS),$(SYSROOT)/sys/fonts/$(word 1,$(subst :,
 ICON_PNGS  := $(wildcard assets/icons/png/*.png)
 ICON_FILES := $(patsubst assets/icons/png/%.png,$(SYSROOT)/sys/icons/%.img,$(ICON_PNGS))
 
-.PHONY: all kernel initrd run run-kvm run-nogui disk clean distclean tools
+.PHONY: all kernel initrd run run-kvm run-nogui disk clean distclean tools test
 
 all: $(ISO)
 
@@ -107,17 +114,31 @@ $(KERNEL): $(KOBJ) kernel/linker.ld
 -include $(KOBJ:.o=.d)
 
 # ---- userland ----
-$(BUILD)/user/libc/%.c.o: user/libc/%.c
-	@mkdir -p $(dir $@)
-	$(CC) $(UCFLAGS) -c $< -o $@
+$(MUSL_LIBC): $(shell find $(MUSL_SRC)/src $(MUSL_SRC)/include $(MUSL_SRC)/arch/x86_64 -type f 2>/dev/null)
+	@mkdir -p $(BUILD)/musl-build
+	cd $(BUILD)/musl-build && CC=$(HOSTCC) CFLAGS="-O2 -g" $(abspath $(MUSL_SRC))/configure --prefix=$(MUSL) --syslibdir=/lib >/dev/null
+	$(MAKE) -C $(BUILD)/musl-build >/dev/null
+	$(MAKE) -C $(BUILD)/musl-build install LDSO_PATHNAME=$(MUSL)/lib/ld-musl-x86_64.so.1 >/dev/null
+	touch $@
 
-$(BUILD)/user/libc/%.S.o: user/libc/%.S
+$(BUILD)/user/lib/%.o: user/lib/%.c $(MUSL_LIBC) $(wildcard user/include/*.h user/include/GL/*.h) gl/gl.c
 	@mkdir -p $(dir $@)
-	$(CC) $(KASFLAGS) -c $< -o $@
+	$(MUSL_GCC) $(UCFLAGS) -Wno-unused-function -c $< -o $@
 
-$(SYSROOT)/bin/%: user/bin/%.c $(ULIBC_OBJ) user/libc/user.ld
+$(ULIB): $(ULIB_OBJ)
+	ar rcs $@ $^
+
+$(SYSROOT)/bin/%: user/bin/%.c $(ULIB) $(MUSL_LIBC)
 	@mkdir -p $(dir $@)
-	$(CC) $(UCFLAGS) $(ULDFLAGS) $< $(ULIBC_OBJ) -o $@
+	$(MUSL_GCC) $(UCFLAGS) $< $(ULIB) -lm -o $@
+
+$(SYSROOT)/bin/%: user/dyn/%.c $(MUSL_LIBC)
+	@mkdir -p $(dir $@)
+	$(MUSL_GCC) $(filter-out -static,$(UCFLAGS)) $< -o $@
+
+$(LDSO): $(MUSL_LIBC)
+	@mkdir -p $(dir $@)
+	strip --strip-debug -o $@ $(MUSL)/lib/libc.so
 
 # ---- fonts / icons ----
 define FONT_RULE
@@ -136,16 +157,27 @@ SKEL_FILES := $(shell find sysroot -type f 2>/dev/null)
 
 initrd: $(INITRD)
 
-$(INITRD): $(FONT_FILES) $(ICON_FILES) $(UPROGS) $(SKEL_FILES) $(KERNEL)
+$(INITRD): $(FONT_FILES) $(ICON_FILES) $(UPROGS) $(UPROGS_DYN) $(LDSO) $(SKEL_FILES) $(KERNEL)
 	@mkdir -p $(SYSROOT)/boot/limine
 	cp -r sysroot/. $(SYSROOT)/
 	cp $(KERNEL) $(SYSROOT)/boot/influx.elf
+	nm -n $(KERNEL) | grep -i ' t ' > $(SYSROOT)/boot/influx.map
 	cp $(LIMINE)/BOOTX64.EFI $(LIMINE)/BOOTIA32.EFI $(LIMINE)/limine-bios.sys $(SYSROOT)/boot/limine/
 	tar --format=ustar --owner=0 --group=0 --mtime='2026-01-01' -C $(SYSROOT) -cf $@ .
 
 # ---- ISO ----
 $(BUILD)/limine: $(LIMINE)/limine.c
 	$(HOSTCC) -O2 -o $@ $< -Wno-unused-result
+
+# $(call MKISO,dir,iso): a hybrid BIOS/UEFI ISO of a staged directory
+define MKISO
+	xorriso -as mkisofs -R -r -J -b boot/limine/limine-bios-cd.bin \
+	    -no-emul-boot -boot-load-size 4 -boot-info-table -hfsplus \
+	    -apm-block-size 2048 --efi-boot boot/limine/limine-uefi-cd.bin \
+	    -efi-boot-part --efi-boot-image --protective-msdos-label \
+	    $(1) -o $(2) 2>/dev/null
+	$(BUILD)/limine bios-install $(2) 2>/dev/null
+endef
 
 $(ISO): $(KERNEL) $(INITRD) limine.conf $(BUILD)/limine
 	rm -rf $(BUILD)/iso
@@ -155,12 +187,22 @@ $(ISO): $(KERNEL) $(INITRD) limine.conf $(BUILD)/limine
 	cp limine.conf $(LIMINE)/limine-bios.sys $(LIMINE)/limine-bios-cd.bin \
 	   $(LIMINE)/limine-uefi-cd.bin $(BUILD)/iso/boot/limine/
 	cp $(LIMINE)/BOOTX64.EFI $(LIMINE)/BOOTIA32.EFI $(BUILD)/iso/EFI/BOOT/
-	xorriso -as mkisofs -R -r -J -b boot/limine/limine-bios-cd.bin \
-	    -no-emul-boot -boot-load-size 4 -boot-info-table -hfsplus \
-	    -apm-block-size 2048 --efi-boot boot/limine/limine-uefi-cd.bin \
-	    -efi-boot-part --efi-boot-image --protective-msdos-label \
-	    $(BUILD)/iso -o $@ 2>/dev/null
-	$(BUILD)/limine bios-install $@ 2>/dev/null
+	$(call MKISO,$(BUILD)/iso,$@)
+
+# ---- tests ----
+# make test: the host-side filesystem regressions, then a headless boot that runs /bin/systest
+# (boot option 'selftest'; SELFTEST_NET=1 adds the DNS/TCP checks, which need the internet)
+SELFTEST_ISO := $(BUILD)/influx-selftest.iso
+SELFTEST_CMDLINE := selftest$(if $(SELFTEST_NET), selftest-net)
+$(SELFTEST_ISO): $(ISO) FORCE
+	rm -rf $(BUILD)/iso-selftest
+	cp -r $(BUILD)/iso $(BUILD)/iso-selftest
+	sed -i 's/^    module_string: initrd$$/&\n    cmdline: $(SELFTEST_CMDLINE)/' $(BUILD)/iso-selftest/boot/limine/limine.conf
+	$(call MKISO,$(BUILD)/iso-selftest,$@)
+
+test: $(SELFTEST_ISO)
+	bash tests/run-fs-regressions.sh
+	bash tests/run-selftest.sh $(SELFTEST_ISO)
 
 # ---- install target disk ----
 DISK_INSTALL := $(BUILD)/install.img
@@ -227,3 +269,5 @@ clean:
 
 distclean:
 	rm -rf $(BUILD)
+
+FORCE:

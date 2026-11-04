@@ -4,9 +4,12 @@
 #include "io.h"
 #include "fs.h"
 #include "simd.h"
+#include "uvm.h"
+#include "uaccess.h"
 
 extern void context_switch(uint64_t *old_rsp, uint64_t new_rsp);
 extern void enter_user_mode(uint64_t rip, uint64_t rsp);
+extern void user_enter(struct regs *r) NORETURN;
 
 struct process *kernel_process;
 uint64_t sched_context_switches;
@@ -69,6 +72,7 @@ static void idle_loop(void *arg) {
 }
 
 static void thread_free(struct thread *t) {
+    kfree(t->start_regs);
     if (t->kstack_base) kfree((void *)t->kstack_base);
     kfree(t->fpu_mem);
     kfree(t);
@@ -93,7 +97,14 @@ static void thread_trampoline(void) {
     finish_switch();
     struct thread *t = current_thread;
     sti();
-    if (t->is_user) enter_user_mode(t->user_rip, t->user_rsp);
+    if (t->is_user) {
+        /* the full user context, in this frame: user_enter loads it with iretq and leaves this stack behind */
+        struct regs r;
+        if (t->start_regs) { r = *t->start_regs; kfree(t->start_regs); t->start_regs = NULL; }
+        else { memset(&r, 0, sizeof r); r.rip = t->user_rip; r.rsp = t->user_rsp; r.rflags = 0x202; }
+        r.cs = USER_CS; r.ss = USER_DS;
+        user_enter(&r);
+    }
     t->entry(t->arg);
     thread_exit(0);
 }
@@ -168,12 +179,28 @@ struct thread *thread_create_user(struct process *p, const char *name, uint64_t 
     return t;
 }
 
+/* a user thread that starts with the full register context r (fork children, clone, execve'd spawns) */
+struct thread *thread_create_user_regs(struct process *p, const char *name, const struct regs *r, uint64_t fs_base, uint64_t sigmask, const uint8_t *fpu) {
+    struct regs *copy = kmalloc(sizeof *copy);
+    if (!copy) return NULL;
+    *copy = *r;
+    struct thread *t = alloc_thread(p, name);
+    t->is_user = true; t->start_regs = copy; t->fs_base = fs_base; t->sigmask = sigmask;
+    t->user_rip = r->rip; t->user_rsp = r->rsp;
+    if (fpu) memcpy(t->fpu, fpu, fpu_state_size);
+    start_thread(t);
+    return t;
+}
+
 struct process *process_create(const char *name, bool user) {
     struct process *p = kzalloc(sizeof *p);
     p->pid = __atomic_fetch_add(&next_pid, 1, __ATOMIC_RELAXED);
     strlcpy(p->name, name, sizeof p->name);
     p->is_user = user;
     p->pml4 = user ? vmm_new_pml4() : 0;
+    if (user) uvm_init(p);
+    waitq_init(&p->child_wq);
+    p->umask = 022;
     p->app_id = -1;
     p->start_time = system_ticks;
     strcpy(p->cwd, "/");
@@ -181,6 +208,9 @@ struct process *process_create(const char *name, bool user) {
     waitq_init(&p->exit_wq);
     p->parent = current_thread ? current_thread->proc : NULL;
     p->ppid = p->parent ? p->parent->pid : 0;
+    if (p->parent) { p->uid = p->parent->uid; p->gid = p->parent->gid; p->euid = p->parent->euid; p->egid = p->parent->egid; p->pgid = p->parent->pgid; p->sid = p->parent->sid; }
+    if (!p->pgid) p->pgid = p->pid;
+    if (!p->sid) p->sid = p->pid;
     if (user) __atomic_fetch_add(&user_procs, 1, __ATOMIC_RELAXED);
     procs_lock();
     list_add_tail(&p->all_link, &all_processes);
@@ -275,13 +305,17 @@ void schedule(void) {
     tss_set_kernel_stack(next->kstack_top);
     c->syscall_rsp = next->kstack_top;
     vmm_switch(next->proc->pml4 ? next->proc->pml4 : vmm_kernel_pml4());
+    if (next->is_user || prev->is_user) wrmsr(0xC0000100, next->fs_base);   /* FS_BASE: user TLS */
     fpu_restore(next->fpu);
     context_switch(&prev->rsp, next->rsp);
     /* back on 'prev' stack, possibly on another CPU */
     finish_switch();
 }
 
-void thread_yield(void) { uint64_t f = irq_save(); schedule(); irq_restore(f); }
+void thread_yield(void) {
+    if (panicking) { pause(); return; }   /* only the panicking CPU runs: polled drivers spin instead */
+    uint64_t f = irq_save(); schedule(); irq_restore(f);
+}
 
 /* sched_lock held: a wakeup aimed at t while it was not waiting (a kill
  * racing with its last check) is kept for its next wait, which then returns
@@ -330,6 +364,11 @@ static void sleep_insert(struct thread *t) {
 }
 
 void thread_sleep_ms(uint64_t ms) {
+    if (panicking) {   /* the tick has stopped: spin on the TSC */
+        uint64_t hz = cpu_tsc_hz() ? cpu_tsc_hz() : 2000000000ull, end = rdtsc() + hz / 1000 * ms;
+        while (rdtsc() < end) pause();
+        return;
+    }
     if (ms == 0) { thread_yield(); return; }
     uint64_t f = irq_save();
     struct thread *t = current_thread;
@@ -359,13 +398,55 @@ static bool claim_orphan(struct process *p) {
 /* p is ready to reap: wake anyone in process_wait() on it. An orphan has
  * nobody to wait for it and is freed right here (its caller, the last thread
  * of p, is already off p's page tables and does not touch p again). */
+static struct process *find_locked(int pid);
 void process_mark_exited(struct process *p) {
-    spin_lock(&exit_lock);
+    procs_lock();
+    struct process *parent = p->ppid ? find_locked(p->ppid) : NULL;
+    spin_acquire(&exit_lock);
     p->exited = true;
     bool reap = claim_orphan(p);
     waitq_wake_all(&p->exit_wq);
-    spin_unlock(&exit_lock);
+    if (parent && !reap) { parent->child_gen++; waitq_wake_all(&parent->child_wq); }
+    spin_release(&exit_lock);
+    if (parent && !reap && parent->is_user && p->is_user && !parent->exited) signal_send(parent, SIGCHLD);
+    procs_unlock();
     if (reap) process_free(p);
+}
+
+/* wait4: reap an exited child of the caller matching pid (-1 any, < -1 process group -pid, 0 the caller's group).
+ * Returns its pid with *status (Linux encoding), 0 for WNOHANG with none ready, -ECHILD, or -ERESTARTSYS. */
+int process_wait_child(int pid, int *status, bool nohang) {
+    struct process *self = current_thread->proc;
+    for (;;) {
+        struct process *c, *found = NULL;
+        bool any = false;
+        procs_lock();
+        spin_acquire(&exit_lock);
+        uint64_t gen = self->child_gen;
+        list_for_each_entry(c, &all_processes, all_link) {
+            if (c->ppid != self->pid || c == self || !c->is_user || c->reaping) continue;
+            if (pid > 0 && c->pid != pid) continue;
+            if (pid == 0 && c->pgid != self->pgid) continue;
+            if (pid < -1 && c->pgid != -pid) continue;
+            any = true;
+            if (c->exited) { found = c; c->reaping = true; break; }
+        }
+        spin_release(&exit_lock);
+        procs_unlock();
+        if (found) {
+            int st = found->exit_signal ? (found->exit_signal & 0x7F) : ((found->exit_code & 0xFF) << 8);
+            int fpid = found->pid;
+            if (status) *status = st;
+            process_free(found);
+            return fpid;
+        }
+        if (!any) return -ECHILD;
+        if (nohang) return 0;
+        spin_lock(&exit_lock);
+        while (self->child_gen == gen && !signal_interrupted()) waitq_wait(&self->child_wq, &exit_lock);
+        spin_unlock(&exit_lock);
+        if (signal_interrupted()) return -512;   /* ERESTARTSYS */
+    }
 }
 
 /* p is exiting: nothing will ever process_wait() on the processes it created

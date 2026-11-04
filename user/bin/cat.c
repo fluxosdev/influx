@@ -3,7 +3,7 @@
 #include <unistd.h>
 #include <string.h>
 #include <errno.h>
-#include <influx.h>
+#include <fcntl.h>
 
 static int dump(int fd) {
     char buf[4096]; long n;
@@ -15,7 +15,7 @@ int main(int argc, char **argv) {
     int status = 0;
     for (int i = 1; i < argc; i++) {
         int fd = open(argv[i], O_RDONLY);
-        if (fd < 0) { fprintf(2, "cat: %s: %s\n", argv[i], strerror(errno)); status = 1; continue; }
+        if (fd < 0) { fprintf(stderr, "cat: %s: %s\n", argv[i], strerror(errno)); status = 1; continue; }
         status |= dump(fd);
         close(fd);
     }

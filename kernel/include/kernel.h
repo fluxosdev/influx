@@ -34,12 +34,24 @@ static inline uint64_t V2P(const void *v) { return (uint64_t)v - hhdm_offset; }
 void kprintf(const char *fmt, ...) __attribute__((format(printf, 1, 2)));
 void kvprintf(const char *fmt, va_list ap);
 void NORETURN panic(const char *fmt, ...) __attribute__((format(printf, 1, 2)));
+/* kernel log (klog.c) */
+void klog_write(const char *s, size_t n);
+size_t klog_snapshot(char *out, size_t max);          /* the last max bytes of the log */
+extern volatile bool panicking;                      /* set once panic() has stopped the system */
+void panic_backtrace(uint64_t rip, uint64_t rbp);
+void NORETURN panic_finish(const char *reason);
+bool kernel_cmdline_has(const char *word);           /* a word on the Limine cmdline */
+void crashlog_init(void);                            /* after the disks are mounted */
+extern char crashlog_previous[];                     /* report saved from the last boot ("" = none) */
 #define ASSERT(c) do { if (unlikely(!(c))) panic("assertion failed: %s (%s:%d)", #c, __FILE__, __LINE__); } while (0)
 
 /* System-wide timekeeping (milliseconds since boot) */
 extern volatile uint64_t system_ticks;
 uint64_t time_ms(void);
 uint64_t time_unix(void);           /* seconds since epoch (UTC) */
+uint64_t time_ns(void);             /* monotonic nanoseconds since boot (TSC when it is constant-rate) */
+int64_t time_realtime_ns(void);     /* nanoseconds since the epoch (UTC) */
+void time_set_realtime_ns(int64_t ns);   /* steps the wall clock and writes the RTC */
 extern int64_t tz_offset_minutes;   /* user-configurable timezone offset */
 
 /* Boot info exported by main.c */

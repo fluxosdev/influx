@@ -13,6 +13,11 @@
 #define O_RDWR    0x0002
 #define O_ACCMODE 0x0003
 #define O_CREAT   0x0040
+#define O_EXCL    0x0080
+#define O_NOCTTY  0x0100
+#define O_NONBLOCK 0x0800
+#define O_CLOEXEC 0x80000
+#define O_NOFOLLOW 0x20000
 #define O_TRUNC   0x0200
 #define O_APPEND  0x0400
 #define O_DIRECTORY 0x10000
@@ -43,7 +48,25 @@ struct vnode_ops {
     /* optional: write at the current end of file, atomically with respect to other writers (O_APPEND);
      * *end receives the offset just past the written data */
     int64_t (*append)(struct vnode *v, const void *buf, size_t n, uint64_t *end);
+    /* optional: which of POLLIN/POLLOUT/POLLHUP/POLLERR hold now (no poll: always readable and writable).
+     * Objects with a poll must call poll_notify() whenever the answer may have changed. */
+    int (*poll)(struct vnode *v, int events);
 };
+
+#define POLLIN   0x001
+#define POLLPRI  0x002
+#define POLLOUT  0x004
+#define POLLERR  0x008
+#define POLLHUP  0x010
+#define POLLNVAL 0x020
+#define POLLRDNORM 0x040
+#define POLLWRNORM 0x100
+int vfs_poll(struct vnode *v, int events);
+void poll_notify(void);                           /* some pollable object changed state */
+uint64_t poll_generation(void);
+/* sleeps until poll_notify() moves the generation past gen, the timeout passes (ms < 0: none)
+ * or a signal arrives; false on timeout or signal */
+bool poll_wait(uint64_t gen, int64_t ms);
 
 struct vnode {
     char name[NAME_MAX + 1];
@@ -62,7 +85,7 @@ struct vnode {
     uint64_t fs_total, fs_free;   /* only on fs roots */
 };
 
-struct file { struct vnode *vn; uint64_t pos; int flags; int refcount; void *priv; };
+struct file { struct vnode *vn; uint64_t pos; int flags; int refcount; void *priv; char *path; /* absolute path it was opened by (NULL: pipe, socket...) */ };
 
 void vfs_init(void);
 struct vnode *vfs_root(void);
@@ -131,3 +154,19 @@ struct vnode *devfs_add(const char *name, int type, const struct vnode_ops *ops,
 #endif
 #define ENODEV   19
 #define ENOTSUP  95
+#define EPIPE    32
+#define EAGAIN   11
+#define EINTR    4
+#define ERESTARTSYS 512
+#define EFAULT   14
+#define ESPIPE   29
+#define EMFILE   24
+#define ENOTSOCK 88
+#define EPERM    1
+#define EXDEV    18
+#define ELOOP    40
+#define ERANGE   34
+#define EOVERFLOW 75
+#ifndef ETIMEDOUT
+#define ETIMEDOUT 110
+#endif

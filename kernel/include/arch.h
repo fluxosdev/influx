@@ -84,6 +84,7 @@ bool pit_sleep_ms(uint32_t ms);    /* busy wait, early boot only; false if the P
 void timer_init(void);             /* starts the scheduling tick */
 struct rtc_time { int year, month, day, hour, minute, second; };
 void rtc_read(struct rtc_time *t);
+void rtc_write(const struct rtc_time *t);
 uint64_t rtc_to_unix(const struct rtc_time *t);
 void unix_to_datetime(uint64_t t, struct rtc_time *out);
 int day_of_week(int y, int m, int d);

@@ -104,7 +104,7 @@ static void ap_entry(struct limine_smp_info *info) {
     sched_ap_enter();
 }
 
-static bool cmdline_has(const char *word) {
+bool kernel_cmdline_has(const char *word) {
     struct limine_executable_cmdline_response *r = cmdline_request.response;
     if (!r || !r->cmdline) return false;
     size_t n = strlen(word);
@@ -124,7 +124,7 @@ void smp_init(void) {
     irq_register(VEC_HALT, halt_irq, NULL);
     struct limine_smp_response *r = smp_request.response;
     if (!r || r->cpu_count < 2) { kprintf("smp: single processor\n"); return; }
-    if (cmdline_has("nosmp")) { kprintf("smp: %lu CPUs, 'nosmp' given: using one\n", r->cpu_count); return; }
+    if (kernel_cmdline_has("nosmp")) { kprintf("smp: %lu CPUs, 'nosmp' given: using one\n", r->cpu_count); return; }
     int want = 0;
     for (uint64_t i = 0; i < r->cpu_count && 1 + want < MAX_CPUS; i++) {
         if (r->cpus[i]->lapic_id == r->bsp_lapic_id) continue;

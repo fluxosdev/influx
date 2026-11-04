@@ -32,6 +32,20 @@ int blockdev_write(struct blockdev *d, uint64_t lba, uint32_t count, const void 
     mutex_unlock(&io_lock);
     return r;
 }
+/* for the panic handler (other CPUs halted, interrupts off): skips the lock, and gives up if a
+ * transfer was in flight when the system stopped, since the controller may be mid-command */
+int blockdev_write_panic(struct blockdev *d, uint64_t lba, uint32_t count, const void *buf) {
+    uint64_t off; struct blockdev *root = resolve(d, lba, count, &off);
+    if (!root) return -ENODEV;
+    if (io_lock.locked) return -EBUSY;
+    return root->write(root, off, count, buf);
+}
+int blockdev_flush_panic(struct blockdev *d) {
+    uint64_t off; struct blockdev *root = resolve(d, 0, 0, &off);
+    if (!root || io_lock.locked) return -EBUSY;
+    return root->flush ? root->flush(root) : 0;
+}
+
 /* drives acknowledge writes from a volatile cache: filesystems call this before and after their commit
  * point (superblock) so that it cannot reach the medium ahead of the blocks it points to */
 int blockdev_flush(struct blockdev *d) {

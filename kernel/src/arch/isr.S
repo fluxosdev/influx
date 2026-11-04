@@ -41,6 +41,9 @@ isr_common:
     cld
     movq %rsp, %rdi          /* the CPU 16-aligns rsp before its 5-qword frame; 2 + 15 pushes keep it aligned */
     call isr_dispatch
+/* also the way into user mode for new threads, fork children and rt_sigreturn: rsp = struct regs */
+.global isr_exit
+isr_exit:
     popq %r15
     popq %r14
     popq %r13

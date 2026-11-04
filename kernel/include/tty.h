@@ -18,6 +18,8 @@ struct tty {
     int cols, rows;
     struct vnode *vn;
     bool closed;
+    bool have_termios;
+    uint8_t termios[36];      /* the last TCSETS (struct ktermios in tty.c) */
 };
 struct tty *tty_create(void (*output)(void *, const char *, size_t), void *priv);
 void tty_destroy(struct tty *t);

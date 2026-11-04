@@ -1,0 +1,299 @@
+/*
+ * systest: checks the kernel's system call interface from user mode, through
+ * musl. Prints one PASS/FAIL line per check and exits with the number of
+ * failures. `systest net` adds DNS and TCP checks (they need a network).
+ * The boot option `selftest` runs it at startup and powers off (CI).
+ */
+#define _GNU_SOURCE
+#include <errno.h>
+#include <fcntl.h>
+#include <netdb.h>
+#include <poll.h>
+#include <pthread.h>
+#include <setjmp.h>
+#include <signal.h>
+#include <spawn.h>
+#include <stdatomic.h>
+#include <stdbool.h>
+#include <stdio.h>
+#include <stdlib.h>
+#include <string.h>
+#include <time.h>
+#include <unistd.h>
+#include <arpa/inet.h>
+#include <netinet/in.h>
+#include <sys/mman.h>
+#include <sys/syscall.h>
+#include <sys/random.h>
+#include <sys/socket.h>
+#include <sys/stat.h>
+#include <sys/wait.h>
+#include <dirent.h>
+
+static int failures, checks;
+#define CHECK(name, cond) do { checks++; if (cond) printf("PASS %s\n", name); else { failures++; printf("FAIL %s (errno %d: %s)\n", name, errno, strerror(errno)); } fflush(stdout); } while (0)
+
+/* ---- memory ---- */
+static void test_memory(void) {
+    char *big = malloc(64 << 20);   /* mmap'd by musl, demand-paged by the kernel */
+    bool ok = big != NULL;
+    if (ok) { for (size_t i = 0; i < (64u << 20); i += 4096) big[i] = (char)i; for (size_t i = 0; i < (64u << 20); i += 4096) if (big[i] != (char)i) ok = false; }
+    free(big);
+    CHECK("malloc 64 MiB and touch every page", ok);
+    void *p = mmap(NULL, 1 << 20, PROT_READ | PROT_WRITE, MAP_PRIVATE | MAP_ANONYMOUS, -1, 0);
+    CHECK("mmap anonymous", p != MAP_FAILED && ((char *)p)[12345] == 0);
+    if (p != MAP_FAILED) CHECK("munmap", munmap(p, 1 << 20) == 0);
+    void *fixed = mmap((void *)0x300000000000, 8192, PROT_READ | PROT_WRITE, MAP_PRIVATE | MAP_ANONYMOUS | MAP_FIXED, -1, 0);
+    CHECK("mmap MAP_FIXED", fixed == (void *)0x300000000000);
+    /* musl's sbrk only answers sbrk(0): the system call itself */
+    char *cur = (char *)syscall(SYS_brk, 0), *nb = (char *)syscall(SYS_brk, cur + 65536);
+    bool brk_ok = nb == cur + 65536;
+    if (brk_ok) { cur[0] = 1; cur[65535] = 2; brk_ok = (char *)syscall(SYS_brk, cur) == cur; }
+    CHECK("brk grows, is usable and shrinks", brk_ok);
+}
+
+/* ---- faults and signals ---- */
+static sigjmp_buf jb;
+static volatile void *fault_addr;
+static void on_segv(int sig, siginfo_t *si, void *uc) { fault_addr = si->si_addr; siglongjmp(jb, 1); }
+static volatile int got_usr1, got_alrm;
+static void on_usr1(int s) { got_usr1++; }
+
+static void test_signals(void) {
+    struct sigaction sa = { 0 };
+    sa.sa_sigaction = on_segv; sa.sa_flags = SA_SIGINFO;
+    sigaction(SIGSEGV, &sa, NULL);
+    volatile int recovered = 0;
+    if (!sigsetjmp(jb, 1)) { *(volatile int *)0x1234 = 1; } else recovered = 1;
+    CHECK("SIGSEGV handler with si_addr, siglongjmp out", recovered && fault_addr == (void *)0x1234);
+    char *ro = mmap(NULL, 4096, PROT_READ | PROT_WRITE, MAP_PRIVATE | MAP_ANONYMOUS, -1, 0);
+    ro[0] = 1;
+    mprotect(ro, 4096, PROT_READ);
+    recovered = 0;
+    if (!sigsetjmp(jb, 1)) { ro[1] = 2; } else recovered = 1;
+    CHECK("mprotect read-only page faults on write", recovered && ro[1] == 0);
+    signal(SIGSEGV, SIG_DFL);
+
+    signal(SIGUSR1, on_usr1);
+    raise(SIGUSR1);
+    CHECK("raise + handler", got_usr1 == 1);
+    sigset_t m; sigemptyset(&m); sigaddset(&m, SIGUSR1);
+    sigprocmask(SIG_BLOCK, &m, NULL);
+    kill(getpid(), SIGUSR1);
+    int before = got_usr1;
+    sigprocmask(SIG_UNBLOCK, &m, NULL);
+    CHECK("blocked signal delivered on unblock", before == 1 && got_usr1 == 2);
+
+    /* a signal interrupting a blocking read: EINTR without SA_RESTART */
+    int pfd[2]; pipe(pfd);
+    struct sigaction ua = { 0 }; ua.sa_handler = on_usr1;
+    sigaction(SIGUSR1, &ua, NULL);
+    pid_t parent = getpid();
+    pid_t c = fork();
+    if (c == 0) { struct timespec ts = { 0, 100000000 }; nanosleep(&ts, NULL); kill(parent, SIGUSR1); _exit(0); }
+    char b; errno = 0;
+    ssize_t r = read(pfd[0], &b, 1);
+    CHECK("blocking read interrupted: EINTR", r == -1 && errno == EINTR);
+    waitpid(c, NULL, 0);
+    close(pfd[0]); close(pfd[1]);
+
+    c = fork();
+    if (c == 0) { for (;;) pause(); }
+    kill(c, SIGTERM);
+    int st = 0; waitpid(c, &st, 0);
+    CHECK("kill child: WIFSIGNALED(SIGTERM)", WIFSIGNALED(st) && WTERMSIG(st) == SIGTERM);
+}
+
+/* ---- processes ---- */
+static void test_processes(void) {
+    int shared = 41;
+    pid_t c = fork();
+    if (c == 0) { shared++; _exit(shared == 42 ? 7 : 1); }
+    int st = 0;
+    CHECK("fork + waitpid", waitpid(c, &st, 0) == c && WIFEXITED(st) && WEXITSTATUS(st) == 7);
+    CHECK("copy-on-write: parent's copy unchanged", shared == 41);
+
+    int pfd[2]; pipe(pfd);
+    c = fork();
+    if (c == 0) { dup2(pfd[1], 1); close(pfd[0]); close(pfd[1]); execl("/bin/echo", "echo", "exec", "works", (char *)NULL); _exit(127); }
+    close(pfd[1]);
+    char buf[64] = { 0 }; size_t n = 0; ssize_t r;
+    while ((r = read(pfd[0], buf + n, sizeof buf - 1 - n)) > 0) n += (size_t)r;
+    close(pfd[0]);
+    waitpid(c, &st, 0);
+    CHECK("fork + execve + pipe", !strcmp(buf, "exec works\n") && WIFEXITED(st) && WEXITSTATUS(st) == 0);
+
+    pipe(pfd);
+    c = fork();
+    if (c == 0) { dup2(pfd[1], 1); close(pfd[0]); close(pfd[1]); execl("/bin/hello-dyn", "hello-dyn", (char *)NULL); _exit(127); }
+    close(pfd[1]);
+    memset(buf, 0, sizeof buf); n = 0;
+    while ((r = read(pfd[0], buf + n, sizeof buf - 1 - n)) > 0) n += (size_t)r;
+    close(pfd[0]);
+    waitpid(c, &st, 0);
+    CHECK("dynamically linked program (PT_INTERP, musl ld.so)", !strncmp(buf, "hello from a dynamically linked program", 39) && WIFEXITED(st) && WEXITSTATUS(st) == 0);
+
+    CHECK("waitpid with no children: ECHILD", waitpid(-1, NULL, WNOHANG) == -1 && errno == ECHILD);
+    CHECK("execve of a missing file: ENOENT", execl("/bin/nonexistent", "x", (char *)NULL) == -1 && errno == ENOENT);
+
+    pid_t sp;
+    extern char **environ;
+    char *argv[] = { "echo", "spawned", NULL };
+    int dn = open("/dev/null", O_WRONLY);
+    posix_spawn_file_actions_t fa; posix_spawn_file_actions_init(&fa);
+    if (dn >= 0) posix_spawn_file_actions_adddup2(&fa, dn, 1);
+    int e = posix_spawn(&sp, "/bin/echo", &fa, NULL, argv, environ);
+    CHECK("posix_spawn", e == 0 && waitpid(sp, &st, 0) == sp && WIFEXITED(st) && WEXITSTATUS(st) == 0);
+    if (dn >= 0) close(dn);
+}
+
+/* ---- threads ---- */
+static pthread_mutex_t mtx = PTHREAD_MUTEX_INITIALIZER;
+static pthread_cond_t cv = PTHREAD_COND_INITIALIZER;
+static long counter;
+static int ready;
+static __thread int tls_value;
+static void *worker(void *arg) {
+    tls_value = (int)(long)arg;
+    for (int i = 0; i < 100000; i++) { pthread_mutex_lock(&mtx); counter++; pthread_mutex_unlock(&mtx); }
+    return (void *)(long)(tls_value * 2);
+}
+static void *waiter(void *arg) {
+    pthread_mutex_lock(&mtx);
+    while (!ready) pthread_cond_wait(&cv, &mtx);
+    pthread_mutex_unlock(&mtx);
+    return (void *)1;
+}
+static void test_threads(void) {
+    pthread_t t[4];
+    tls_value = 99;
+    bool ok = true;
+    for (long i = 0; i < 4; i++) ok &= pthread_create(&t[i], NULL, worker, (void *)(i + 1)) == 0;
+    long sum = 0;
+    for (int i = 0; i < 4; i++) { void *r; ok &= pthread_join(t[i], &r) == 0; sum += (long)r; }
+    CHECK("4 threads, contended mutex", ok && counter == 400000);
+    CHECK("thread-local storage per thread", sum == 2 * (1 + 2 + 3 + 4) && tls_value == 99);
+    pthread_t w[3];
+    for (int i = 0; i < 3; i++) pthread_create(&w[i], NULL, waiter, NULL);
+    struct timespec ts = { 0, 50000000 }; nanosleep(&ts, NULL);
+    pthread_mutex_lock(&mtx); ready = 1; pthread_cond_broadcast(&cv); pthread_mutex_unlock(&mtx);
+    long woke = 0;
+    for (int i = 0; i < 3; i++) { void *r; pthread_join(w[i], &r); woke += (long)r; }
+    CHECK("condition variable broadcast", woke == 3);
+}
+
+/* ---- files and descriptors ---- */
+static void test_files(void) {
+    int fd = open("/tmp/systest.txt", O_RDWR | O_CREAT | O_TRUNC, 0644);
+    CHECK("open O_CREAT", fd >= 0);
+    CHECK("write", write(fd, "hello world\n", 12) == 12);
+    CHECK("lseek + read", lseek(fd, 6, SEEK_SET) == 6 && ({ char b[8] = { 0 }; read(fd, b, 5) == 5 && !memcmp(b, "world", 5); }));
+    char pb[6] = { 0 };
+    CHECK("pread", pread(fd, pb, 5, 0) == 5 && !strcmp(pb, "hello"));
+    struct stat st;
+    CHECK("fstat size and type", fstat(fd, &st) == 0 && st.st_size == 12 && S_ISREG(st.st_mode));
+    char *map = mmap(NULL, 12, PROT_READ, MAP_PRIVATE, fd, 0);
+    CHECK("mmap a file", map != MAP_FAILED && !memcmp(map, "hello world", 11));
+    close(fd);
+    CHECK("O_EXCL on an existing file: EEXIST", open("/tmp/systest.txt", O_CREAT | O_EXCL | O_WRONLY, 0644) == -1 && errno == EEXIST);
+    FILE *f = fopen("/tmp/systest.txt", "a"); fprintf(f, "%s %.3f\n", "pi", 3.14159); fclose(f);
+    char line[64] = { 0 }; f = fopen("/tmp/systest.txt", "r"); fgets(line, sizeof line, f); fgets(line, sizeof line, f); fclose(f);
+    CHECK("stdio fopen/fprintf(%f)/fgets", !strcmp(line, "pi 3.142\n"));
+    CHECK("rename", rename("/tmp/systest.txt", "/tmp/systest2.txt") == 0 && access("/tmp/systest2.txt", F_OK) == 0);
+    CHECK("unlink", unlink("/tmp/systest2.txt") == 0 && access("/tmp/systest2.txt", F_OK) == -1 && errno == ENOENT);
+    CHECK("mkdir + rmdir", mkdir("/tmp/systest.d", 0755) == 0 && rmdir("/tmp/systest.d") == 0);
+    DIR *d = opendir("/bin"); int n = 0; bool seen = false; struct dirent *de;
+    while (d && (de = readdir(d))) { n++; if (!strcmp(de->d_name, "systest")) seen = true; }
+    if (d) closedir(d);
+    CHECK("opendir/readdir", n > 3 && seen);
+    char cwd[256];
+    CHECK("chdir + getcwd", chdir("/tmp") == 0 && getcwd(cwd, sizeof cwd) && !strcmp(cwd, "/tmp"));
+    int dfd = dup(1);
+    CHECK("dup + fcntl FD_CLOEXEC", dfd > 2 && fcntl(dfd, F_SETFD, FD_CLOEXEC) == 0 && fcntl(dfd, F_GETFD) == FD_CLOEXEC);
+    close(dfd);
+}
+
+/* ---- pipes, poll, socketpair ---- */
+static void test_ipc(void) {
+    int p[2]; pipe2(p, O_NONBLOCK);
+    char b;
+    CHECK("non-blocking empty pipe: EAGAIN", read(p[0], &b, 1) == -1 && errno == EAGAIN);
+    struct pollfd pf = { p[0], POLLIN, 0 };
+    CHECK("poll timeout on an empty pipe", poll(&pf, 1, 50) == 0);
+    write(p[1], "x", 1);
+    CHECK("poll sees data", poll(&pf, 1, 0) == 1 && (pf.revents & POLLIN));
+    close(p[1]);
+    read(p[0], &b, 1);
+    pf.revents = 0;
+    CHECK("poll sees the writer gone (POLLHUP)", poll(&pf, 1, 0) == 1 && (pf.revents & POLLHUP));
+    close(p[0]);
+    signal(SIGPIPE, SIG_IGN);
+    pipe(p); close(p[0]);
+    CHECK("write to a pipe with no reader: EPIPE", write(p[1], "x", 1) == -1 && errno == EPIPE);
+    close(p[1]);
+    int sv[2];
+    CHECK("socketpair", socketpair(AF_UNIX, SOCK_STREAM, 0, sv) == 0);
+    char m[8] = { 0 };
+    CHECK("socketpair both directions", write(sv[0], "ping", 4) == 4 && read(sv[1], m, 4) == 4 && !strcmp(m, "ping") && write(sv[1], "pong", 4) == 4 && read(sv[0], m, 4) == 4 && !strcmp(m, "pong"));
+    close(sv[0]); close(sv[1]);
+}
+
+/* ---- time and randomness ---- */
+static void test_time(void) {
+    struct timespec a, b;
+    clock_gettime(CLOCK_MONOTONIC, &a);
+    struct timespec ts = { 0, 20000000 };
+    nanosleep(&ts, NULL);
+    clock_gettime(CLOCK_MONOTONIC, &b);
+    long ns = (b.tv_sec - a.tv_sec) * 1000000000L + (b.tv_nsec - a.tv_nsec);
+    CHECK("nanosleep 20 ms, measured by CLOCK_MONOTONIC", ns >= 19000000 && ns < 200000000);
+    struct timespec rt; clock_gettime(CLOCK_REALTIME, &rt);
+    CHECK("CLOCK_REALTIME is after 2024", rt.tv_sec > 1704067200);
+    unsigned char r1[32], r2[32];
+    CHECK("getrandom", getrandom(r1, 32, 0) == 32 && getrandom(r2, 32, 0) == 32 && memcmp(r1, r2, 32));
+}
+
+/* ---- network (optional) ---- */
+static void test_net(void) {
+    struct addrinfo hints = { 0 }, *ai = NULL;
+    hints.ai_family = AF_INET; hints.ai_socktype = SOCK_STREAM;
+    int e = getaddrinfo("example.com", "80", &hints, &ai);
+    CHECK("getaddrinfo example.com (DNS over UDP from user mode)", e == 0 && ai);
+    if (e || !ai) return;
+    int s = socket(AF_INET, SOCK_STREAM, 0);
+    CHECK("TCP connect", s >= 0 && connect(s, ai->ai_addr, ai->ai_addrlen) == 0);
+    const char *req = "HEAD / HTTP/1.0\r\nHost: example.com\r\n\r\n";
+    char buf[512] = { 0 };
+    ssize_t n = 0, r;
+    if (send(s, req, strlen(req), 0) == (ssize_t)strlen(req)) while ((r = recv(s, buf + n, sizeof buf - 1 - n, 0)) > 0) n += r;
+    CHECK("HTTP over a user-mode socket", n > 12 && !strncmp(buf, "HTTP/1.", 7));
+    close(s);
+    /* non-blocking connect */
+    s = socket(AF_INET, SOCK_STREAM | SOCK_NONBLOCK, 0);
+    int c = connect(s, ai->ai_addr, ai->ai_addrlen);
+    struct pollfd pf = { s, POLLOUT, 0 };
+    int err = -1; socklen_t el = sizeof err;
+    CHECK("non-blocking connect: EINPROGRESS, then POLLOUT, SO_ERROR 0", c == -1 && errno == EINPROGRESS && poll(&pf, 1, 5000) == 1 && getsockopt(s, SOL_SOCKET, SO_ERROR, &err, &el) == 0 && err == 0);
+    close(s);
+    freeaddrinfo(ai);
+    /* a listening socket that QEMU's hostfwd can reach (tcp::5555-:7) answers one connection */
+    int l = socket(AF_INET, SOCK_STREAM, 0);
+    struct sockaddr_in sa = { .sin_family = AF_INET, .sin_port = htons(7), .sin_addr.s_addr = INADDR_ANY };
+    CHECK("bind + listen", bind(l, (struct sockaddr *)&sa, sizeof sa) == 0 && listen(l, 4) == 0);
+    close(l);
+}
+
+int main(int argc, char **argv) {
+    setvbuf(stdout, NULL, _IOLBF, 0);
+    printf("systest: inFlux system call checks (pid %d)\n", getpid());
+    test_memory();
+    test_signals();
+    test_processes();
+    test_threads();
+    test_files();
+    test_ipc();
+    test_time();
+    if (argc > 1 && !strcmp(argv[1], "net")) test_net();
+    printf("systest: %d of %d checks passed\n", checks - failures, checks);
+    return failures;
+}

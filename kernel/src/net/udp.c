@@ -3,6 +3,8 @@
 #include "net_internal.h"
 #include "mm.h"
 #include "string.h"
+#include "fs.h"
+#include "signal.h"
 
 #define UDP_QUEUE 32
 
@@ -74,7 +76,17 @@ void udp_input(struct netif *n, uint32_t src, uint32_t dst, const uint8_t *pkt, 
     memcpy(d->data, pkt + sizeof *h, d->len);
     s->count++;
     sem_post(&s->sem);
+    poll_notify();
 }
+
+int udp_poll(struct udp_sock *s) {
+    mutex_lock(&net_lock);
+    int r = POLLOUT | POLLWRNORM | (s->count ? POLLIN | POLLRDNORM : 0);
+    mutex_unlock(&net_lock);
+    return r;
+}
+uint16_t udp_port(struct udp_sock *s) { return s->port; }
+int udp_pending_bytes(struct udp_sock *s) { mutex_lock(&net_lock); int n = s->count ? s->q[s->head].len : 0; mutex_unlock(&net_lock); return n; }
 
 int udp_sendto_if(struct udp_sock *s, struct netif *n, uint32_t src, uint32_t dst, uint16_t port, const void *data, size_t len) {
     uint8_t pkt[ETH_MTU];
@@ -116,8 +128,9 @@ int udp_recvfrom(struct udp_sock *s, void *buf, size_t len, uint32_t *src, uint1
         }
         mutex_unlock(&net_lock);
         uint64_t now = time_ms();
-        if (timeout_ms >= 0 && now >= deadline) return -ETIMEDOUT;
-        if (timeout_ms < 0) sem_wait(&s->sem);
-        else sem_wait_timeout(&s->sem, deadline - now);
+        if (timeout_ms == 0) return -EAGAIN;
+        if (timeout_ms > 0 && now >= deadline) return -ETIMEDOUT;
+        if (signal_interrupted()) return -ERESTARTSYS;
+        sem_wait_timeout(&s->sem, timeout_ms < 0 ? 100 : MIN(100, deadline - now));
     }
 }

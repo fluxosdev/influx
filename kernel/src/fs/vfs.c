@@ -164,6 +164,7 @@ int vfs_open_rel(const char *cwd, const char *path, int flags, struct file **out
         v = parent->ops->create(parent, last, VN_FILE);
         if (!v) { vnode_unref(parent); mutex_unlock(&vfs_mutex); return -EIO; }
     }
+    else if ((flags & (O_CREAT | O_EXCL)) == (O_CREAT | O_EXCL)) { if (parent) vnode_unref(parent); mutex_unlock(&vfs_mutex); vnode_unref(v); return -EEXIST; }
     if (parent) vnode_unref(parent);
     mutex_unlock(&vfs_mutex);
     if ((flags & O_DIRECTORY) && v->type != VN_DIR) { vnode_unref(v); return -ENOTDIR; }
@@ -171,6 +172,7 @@ int vfs_open_rel(const char *cwd, const char *path, int flags, struct file **out
     if ((flags & O_TRUNC) && (flags & O_ACCMODE) != O_RDONLY && v->type == VN_FILE && v->ops->truncate && (r = v->ops->truncate(v, 0)) < 0) { vnode_unref(v); return r; }
     struct file *f = kzalloc(sizeof *f);
     f->vn = v; f->flags = flags; f->refcount = 1;
+    f->path = strdup(norm);
     f->pos = (flags & O_APPEND) ? v->size : 0;
     *out = f;
     return 0;
@@ -223,6 +225,7 @@ int vfs_close(struct file *f) {
     int r = 0;
     if ((f->flags & O_ACCMODE) != O_RDONLY && f->vn->type == VN_FILE && f->vn->ops->sync) r = f->vn->ops->sync(f->vn);
     vnode_unref(f->vn);
+    kfree(f->path);
     kfree(f);
     return r < 0 ? r : 0;
 }

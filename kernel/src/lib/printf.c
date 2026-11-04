@@ -2,6 +2,8 @@
 #include "string.h"
 #include "arch.h"
 #include "spinlock.h"
+#include "sched.h"
+#include "percpu.h"
 
 /* Minimal printf: %d %i %u %x %X %p %s %c %% %ld %lu %lx %lld %llu %llx %zu %zx with
  * width, '-', '0', and precision for strings/ints. No floating point. */
@@ -88,16 +90,22 @@ void kvprintf(const char *fmt, va_list ap) {
     if (n >= (int)sizeof buf) n = sizeof buf - 1;
     spin_lock(&print_lock);
     serial_write(buf, n);
+    klog_write(buf, n);
     spin_unlock(&print_lock);
 }
 void kprintf(const char *fmt, ...) { va_list ap; va_start(ap, fmt); kvprintf(fmt, ap); va_end(ap); }
 
 void NORETURN panic(const char *fmt, ...) {
     cli();
+    static volatile int entered;
+    if (__atomic_exchange_n(&entered, 1, __ATOMIC_ACQ_REL)) for (;;) hlt();   /* a second CPU, or a panic while panicking */
+    panicking = true;
     smp_halt_others();
     spin_release(&print_lock);   /* a CPU stopped mid-kprintf would keep it forever */
-    kprintf("\n\033[31;1m*** KERNEL PANIC ***\033[0m\n");
-    va_list ap; va_start(ap, fmt); kvprintf(fmt, ap); va_end(ap);
-    kprintf("\n");
-    for (;;) hlt();
+    char reason[200];
+    va_list ap; va_start(ap, fmt); vsnprintf(reason, sizeof reason, fmt, ap); va_end(ap);
+    kprintf("\n\033[31;1m*** KERNEL PANIC ***\033[0m\n%s\n", reason);
+    if (current_thread) kprintf("thread '%s' (tid %d) on cpu %d\n", current_thread->name, current_thread->tid, this_cpu()->id);
+    panic_backtrace(0, (uint64_t)__builtin_frame_address(0));
+    panic_finish(reason);
 }
