@@ -4,6 +4,8 @@
  * window_* API and receive events through per-window queues.
  */
 #include "ui.h"
+#include "sounds.h"
+#include "power.h"
 #include "mm.h"
 #include "string.h"
 #include "io.h"
@@ -484,6 +486,7 @@ static const char *current_app_name(void) {
 }
 static const struct app_menus *current_menus(void) { return focused && !(focused->flags & WIN_UTILITY) ? focused->menus : NULL; }
 
+static struct power_status menubar_power;
 static void draw_menubar(struct canvas *c) {
     if (!rect_overlaps(rect_make(0, 0, scr_w, MENUBAR_H), c->clip)) return;
     gfx_fill_rect(c, 0, 0, scr_w, MENUBAR_H, theme.menubar_bg);
@@ -512,6 +515,33 @@ static void draw_menubar(struct canvas *c) {
     char clk[64]; clock_string(clk, sizeof clk);
     int cw = font_text_width(font_ui, clk);
     font_draw(c, font_ui, scr_w - cw - 14, ty, theme.menubar_text, clk);
+    /* battery: an outline filled to the charge, then the percentage */
+    struct power_status ps = menubar_power;
+    if (ps.battery_present && ps.percent >= 0) {
+        char pct[16]; snprintf(pct, sizeof pct, "%d%%", ps.percent);
+        int pw = font_text_width(font_ui, pct), bx = scr_w - cw - 14 - 18 - pw - 6 - 25, by = (MENUBAR_H - 11) / 2;
+        color_t col = theme.menubar_text, fill = ps.percent <= 10 && !ps.charging ? RGB(0xFF, 0x45, 0x3A) : ps.charging || ps.on_ac ? RGB(0x34, 0xC7, 0x59) : col;
+        gfx_draw_rounded_rect(c, bx, by, 22, 11, 3, col);
+        gfx_fill_rect(c, bx + 22, by + 3, 2, 5, col);
+        int fw = MAX(1, 18 * ps.percent / 100);
+        gfx_fill_rounded_rect(c, bx + 2, by + 2, fw, 7, 2, fill);
+        font_draw(c, font_ui, bx + 30, ty, theme.menubar_text, pct);
+    }
+}
+
+/* the battery shown in the menu bar, refreshed by power_thread (AML can be slow: never from drawing) */
+static void power_thread(void *arg) {
+    for (;;) {
+        struct power_status ps;
+        bool any = power_status(&ps);
+        if (any || menubar_power.battery_present) {
+            bool changed = memcmp(&ps, &menubar_power, sizeof ps) != 0;
+            menubar_power = ps;
+            if (changed) damage_add(rect_make(0, 0, scr_w, MENUBAR_H));
+        }
+        if (!any && !menubar_power.battery_present && time_ms() > 120000) return;   /* a desktop without a battery */
+        thread_sleep_ms(30000);
+    }
 }
 
 static const struct menu *open_menu_def(void) {
@@ -682,6 +712,7 @@ static void compose_band(void *ctx, int i) {
     list_for_each_entry(w, &windows, link) if (!(w->flags & WIN_MINIMIZED)) draw_window(&c, w, true);
 }
 
+static void draw_toasts(struct canvas *c);
 static void compose(struct rect r) {
     struct window *w;
     int bands = smp_workers() > 1 && r.w * r.h >= COMPOSE_BAND_MIN_PX ? MIN(smp_workers() * 2, r.h / 16) : 1;
@@ -697,6 +728,7 @@ static void compose(struct rect r) {
         list_for_each_entry(w, &windows, link) if (!(w->flags & WIN_MINIMIZED)) draw_window(screen, w, false);
     }
     draw_dock(screen);
+    draw_toasts(screen);
     draw_menubar(screen);
     if (open_menu != -1) draw_menu_popup(screen);
     if (!hw_cursor) gfx_blit(screen, mouse_x - 1, mouse_y - 1, cursor_img);
@@ -789,9 +821,12 @@ static void handle_menu_command(int cmd) {
     window_post_event(focused, &e);
 }
 
+static bool toast_click(int x, int y);
+static void toasts_tick(void);
 static void on_mouse_button(const struct input_event *in) {
     int x = mouse_x, y = mouse_y;
     mouse_buttons = in->buttons;
+    if (in->pressed && in->button == BTN_LEFT && open_menu == -1 && toast_click(x, y)) { toasts_tick(); return; }
     if (in->pressed && in->button == BTN_LEFT) {
         if (open_menu != -1) {
             int item = menu_item_at(x, y);
@@ -995,6 +1030,72 @@ static void on_key(const struct input_event *in) {
     }
 }
 
+/* ---------------------------------------------------------------- notifications
+ * Banners in the top right corner, newest on top, under the menu bar. They go away after five
+ * seconds or when clicked. Posted from any thread: the list has its own lock. */
+#define TOAST_MAX 4
+#define TOAST_W 340
+#define TOAST_H 66
+#define TOAST_MS 5000
+static struct toast { char title[64], body[200]; uint64_t at; bool used; } toasts[TOAST_MAX];
+static spinlock_t toast_lock = SPINLOCK_INIT;
+static struct rect toast_rect(int slot) { return rect_make(scr_w - TOAST_W - 12, MENUBAR_H + 10 + slot * (TOAST_H + 8), TOAST_W, TOAST_H); }
+static struct rect toasts_area(void) { struct rect a = toast_rect(0); a.x -= 20; a.y -= 10; a.w += 40; a.h = TOAST_MAX * (TOAST_H + 8) + 30; return a; }
+
+void notify_post(const char *title, const char *body) {
+    spin_lock(&toast_lock);
+    memmove(&toasts[1], &toasts[0], (TOAST_MAX - 1) * sizeof toasts[0]);   /* newest on top; the oldest falls off */
+    strlcpy(toasts[0].title, title, sizeof toasts[0].title);
+    strlcpy(toasts[0].body, body ? body : "", sizeof toasts[0].body);
+    toasts[0].at = system_ticks; toasts[0].used = true;
+    spin_unlock(&toast_lock);
+    kprintf("notification: %s: %s\n", title, body ? body : "");
+    damage_add(toasts_area());
+    sound_play(SOUND_NOTIFY);
+    sem_post(&wake_sem);
+}
+
+static void draw_toasts(struct canvas *c) {
+    if (!rect_overlaps(toasts_area(), c->clip)) return;
+    struct toast local[TOAST_MAX];
+    spin_lock(&toast_lock); memcpy(local, toasts, sizeof local); spin_unlock(&toast_lock);
+    for (int i = 0; i < TOAST_MAX; i++) {
+        if (!local[i].used) continue;
+        struct rect r = toast_rect(i);
+        gfx_shadow_outside(c, r, 12, 10, 50, 3);
+        gfx_fill_rounded_rect(c, r.x, r.y, r.w, r.h, 12, theme.dark ? RGBA(0x2C, 0x2C, 0x2E, 0xF4) : RGBA(0xFA, 0xFA, 0xFC, 0xF4));
+        gfx_draw_rounded_rect(c, r.x, r.y, r.w, r.h, 12, theme.dark ? RGBA(255, 255, 255, 0x22) : RGBA(0, 0, 0, 0x1A));
+        if (logo_icon) gfx_blit_scaled_tinted(c, r.x + 14, r.y + (r.h - 28) / 2, 28, 28, logo_icon, theme.accent);
+        font_draw_ellipsized(c, font_ui_semibold, r.x + 54, r.y + 12, r.w - 66, theme.text, local[i].title);
+        /* the body on up to two lines */
+        const char *b = local[i].body;
+        int n = font_fit_chars(font_ui_small, b, r.w - 66);
+        if ((size_t)n < strlen(b)) { int k = n; while (k > 0 && b[k] != ' ') k--; if (k > 0) n = k; }
+        font_draw_n(c, font_ui_small, r.x + 54, r.y + 31, theme.text_secondary, b, n);
+        if (b[n]) font_draw_ellipsized(c, font_ui_small, r.x + 54, r.y + 46, r.w - 66, theme.text_secondary, b + n + (b[n] == ' '));
+    }
+}
+
+/* expired banners go; a click on one dismisses it (wm_lock held) */
+static void toasts_tick(void) {
+    bool changed = false;
+    spin_lock(&toast_lock);
+    for (int i = 0; i < TOAST_MAX; i++) if (toasts[i].used && system_ticks - toasts[i].at > TOAST_MS) { toasts[i].used = false; changed = true; }
+    /* close the gaps */
+    int k = 0;
+    for (int i = 0; i < TOAST_MAX; i++) if (toasts[i].used) { if (k != i) toasts[k] = toasts[i]; k++; }
+    for (; k < TOAST_MAX; k++) toasts[k].used = false;
+    spin_unlock(&toast_lock);
+    if (changed) damage_add(toasts_area());
+}
+static bool toast_click(int x, int y) {
+    bool hit = false;
+    spin_lock(&toast_lock);
+    for (int i = 0; i < TOAST_MAX; i++) if (toasts[i].used && rect_contains(toast_rect(i), x, y)) { toasts[i].at = 0; hit = true; }
+    spin_unlock(&toast_lock);
+    return hit;
+}
+
 /* ---------------------------------------------------------------- main loop */
 void wm_init(void) {
     mutex_init(&wm_lock);
@@ -1003,6 +1104,7 @@ void wm_init(void) {
     mouse_x = scr_w / 2; mouse_y = scr_h / 2;
     theme_apply(false, 0);
     prefs_load();   /* saved appearance, wallpaper, clock and time zone */
+    thread_create(kernel_process, "power", power_thread, NULL);
     wallpaper_build();
     cursor_init();
     hw_cursor_init();
@@ -1071,6 +1173,8 @@ void wm_run(void) {
                 mutex_unlock(&wm_lock);
             }
         }
+        static uint64_t last_toast_check;
+        if (system_ticks - last_toast_check > 250) { last_toast_check = system_ticks; mutex_lock(&wm_lock); toasts_tick(); mutex_unlock(&wm_lock); }
         if (system_ticks - last_clock_check > 1000) {
             last_clock_check = system_ticks;
             struct rtc_time t; unix_to_datetime(time_unix() + tz_offset_minutes * 60, &t);

@@ -46,6 +46,25 @@ UPROGS    := $(patsubst user/bin/%.c,$(BUILD)/sysroot/bin/%,$(wildcard user/bin/
 # dynamically linked programs (user/dyn): musl's libc.so is also its dynamic linker, /lib/ld-musl-x86_64.so.1
 UPROGS_DYN := $(patsubst user/dyn/%.c,$(BUILD)/sysroot/bin/%,$(wildcard user/dyn/*.c))
 LDSO      := $(BUILD)/sysroot/lib/ld-musl-x86_64.so.1
+# libui: the kernel's drawing, font, image, widget, theme and HTTP code compiled for user programs
+# (shim headers in user/ui/shim stand in for the kernel's heap, threads and window system)
+UI_KSRC   := kernel/src/gfx/canvas.c kernel/src/gfx/font.c kernel/src/gfx/image.c kernel/src/gfx/imgdecode.c \
+             kernel/src/ui/widgets.c kernel/src/ui/theme.c kernel/src/lib/simd.c kernel/src/net/http.c
+UI_SRC    := $(wildcard user/ui/*.c)
+UI_CFLAGS := -std=gnu11 -O2 -g -mavx -DINFLUX_USERSPACE -D_GNU_SOURCE -MMD -MP \
+             -iquote user/ui/shim -iquote kernel/include -iquote user/apps/browser -Ithird_party/bearssl/inc \
+             -Wall -Wextra -Wno-unused-parameter -Wno-unused-function -Wno-misleading-indentation -Wno-type-limits \
+             -Wno-missing-field-initializers -Wno-sign-compare -Wno-address-of-packed-member \
+             -Wno-unused-but-set-variable -Wno-implicit-fallthrough -Wno-format-truncation
+UI_OBJ    := $(patsubst kernel/src/%.c,$(BUILD)/user/ui/k/%.o,$(UI_KSRC)) $(patsubst user/ui/%.c,$(BUILD)/user/ui/%.o,$(UI_SRC))
+UILIB     := $(BUILD)/user/libui.a
+BROWSER_OBJ := $(patsubst user/apps/browser/%.c,$(BUILD)/user/apps/browser/%.o,$(wildcard user/apps/browser/*.c))
+UAPPS     := $(BUILD)/sysroot/bin/browser $(BUILD)/sysroot/bin/wget
+# BearSSL (third_party/bearssl) for TLS in user programs, and the Mozilla roots it trusts
+BEARSSL_SRC := $(shell find third_party/bearssl/src -name '*.c')
+BEARSSL_OBJ := $(patsubst third_party/bearssl/src/%.c,$(BUILD)/user/bearssl/%.o,$(BEARSSL_SRC))
+BEARSSL     := $(BUILD)/user/libbearssl.a
+CA_BUNDLE   := $(BUILD)/sysroot/etc/ssl/certs/ca-certificates.crt
 
 # ---- assets ----
 FONTGEN := $(BUILD)/tools/fontgen
@@ -68,7 +87,7 @@ FONT_FILES := $(foreach s,$(FONT_SPECS),$(SYSROOT)/sys/fonts/$(word 1,$(subst :,
 ICON_PNGS  := $(wildcard assets/icons/png/*.png)
 ICON_FILES := $(patsubst assets/icons/png/%.png,$(SYSROOT)/sys/icons/%.img,$(ICON_PNGS))
 
-.PHONY: all kernel initrd run run-kvm run-nogui disk clean distclean tools test
+.PHONY: all kernel initrd run run-kvm run-nogui disk clean distclean tools test test-fs
 
 all: $(ISO)
 
@@ -136,6 +155,46 @@ $(SYSROOT)/bin/%: user/dyn/%.c $(MUSL_LIBC)
 	@mkdir -p $(dir $@)
 	$(MUSL_GCC) $(filter-out -static,$(UCFLAGS)) $< -o $@
 
+$(BUILD)/user/ui/k/%.o: kernel/src/%.c $(MUSL_LIBC)
+	@mkdir -p $(dir $@)
+	$(MUSL_GCC) $(UI_CFLAGS) -c $< -o $@
+
+$(BUILD)/user/ui/%.o: user/ui/%.c $(MUSL_LIBC)
+	@mkdir -p $(dir $@)
+	$(MUSL_GCC) $(UI_CFLAGS) -c $< -o $@
+
+$(UILIB): $(UI_OBJ)
+	ar rcs $@ $^
+
+$(BUILD)/user/apps/browser/%.o: user/apps/browser/%.c $(MUSL_LIBC)
+	@mkdir -p $(dir $@)
+	$(MUSL_GCC) $(UI_CFLAGS) -c $< -o $@
+
+$(SYSROOT)/bin/browser: $(BROWSER_OBJ) $(UILIB) $(BEARSSL)
+	@mkdir -p $(dir $@)
+	$(MUSL_GCC) -static $^ -lm -o $@
+
+$(BUILD)/user/apps/wget/%.o: user/apps/wget/%.c $(MUSL_LIBC)
+	@mkdir -p $(dir $@)
+	$(MUSL_GCC) $(UI_CFLAGS) -c $< -o $@
+
+$(SYSROOT)/bin/wget: $(BUILD)/user/apps/wget/main.o $(UILIB) $(BEARSSL)
+	@mkdir -p $(dir $@)
+	$(MUSL_GCC) -static $^ -lm -o $@
+
+$(BUILD)/user/bearssl/%.o: third_party/bearssl/src/%.c $(MUSL_LIBC)
+	@mkdir -p $(dir $@)
+	$(MUSL_GCC) -std=gnu99 -O2 -g -Ithird_party/bearssl/inc -Ithird_party/bearssl/src -c $< -o $@
+
+$(BEARSSL): $(BEARSSL_OBJ)
+	ar rcs $@ $^
+
+$(CA_BUNDLE): third_party/ca-certificates/cacert.pem
+	@mkdir -p $(dir $@)
+	cp $< $@
+
+-include $(UI_OBJ:.o=.d) $(BROWSER_OBJ:.o=.d)
+
 $(LDSO): $(MUSL_LIBC)
 	@mkdir -p $(dir $@)
 	strip --strip-debug -o $@ $(MUSL)/lib/libc.so
@@ -157,7 +216,7 @@ SKEL_FILES := $(shell find sysroot -type f 2>/dev/null)
 
 initrd: $(INITRD)
 
-$(INITRD): $(FONT_FILES) $(ICON_FILES) $(UPROGS) $(UPROGS_DYN) $(LDSO) $(SKEL_FILES) $(KERNEL)
+$(INITRD): $(FONT_FILES) $(ICON_FILES) $(UPROGS) $(UPROGS_DYN) $(UAPPS) $(LDSO) $(CA_BUNDLE) $(SKEL_FILES) $(KERNEL)
 	@mkdir -p $(SYSROOT)/boot/limine
 	cp -r sysroot/. $(SYSROOT)/
 	cp $(KERNEL) $(SYSROOT)/boot/influx.elf
@@ -193,7 +252,7 @@ $(ISO): $(KERNEL) $(INITRD) limine.conf $(BUILD)/limine
 # make test: the host-side filesystem regressions, then a headless boot that runs /bin/systest
 # (boot option 'selftest'; SELFTEST_NET=1 adds the DNS/TCP checks, which need the internet)
 SELFTEST_ISO := $(BUILD)/influx-selftest.iso
-SELFTEST_CMDLINE := selftest$(if $(SELFTEST_NET), selftest-net)
+SELFTEST_CMDLINE := selftest$(if $(SELFTEST_NET), selftest-net)$(if $(SELFTEST_FS), selftest-fs)
 $(SELFTEST_ISO): $(ISO) FORCE
 	rm -rf $(BUILD)/iso-selftest
 	cp -r $(BUILD)/iso $(BUILD)/iso-selftest
@@ -203,6 +262,12 @@ $(SELFTEST_ISO): $(ISO) FORCE
 test: $(SELFTEST_ISO)
 	bash tests/run-fs-regressions.sh
 	bash tests/run-selftest.sh $(SELFTEST_ISO)
+
+# make test-fs: the read-only ext4 driver against a volume built by mkfs.ext4 (needs e2fsprogs)
+test-fs:
+	bash tests/mk-fs-image.sh ext4 $(BUILD)/test-ext4.img
+	$(MAKE) $(SELFTEST_ISO) SELFTEST_FS=1
+	SELFTEST_DISK=$(BUILD)/test-ext4.img bash tests/run-selftest.sh $(SELFTEST_ISO)
 
 # ---- install target disk ----
 DISK_INSTALL := $(BUILD)/install.img

@@ -263,7 +263,7 @@ int64_t sys_connect(int fd, uint64_t uaddr, uint32_t len) {
         if (tcp_connecting(s->tcp)) return -EALREADY;
         return -EISCONN;
     }
-    if (ip == 0x7F000001 || !ip) return -ECONNREFUSED;   /* no loopback interface yet */
+    if (!ip) ip = 0x7F000001;   /* INADDR_ANY: this machine */
     s->tcp = tcp_connect_start(ip, port, s->bind_port, &e);
     if (!s->tcp) return -e;
     s->peer_ip = ip; s->peer_port = port;

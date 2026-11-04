@@ -14,14 +14,17 @@ uint32_t ip_pseudo_sum(uint32_t src, uint32_t dst, uint8_t proto, uint16_t len) 
 
 struct netif *ip_route(uint32_t dst, uint32_t *hop) {
     if (dst == 0xFFFFFFFF) { *hop = dst; return netif_default(); }
+    /* 127/8 and this machine's own addresses go round through lo */
+    if ((dst >> 24) == 127) { *hop = dst; return netif_loopback(); }
+    for (int i = 0; i < netif_count(); i++) { struct netif *n = netif_at(i); if (n->configured && n->ip == dst && !n->loopback) { *hop = dst; return netif_loopback(); } }
     for (int i = 0; i < netif_count(); i++) {
         struct netif *n = netif_at(i);
-        if (!n->up || !n->configured) continue;
+        if (!n->up || !n->configured || n->loopback) continue;
         if ((dst & n->netmask) == (n->ip & n->netmask)) { *hop = dst; return n; }
     }
     for (int i = 0; i < netif_count(); i++) {
         struct netif *n = netif_at(i);
-        if (n->up && n->configured && n->gateway) { *hop = n->gateway; return n; }
+        if (n->up && n->configured && n->gateway && !n->loopback) { *hop = n->gateway; return n; }
     }
     return NULL;
 }
@@ -42,6 +45,7 @@ int ip_output_src(struct netif *n, uint32_t src, uint32_t dst, uint8_t proto, co
     h->dst = htonl(dst);
     h->csum = htons(net_checksum(h, sizeof *h, 0));
     memcpy(pkt + sizeof *h, payload, len);
+    if (n->loopback) return loopback_output(pkt, sizeof *h + len);
     return arp_output(n, hop, pkt, sizeof *h + len);
 }
 
@@ -62,7 +66,7 @@ void ip_input(struct netif *n, const uint8_t *pkt, size_t len) {
     if (net_checksum(h, ihl, 0) != 0) { n->rx_errors++; return; }
     if (ntohs(h->frag) & (IP_FLAG_MF | IP_FRAG_OFFSET)) { ip_dropped_fragments++; return; }
     uint32_t src = ntohl(h->src), dst = ntohl(h->dst);
-    bool for_us = !n->configured || dst == n->ip || dst == 0xFFFFFFFF || (n->netmask && dst == (n->ip | ~n->netmask));
+    bool for_us = n->loopback || !n->configured || dst == n->ip || dst == 0xFFFFFFFF || (n->netmask && dst == (n->ip | ~n->netmask));
     if (!for_us) return;
     ip_input_ttl = h->ttl;
     const uint8_t *payload = pkt + ihl;

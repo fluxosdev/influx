@@ -213,6 +213,26 @@ static void test_files(void) {
     close(dfd);
 }
 
+/* ---- symbolic links ---- */
+static void test_symlinks(void) {
+    mkdir("/tmp/sl", 0755);
+    FILE *f = fopen("/tmp/sl/target.txt", "w"); fputs("linked", f); fclose(f);
+    CHECK("symlink", symlink("target.txt", "/tmp/sl/rel") == 0 && symlink("/tmp/sl", "/tmp/sl-abs") == 0);
+    char buf[64] = { 0 };
+    CHECK("readlink", readlink("/tmp/sl/rel", buf, sizeof buf) == 10 && !strncmp(buf, "target.txt", 10));
+    struct stat st;
+    CHECK("lstat sees the link, stat the target", lstat("/tmp/sl/rel", &st) == 0 && S_ISLNK(st.st_mode) && stat("/tmp/sl/rel", &st) == 0 && S_ISREG(st.st_mode) && st.st_size == 6);
+    memset(buf, 0, sizeof buf);
+    f = fopen("/tmp/sl-abs/rel", "r");   /* through two links: a directory one, then a relative one */
+    CHECK("open through a directory link and a relative link", f && fgets(buf, sizeof buf, f) && !strcmp(buf, "linked"));
+    if (f) fclose(f);
+    symlink("loop2", "/tmp/sl/loop1"); symlink("loop1", "/tmp/sl/loop2");
+    CHECK("a link loop fails instead of hanging", open("/tmp/sl/loop1", O_RDONLY) == -1);
+    CHECK("rename a link", rename("/tmp/sl/rel", "/tmp/sl/rel2") == 0 && readlink("/tmp/sl/rel2", buf, sizeof buf) == 10);
+    CHECK("unlink removes the link, not the target", unlink("/tmp/sl/rel2") == 0 && access("/tmp/sl/target.txt", F_OK) == 0);
+    unlink("/tmp/sl/loop1"); unlink("/tmp/sl/loop2"); unlink("/tmp/sl/target.txt"); unlink("/tmp/sl-abs"); rmdir("/tmp/sl");
+}
+
 /* ---- pipes, poll, socketpair ---- */
 static void test_ipc(void) {
     int p[2]; pipe2(p, O_NONBLOCK);
@@ -253,6 +273,35 @@ static void test_time(void) {
     CHECK("getrandom", getrandom(r1, 32, 0) == 32 && getrandom(r2, 32, 0) == 32 && memcmp(r1, r2, 32));
 }
 
+/* ---- loopback: TCP and UDP to 127.0.0.1, no network needed ---- */
+static void test_loopback(void) {
+    int l = socket(AF_INET, SOCK_STREAM, 0);
+    struct sockaddr_in sa = { .sin_family = AF_INET, .sin_port = htons(5555), .sin_addr.s_addr = htonl(INADDR_LOOPBACK) };
+    bool ok = l >= 0 && bind(l, (struct sockaddr *)&sa, sizeof sa) == 0 && listen(l, 4) == 0;
+    CHECK("TCP listen on 127.0.0.1", ok);
+    int c = socket(AF_INET, SOCK_STREAM, 0);
+    CHECK("TCP connect over loopback", connect(c, (struct sockaddr *)&sa, sizeof sa) == 0);
+    struct sockaddr_in peer; socklen_t pl = sizeof peer;
+    int a = accept(l, (struct sockaddr *)&peer, &pl);
+    CHECK("accept", a >= 0 && peer.sin_addr.s_addr == htonl(INADDR_LOOPBACK));
+    char big[100000];
+    for (size_t i = 0; i < sizeof big; i++) big[i] = (char)(i * 7);
+    pid_t w = fork();
+    if (w == 0) { close(a); size_t o = 0; while (o < sizeof big) { ssize_t r = write(c, big + o, sizeof big - o); if (r <= 0) _exit(1); o += (size_t)r; } close(c); _exit(0); }
+    close(c);
+    static char got[100000]; size_t n = 0; ssize_t r;
+    while ((r = read(a, got + n, sizeof got - n)) > 0) n += (size_t)r;
+    int st; waitpid(w, &st, 0);
+    CHECK("100 kB across loopback TCP, then EOF", n == sizeof big && !memcmp(got, big, sizeof big) && WIFEXITED(st) && WEXITSTATUS(st) == 0);
+    close(a); close(l);
+    int u1 = socket(AF_INET, SOCK_DGRAM, 0), u2 = socket(AF_INET, SOCK_DGRAM, 0);
+    struct sockaddr_in ua = { .sin_family = AF_INET, .sin_port = htons(5556), .sin_addr.s_addr = htonl(INADDR_LOOPBACK) };
+    bind(u1, (struct sockaddr *)&ua, sizeof ua);
+    char m[16] = { 0 };
+    CHECK("UDP over loopback", sendto(u2, "dgram", 5, 0, (struct sockaddr *)&ua, sizeof ua) == 5 && recv(u1, m, sizeof m, 0) == 5 && !strcmp(m, "dgram"));
+    close(u1); close(u2);
+}
+
 /* ---- network (optional) ---- */
 static void test_net(void) {
     struct addrinfo hints = { 0 }, *ai = NULL;
@@ -276,6 +325,19 @@ static void test_net(void) {
     CHECK("non-blocking connect: EINPROGRESS, then POLLOUT, SO_ERROR 0", c == -1 && errno == EINPROGRESS && poll(&pf, 1, 5000) == 1 && getsockopt(s, SOL_SOCKET, SO_ERROR, &err, &el) == 0 && err == 0);
     close(s);
     freeaddrinfo(ai);
+    /* HTTPS through /bin/wget: BearSSL, certificate checks against the Mozilla roots, the system clock */
+    int st;
+    pid_t w = fork();
+    if (w == 0) { int dn = open("/dev/null", O_WRONLY); dup2(dn, 2); execl("/bin/wget", "wget", "-q", "-O", "/tmp/https.html", "https://example.com/", (char *)NULL); _exit(127); }
+    waitpid(w, &st, 0);
+    char page[4096] = { 0 };
+    int hf = open("/tmp/https.html", O_RDONLY);
+    if (hf >= 0) { read(hf, page, sizeof page - 1); close(hf); }
+    CHECK("HTTPS GET (wget, BearSSL, certificate verified)", WIFEXITED(st) && WEXITSTATUS(st) == 0 && strstr(page, "Example Domain"));
+    w = fork();
+    if (w == 0) { int dn = open("/dev/null", O_WRONLY); dup2(dn, 2); execl("/bin/wget", "wget", "-q", "-O", "/dev/null", "https://expired.badssl.com/", (char *)NULL); _exit(127); }
+    waitpid(w, &st, 0);
+    CHECK("HTTPS refuses an expired certificate", WIFEXITED(st) && WEXITSTATUS(st) == 1);
     /* a listening socket that QEMU's hostfwd can reach (tcp::5555-:7) answers one connection */
     int l = socket(AF_INET, SOCK_STREAM, 0);
     struct sockaddr_in sa = { .sin_family = AF_INET, .sin_port = htons(7), .sin_addr.s_addr = INADDR_ANY };
@@ -283,7 +345,56 @@ static void test_net(void) {
     close(l);
 }
 
+/* ---- a volume made by tests/mk-fs-image.sh (ext4, NTFS), mounted at dir ---- */
+static bool pattern_ok(const char *path, long size) {
+    int fd = open(path, O_RDONLY);
+    if (fd < 0) return false;
+    static unsigned char buf[65536];
+    long off = 0; ssize_t r; bool ok = true;
+    while ((r = read(fd, buf, sizeof buf)) > 0) {
+        for (ssize_t i = 0; i < r; i++) if (buf[i] != (unsigned char)(((off + i) * 7 + size) % 251)) ok = false;
+        off += r;
+    }
+    close(fd);
+    return ok && off == size;
+}
+static void test_volume(const char *dir) {
+    char p[512];
+    static const long sizes[] = { 0, 1, 4095, 4096, 70000, 5 * 1024 * 1024 + 3 };
+    for (unsigned i = 0; i < sizeof sizes / sizeof sizes[0]; i++) {
+        snprintf(p, sizeof p, "%s/p%ld", dir, sizes[i]);
+        char name[64]; snprintf(name, sizeof name, "read a %ld-byte file", sizes[i]);
+        struct stat st;
+        CHECK(name, stat(p, &st) == 0 && st.st_size == sizes[i] && pattern_ok(p, sizes[i]));
+    }
+    snprintf(p, sizeof p, "%s/dir/sub/deep.bin", dir);
+    CHECK("nested directories", pattern_ok(p, 12345));
+    snprintf(p, sizeof p, "%s/many", dir);
+    DIR *d = opendir(p); int n = 0; struct dirent *e; bool all = true;
+    while (d && (e = readdir(d))) if (strncmp(e->d_name, "file", 4) == 0) n++;
+    if (d) closedir(d);
+    for (int i = 0; i < 300; i += 37) { snprintf(p, sizeof p, "%s/many/file%03d", dir, i); char b[8] = { 0 }; int fd = open(p, O_RDONLY); if (fd < 0 || read(fd, b, 7) <= 0 || atoi(b) != i) all = false; if (fd >= 0) close(fd); }
+    CHECK("a 300-entry directory: listing and lookups", n == 300 && all);
+    snprintf(p, sizeof p, "%s/short-link", dir);
+    struct stat ls;
+    if (lstat(p, &ls) == 0) {
+        char t[256] = { 0 };
+        CHECK("short symbolic link", S_ISLNK(ls.st_mode) && readlink(p, t, sizeof t) == 5 && !strcmp(t, "p4096") && pattern_ok(p, 4096));
+        snprintf(p, sizeof p, "%s/long-link", dir);
+        memset(t, 0, sizeof t);
+        CHECK("long symbolic link (stored in a block)", readlink(p, t, sizeof t) == 83 && !strncmp(t, "dir/sub/../sub/deep.bin-that", 28));
+    }
+    CHECK("the volume is read-only", open(dir, O_RDONLY) >= 0 && ({ snprintf(p, sizeof p, "%s/new.txt", dir); open(p, O_CREAT | O_WRONLY, 0644) < 0; }));
+}
+
 int main(int argc, char **argv) {
+    if (argc > 2 && !strcmp(argv[1], "fs")) {
+        setvbuf(stdout, NULL, _IOLBF, 0);
+        printf("systest: checking the volume at %s\n", argv[2]);
+        test_volume(argv[2]);
+        printf("systest: %d of %d checks passed\n", checks - failures, checks);
+        return failures;
+    }
     setvbuf(stdout, NULL, _IOLBF, 0);
     printf("systest: inFlux system call checks (pid %d)\n", getpid());
     test_memory();
@@ -291,8 +402,10 @@ int main(int argc, char **argv) {
     test_processes();
     test_threads();
     test_files();
+    test_symlinks();
     test_ipc();
     test_time();
+    test_loopback();
     if (argc > 1 && !strcmp(argv[1], "net")) test_net();
     printf("systest: %d of %d checks passed\n", checks - failures, checks);
     return failures;

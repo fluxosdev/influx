@@ -7,6 +7,7 @@
 
 struct vnode *btrfs_mount(struct blockdev *d);
 struct vnode *fat32_mount(struct blockdev *d);
+struct vnode *ext4_mount(struct blockdev *d);
 int btrfs_unmount(struct vnode *root);   /* final write-back, leaves the background flusher */
 void fat32_free(struct vnode *root);     /* frees a FAT volume that never got mounted */
 
@@ -24,6 +25,7 @@ static int mount_one(struct blockdev *d) {
     if (vfs_mount_count() >= VFS_MAX_MOUNTS) { kprintf("storage: no free mount slot for %s\n", d->name); return -ENOSPC; }   /* a mounted fs cannot be torn down again */
     struct vnode *root = btrfs_mount(d);
     if (!root) root = fat32_mount(d);
+    if (!root) root = ext4_mount(d);
     if (!root) return -EINVAL;
     char mp[64];
     snprintf(mp, sizeof mp, d->esp ? "/mnt/.%s" : "/mnt/%s", d->name);   /* dot-name hides the ESP */

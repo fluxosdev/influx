@@ -29,4 +29,5 @@ int influx_sysinfo(struct influx_sysinfo *si) { return (int)ret(sc(SYS_INFLUX_SY
 int influx_ps(struct procinfo *out, int max) { return (int)ret(sc(SYS_INFLUX_PS, (long)out, max, 0, 0)); }
 int influx_lsblk(struct blkinfo *out, int max) { return (int)ret(sc(SYS_INFLUX_LSBLK, (long)out, max, 0, 0)); }
 int influx_spawn(const char *path, char *const argv[], char *const envp[]) { return (int)ret(sc(SYS_INFLUX_SPAWN, (long)path, (long)argv, (long)envp, 0)); }
+int influx_notify(const char *title, const char *body) { return (int)ret(sc(SYS_INFLUX_NOTIFY, (long)title, (long)body, 0, 0)); }
 long uptime_ms(void) { struct timespec ts; clock_gettime(CLOCK_MONOTONIC, &ts); return ts.tv_sec * 1000 + ts.tv_nsec / 1000000; }

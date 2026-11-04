@@ -41,3 +41,31 @@ uaccess_fault:
     ret
 
 .section .note.GNU-stack,"",@progbits
+
+/* MSR access that survives a #GP (an MSR this processor lacks): the #GP handler sends a fault in
+ * [msr_safe_start, msr_safe_end) to msr_fault, which returns -1 */
+.section .text
+.global msr_safe_start, msr_safe_end, msr_fault, rdmsr_safe, wrmsr_safe
+msr_safe_start:
+/* int rdmsr_safe(uint32_t msr, uint64_t *out) */
+rdmsr_safe:
+    movl %edi, %ecx
+    rdmsr
+    shlq $32, %rdx
+    orq %rdx, %rax
+    movq %rax, (%rsi)
+    xorl %eax, %eax
+    ret
+/* int wrmsr_safe(uint32_t msr, uint64_t v) */
+wrmsr_safe:
+    movl %edi, %ecx
+    movq %rsi, %rax
+    movq %rsi, %rdx
+    shrq $32, %rdx
+    wrmsr
+    xorl %eax, %eax
+    ret
+msr_safe_end:
+msr_fault:
+    movl $-1, %eax
+    ret

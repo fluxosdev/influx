@@ -4,7 +4,6 @@
  * programs (the HTTP client), on top of BSD sockets. Waits poll in short
  * steps so the caller's cancel flag stops them, as in the kernel.
  */
-#define _GNU_SOURCE
 #include <errno.h>
 #include <fcntl.h>
 #include <netdb.h>

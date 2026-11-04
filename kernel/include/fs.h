@@ -7,6 +7,7 @@
 #define VN_DIR  2
 #define VN_DEV  3      /* character device */
 #define VN_BLK  4      /* block device */
+#define VN_LNK  5      /* symbolic link: its data is the target path */
 
 #define O_RDONLY  0x0000
 #define O_WRONLY  0x0001
@@ -111,6 +112,10 @@ int vfs_mkdir(const char *path);
 int vfs_create(const char *path);
 int vfs_unlink(const char *path);
 int vfs_rename(const char *oldp, const char *newp);
+int vfs_symlink(const char *target, const char *linkpath);
+int vfs_readlink(const char *path, char *buf, size_t n);   /* bytes, not NUL-terminated */
+int vfs_lstat(const char *path, struct stat *st);
+struct vnode *vfs_lookup_nofollow(const char *path);
 int vfs_truncate(struct vnode *v, uint64_t size);           /* regular files only */
 int vfs_sync(void);
 int vfs_normalize(const char *cwd, const char *path, char *out, size_t n);   /* 0, -ENOENT (empty path) or -ENAMETOOLONG; out is "" on error */

@@ -8,7 +8,7 @@
 #include "random.h"
 #include "signal.h"
 
-extern char uaccess_start[], uaccess_end[], uaccess_fault[];
+extern char uaccess_start[], uaccess_end[], uaccess_fault[], msr_safe_start[], msr_safe_end[], msr_fault[];
 
 struct idt_entry { uint16_t off0; uint16_t sel; uint8_t ist; uint8_t type; uint16_t off1; uint32_t off2; uint32_t zero; } PACKED;
 static struct idt_entry idt[256] ALIGNED(16);
@@ -87,6 +87,8 @@ void isr_dispatch(struct regs *r) {
             /* the kernel's copy_from_user and friends: give up with -EFAULT */
             if (!(r->cs & 3) && r->rip >= (uint64_t)uaccess_start && r->rip < (uint64_t)uaccess_end) { r->rip = (uint64_t)uaccess_fault; return; }
         }
+        /* rdmsr_safe/wrmsr_safe: an MSR this processor does not have */
+        if (r->int_no == 13 && !(r->cs & 3) && r->rip >= (uint64_t)msr_safe_start && r->rip < (uint64_t)msr_safe_end) { r->rip = (uint64_t)msr_fault; return; }
         if ((r->cs & 3) && r->int_no != 8 && r->int_no != 18) {
             /* fault in user mode: a signal, which kills the process unless it handles it */
             int sig, code = 0; uint64_t addr = r->rip;

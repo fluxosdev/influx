@@ -14,6 +14,8 @@ static inline void outsw(uint16_t port, const void *buf, uint64_t count) { __asm
 
 static inline uint64_t rdmsr(uint32_t msr) { uint32_t lo, hi; __asm__ volatile("rdmsr" : "=a"(lo), "=d"(hi) : "c"(msr)); return ((uint64_t)hi << 32) | lo; }
 static inline void wrmsr(uint32_t msr, uint64_t v) { __asm__ volatile("wrmsr" :: "c"(msr), "a"((uint32_t)v), "d"((uint32_t)(v >> 32))); }
+int rdmsr_safe(uint32_t msr, uint64_t *out);   /* 0, or -1 if the MSR faulted (#GP) */
+int wrmsr_safe(uint32_t msr, uint64_t v);
 static inline uint64_t rdtsc(void) { uint32_t lo, hi; __asm__ volatile("rdtsc" : "=a"(lo), "=d"(hi)); return ((uint64_t)hi << 32) | lo; }
 
 static inline void cli(void) { __asm__ volatile("cli"); }

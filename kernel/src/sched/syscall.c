@@ -101,7 +101,7 @@ struct linux_stat {
     int64_t atime, atime_ns, mtime, mtime_ns, ctime, ctime_ns; int64_t reserved[3];
 };
 static uint32_t mode_of(int type, uint32_t perm) {
-    uint32_t fmt = type == VN_DIR ? 0040000 : type == VN_DEV ? 0020000 : type == VN_BLK ? 0060000 : 0100000;
+    uint32_t fmt = type == VN_DIR ? 0040000 : type == VN_DEV ? 0020000 : type == VN_BLK ? 0060000 : type == VN_LNK ? 0120000 : 0100000;
     if (perm & 0170000) return perm;   /* already carries a type (sockets) */
     return fmt | (perm & 07777 ? perm & 07777 : (type == VN_DIR ? 0755 : 0644));
 }
@@ -113,8 +113,8 @@ static void fill_stat(struct linux_stat *ls, struct vnode *v) {
     ls->size = (int64_t)v->size; ls->blksize = 4096; ls->blocks = (int64_t)((v->size + 511) / 512);
     ls->atime = ls->mtime = ls->ctime = (int64_t)v->mtime;
 }
-static int64_t stat_path(struct process *p, const char *abs, uint64_t ust) {
-    struct vnode *v = vfs_lookup(abs);
+static int64_t stat_path(struct process *p, const char *abs, uint64_t ust, bool follow) {
+    struct vnode *v = follow ? vfs_lookup(abs) : vfs_lookup_nofollow(abs);
     if (!v) return -ENOENT;
     struct linux_stat ls; fill_stat(&ls, v);
     vnode_unref(v);
@@ -200,7 +200,7 @@ static int64_t sys_getdents64(struct process *p, int fd, uint64_t ubuf, size_t l
         uint64_t ino = d.ino ? d.ino : f->pos + 1, next = f->pos + 1;
         memcpy(rec, &ino, 8); memcpy(rec + 8, &next, 8);
         uint16_t rl = (uint16_t)reclen; memcpy(rec + 16, &rl, 2);
-        rec[18] = d.type == VN_DIR ? 4 : d.type == VN_DEV ? 2 : d.type == VN_BLK ? 6 : 8;
+        rec[18] = d.type == VN_DIR ? 4 : d.type == VN_DEV ? 2 : d.type == VN_BLK ? 6 : d.type == VN_LNK ? 10 : 8;
         memcpy(rec + 19, d.name, nl);
         if (copy_to_user(ubuf + o, rec, reclen) < 0) return o ? (int64_t)o : -EFAULT;
         o += reclen;
@@ -665,6 +665,12 @@ static int64_t sys_desktop(struct process *p, uint64_t nr, uint64_t a1, uint64_t
         char arg[PATH_MAX];
         if (a2 && strncpy_from_user(arg, a2, sizeof arg) < 0) return -EFAULT;
         return app_launch((int)a1, a2 ? arg : NULL); }
+    case 0x1026: {   /* notify(title, body) */
+        char t[64], b[200];
+        if (strncpy_from_user(t, a1, sizeof t) < 0) return -EFAULT;
+        if (a2 && strncpy_from_user(b, a2, sizeof b) < 0) return -EFAULT;
+        notify_post(t, a2 ? b : "");
+        return 0; }
     case 0x1025: { char path[PATH_MAX]; if (resolve_at(p, AT_FDCWD, a1, path, false) < 0) return -EFAULT; app_open_path(path); return 0; }
     }
     return -ENOSYS;
@@ -703,6 +709,12 @@ static int64_t sys_influx(struct process *p, uint64_t nr, uint64_t a1, uint64_t 
         int64_t r = copy_to_user(a1, out, (size_t)n * sizeof *out) < 0 ? -EFAULT : n;
         kfree(out);
         return r; }
+    case 0x1004: {   /* netinfo(out): the default network adapter */
+        struct { char name[8], driver[32]; uint32_t ip, netmask, gateway, dns; int32_t up, configured, present, pad; } ni;
+        memset(&ni, 0, sizeof ni);
+        struct netif *n = netif_default();
+        if (n) { memcpy(ni.name, n->name, sizeof ni.name); memcpy(ni.driver, n->driver, sizeof ni.driver); ni.ip = n->ip; ni.netmask = n->netmask; ni.gateway = n->gateway; ni.dns = n->dns; ni.up = n->up; ni.configured = n->configured; ni.present = 1; }
+        return copy_to_user(a1, &ni, sizeof ni) < 0 ? -EFAULT : 0; }
     case 0x1003: {   /* inFlux sysinfo */
         struct user_isysinfo si = { system_ticks, pmm_total_bytes(), pmm_free_bytes(), pmm_used_bytes(), 0, 0 };
         struct process *l[64]; si.procs = process_list(l, 64); struct thread *t[128]; si.threads = thread_list(t, 128);
@@ -735,14 +747,14 @@ static int64_t do_syscall(struct regs *r) {
         if ((e = vfs_open_rel("/", path, flags & ~O_CLOEXEC, &f)) < 0) return e;
         return fd_install(p, f, flags & O_CLOEXEC, 0); }
     case 3: return fd_close(p, (int)a1);
-    case 4: case 6: if ((e = resolve_at(p, AT_FDCWD, a1, path, false)) < 0) return e; return stat_path(p, path, a2);
+    case 4: case 6: if ((e = resolve_at(p, AT_FDCWD, a1, path, false)) < 0) return e; return stat_path(p, path, a2, nr == 4);
     case 5: { struct file *f = fd_get(p, (int)a1); if (!f) return -EBADF; struct linux_stat ls; fill_stat(&ls, f->vn); return copy_to_user(a2, &ls, sizeof ls) < 0 ? -EFAULT : 0; }
     case 262: {   /* newfstatat */
         if ((e = resolve_at(p, (int)a1, a2, path, a4 & AT_EMPTY_PATH)) < 0) {
             if (e == -EBADF && (a4 & AT_EMPTY_PATH)) { struct file *f = fd_get(p, (int)a1); if (!f) return -EBADF; struct linux_stat ls; fill_stat(&ls, f->vn); return copy_to_user(a3, &ls, sizeof ls) < 0 ? -EFAULT : 0; }
             return e;
         }
-        return stat_path(p, path, a3); }
+        return stat_path(p, path, a3, !(a4 & AT_SYMLINK_NOFOLLOW)); }
     case 8: { struct file *f = fd_get(p, (int)a1); if (!f) return -EBADF; if (f->vn->type == VN_DEV && !f->path) return -ESPIPE;
         if (f->vn->type == VN_DIR) { if ((int)a3 == SEEK_SET && (int64_t)a2 >= 0) { f->pos = a2; return (int64_t)a2; } return -EINVAL; }
         return vfs_seek(f, (int64_t)a2, (int)a3); }
@@ -809,15 +821,23 @@ static int64_t do_syscall(struct regs *r) {
     case 83: case 258: if ((e = resolve_at(p, nr == 83 ? AT_FDCWD : (int)a1, nr == 83 ? a1 : a2, path, false)) < 0) return e; return vfs_mkdir(path);
     case 84: case 87: case 263: {   /* rmdir, unlink, unlinkat */
         if ((e = resolve_at(p, nr == 263 ? (int)a1 : AT_FDCWD, nr == 263 ? a2 : a1, path, false)) < 0) return e;
-        struct stat st; if (vfs_stat(path, &st) < 0) return -ENOENT;
+        struct stat st; if (vfs_lstat(path, &st) < 0) return -ENOENT;
         bool want_dir = nr == 84 || (nr == 263 && (a3 & AT_REMOVEDIR));
         if (want_dir && st.type != VN_DIR) return -ENOTDIR;
         if (!want_dir && st.type == VN_DIR) return -EISDIR;
         return vfs_unlink(path); }
-    case 89: case 267: {   /* readlink: no symbolic links on these filesystems yet */
+    case 89: case 267: {   /* readlink, readlinkat */
         if ((e = resolve_at(p, nr == 89 ? AT_FDCWD : (int)a1, nr == 89 ? a1 : a2, path, false)) < 0) return e;
-        struct vnode *v = vfs_lookup(path); if (!v) return -ENOENT; vnode_unref(v); return -EINVAL; }
-    case 86: case 88: case 265: case 266: return -EPERM;   /* hard and symbolic links */
+        uint64_t ubuf = nr == 89 ? a2 : a3; size_t n = MIN(nr == 89 ? a3 : a4, (uint64_t)PATH_MAX);
+        int l = vfs_readlink(path, path2, n);
+        if (l < 0) return l;
+        return copy_to_user(ubuf, path2, (size_t)l) < 0 ? -EFAULT : l; }
+    case 88: case 266: {   /* symlink(target, path), symlinkat(target, dirfd, path) */
+        long tl = strncpy_from_user(path2, a1, PATH_MAX);
+        if (tl < 0) return tl;
+        if ((e = resolve_at(p, nr == 88 ? AT_FDCWD : (int)a2, nr == 88 ? a2 : a3, path, false)) < 0) return e;
+        return vfs_symlink(path2, path); }
+    case 86: case 265: return -EPERM;   /* hard links */
     case 90: case 91: case 92: case 93: case 94: case 268: case 260: return 0;   /* chmod/chown family: permissions are not enforced yet */
     case 95: { uint32_t old = p->umask; p->umask = (uint32_t)a1 & 0777; return old; }
     case 162: vfs_sync(); return 0;

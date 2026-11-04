@@ -1,4 +1,5 @@
 #include "ui.h"
+#include "sounds.h"
 #include "string.h"
 
 /* Modal dialogs run on the calling thread with their own event loop. */
@@ -101,10 +102,12 @@ static int dlg_run(struct dlg *d) {
 
 void dialog_message(const char *title, const char *message) {
     struct dlg d = { .title = title, .msg = message, .ok = "OK", .alert = true };
+    sound_play(SOUND_ALERT);
     dlg_run(&d);
 }
 bool dialog_confirm(const char *title, const char *message, const char *ok_label, bool destructive) {
     struct dlg d = { .title = title, .msg = message, .ok = ok_label, .destructive = destructive };
+    if (destructive) sound_play(SOUND_ALERT);
     return dlg_run(&d) == 1;
 }
 bool dialog_prompt(const char *title, const char *message, const char *initial, char *out, size_t outsz) {

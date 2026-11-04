@@ -1,4 +1,5 @@
 #include "arch.h"
+#include "power.h"
 #include "sched.h"
 #include "mm.h"
 #include "string.h"
@@ -98,6 +99,7 @@ static void ap_entry(struct limine_smp_info *info) {
     lapic_init_ap();
     syscall_init_cpu();
     lapic_timer_start(1000);
+    cpupower_init();
     __atomic_fetch_or(&online_mask, 1ULL << c->id, __ATOMIC_SEQ_CST);
     c->online = true;
     __atomic_fetch_add(&ap_online, 1, __ATOMIC_SEQ_CST);

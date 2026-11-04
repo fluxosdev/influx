@@ -1,0 +1,4 @@
+Mozilla CA certificate bundle as extracted by curl (https://curl.se/docs/caextract.html),
+from Mozilla certdata.txt as of 2026-10-20. Mozilla Public License 2.0.
+Installed as /etc/ssl/certs/ca-certificates.crt; the Browser trusts these roots for HTTPS.
+Update by replacing cacert.pem with a newer download.

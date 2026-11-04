@@ -16,3 +16,6 @@ void simd_blend_tint(uint32_t *d, const uint32_t *s, uint32_t tint, uint32_t ta,
 void simd_blend_mask8(uint32_t *d, const uint8_t *m, uint32_t col, uint32_t ca, size_t n);
 void simd_blur_h(const uint32_t *src, int sstride, uint32_t *dst, int dstride, int w, int h, int radius);
 void simd_blur_v(const uint32_t *src, int sstride, uint32_t *dst, int dstride, int w, int h, int radius, void *scratch);
+/* the kernel spreads big blurs over its CPU workers; a user program does them in the calling thread */
+static inline int smp_workers(void) { return 1; }
+static inline void smp_parallel_for(int n, void (*fn)(void *ctx, int i), void *ctx) { for (int i = 0; i < n; i++) fn(ctx, i); }

@@ -5,6 +5,7 @@
 
 enum {
     SYS_INFLUX_SPAWN = 0x1000, SYS_INFLUX_PS, SYS_INFLUX_LSBLK, SYS_INFLUX_SYSINFO,
+    SYS_INFLUX_NOTIFY = 0x1026,
     SYS_WIN_CREATE = 0x1010, SYS_WIN_PRESENT, SYS_WIN_EVENT, SYS_WIN_DESTROY, SYS_WIN_TITLE,
 };
 
@@ -33,3 +34,5 @@ int influx_lsblk(struct blkinfo *out, int max);
 /* starts a program as a child (wait for it with waitpid); envp NULL: the system default */
 int influx_spawn(const char *path, char *const argv[], char *const envp[]);
 long uptime_ms(void);
+/* a notification banner on the desktop (with the notification sound) */
+int influx_notify(const char *title, const char *body);

@@ -467,7 +467,7 @@ struct tcp_conn *tcp_connect_start(uint32_t ip, uint16_t port, uint16_t lport, i
     mutex_lock(&net_lock);
     uint32_t hop;
     struct netif *n = ip_route(ip, &hop);
-    if (!n || (ip >> 24) == 127 || ip == 0) { mutex_unlock(&net_lock); *err = ENETUNREACH; return NULL; }
+    if (!n || ip == 0) { mutex_unlock(&net_lock); *err = ENETUNREACH; return NULL; }
     struct tcp_conn *c = conn_alloc(n);
     if (!c) { mutex_unlock(&net_lock); *err = ENOMEM; return NULL; }
     c->lip = n->ip; c->rip = ip; c->rport = port;

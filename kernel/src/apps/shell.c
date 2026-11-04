@@ -9,6 +9,7 @@
 #include "gpu.h"
 #include "installer.h"
 #include "net.h"
+#include "power.h"
 #include "acpi.h"
 #include "audio.h"
 #include "usb.h"
@@ -773,6 +774,7 @@ static int b_ifconfig(struct ctx *c, int argc, char **argv) {
         dns_flush();
         return 0;
     }
+    if (netif_count() <= 1) cputs(c, "(only the loopback interface: no network adapters found)\n");
     if (!netif_count()) { cputs(c, "no network adapters (QEMU: -device ne2k_pci,netdev=n0 -netdev user,id=n0)\n"); return 1; }
     for (int i = 0; i < netif_count(); i++) {
         struct netif *n = netif_at(i);
@@ -788,7 +790,7 @@ static int b_ifconfig(struct ctx *c, int argc, char **argv) {
     return 0;
 }
 static int b_dhcp(struct ctx *c, int argc, char **argv) {
-    struct netif *n = argc > 1 ? netif_find(argv[1]) : netif_at(0);
+    struct netif *n = argc > 1 ? netif_find(argv[1]) : netif_default();
     if (!n) { eprintf(c, "dhcp: no such interface\n"); return 1; }
     cprintf(c, "%s: requesting an address...\n", n->name);
     mutex_lock(&net_lock); n->configured = false; n->ip = 0; mutex_unlock(&net_lock);
@@ -796,6 +798,39 @@ static int b_dhcp(struct ctx *c, int argc, char **argv) {
     if (r < 0) { eprintf(c, "dhcp: no lease (%s)\n", r == -ETIMEDOUT ? "no answer" : r == -ECONNREFUSED ? "refused" : "error"); return 1; }
     char ip[16], gw[16]; ip_to_str(n->ip, ip); ip_to_str(n->gateway, gw);
     cprintf(c, "%s: %s, gateway %s\n", n->name, ip, gw);
+    return 0;
+}
+static int b_ln(struct ctx *c, int argc, char **argv) {
+    bool sym = false; int i = 1;
+    for (; i < argc && argv[i][0] == '-'; i++) { if (!strcmp(argv[i], "-s") || !strcmp(argv[i], "-sf")) sym = true; else { eprintf(c, "ln: unknown option %s\n", argv[i]); return 1; } }
+    if (!sym) { eprintf(c, "ln: hard links are not supported; use ln -s\n"); return 1; }
+    if (argc - i != 2) { eprintf(c, "usage: ln -s TARGET LINK\n"); return 1; }
+    char link[PATH_MAX]; resolve(c->sh, argv[i + 1], link, sizeof link);
+    int r = vfs_symlink(argv[i], link);
+    if (r < 0) { eprintf(c, "ln: %s: %s\n", argv[i + 1], errstr(r)); return 1; }
+    return 0;
+}
+static int b_power(struct ctx *c, int argc, char **argv) {
+    struct power_status ps;
+    power_battery_changed();
+    if (power_status(&ps)) {
+        cprintf(c, "battery: %d%%, %s", ps.percent, ps.charging ? "charging" : ps.discharging ? "discharging" : "not charging");
+        if (ps.discharging && ps.minutes_left) cprintf(c, ", %d:%02d left", ps.minutes_left / 60, ps.minutes_left % 60);
+        cprintf(c, "%s\n", ps.critical ? " (critical)" : "");
+    } else cputs(c, "battery: none\n");
+    if (ps.ac_known) cprintf(c, "AC adapter: %s\n", ps.on_ac ? "connected" : "not connected");
+    int b = backlight_get();
+    if (backlight_available()) cprintf(c, "backlight: %d%%\n", b); else cputs(c, "backlight: no ACPI control\n");
+    cprintf(c, "processor: %s\n", cpupower_describe());
+    return 0;
+}
+static int b_brightness(struct ctx *c, int argc, char **argv) {
+    if (!backlight_available()) { eprintf(c, "brightness: no backlight the firmware lets us control\n"); return 1; }
+    if (argc < 2) { cprintf(c, "%d%%\n", backlight_get()); return 0; }
+    if (!strcmp(argv[1], "+") || !strcmp(argv[1], "-")) { backlight_step(argv[1][0] == '+' ? 1 : -1); cprintf(c, "%d%%\n", backlight_get()); return 0; }
+    int r = backlight_set(atoi(argv[1]));
+    if (r < 0) { eprintf(c, "brightness: %s\n", errstr(r)); return 1; }
+    cprintf(c, "%d%%\n", r);
     return 0;
 }
 static int b_dmesg(struct ctx *c, int argc, char **argv) {
@@ -1111,7 +1146,7 @@ static const struct builtin builtins[] = {
     { "acpi", b_acpi, "ACPI information, namespace dump and evaluation" }, { "alias", b_alias, "define or list aliases: alias ll='ls -l'" }, { "arp", b_arp, "show the ARP cache" }, { "basename", b_basename, "strip directory from a path" },
     { "cat", b_cat, "concatenate files (-n numbers lines)" }, { "cd", b_cd, "change directory (cd -, cd ~)" },
     { "clear", b_clear, "clear the screen" }, { "cp", b_cp, "copy files (-r for directories)" }, { "curl", b_curl, "fetch a URL over HTTP (-I headers, -i, -o file)" },
-    { "date", b_date, "show the current date and time" }, { "df", b_df, "show filesystem usage (-h)" }, { "dmesg", b_dmesg, "print the kernel log" }, { "dhcp", b_dhcp, "request an address for an adapter" },
+    { "date", b_date, "show the current date and time" }, { "df", b_df, "show filesystem usage (-h)" }, { "dmesg", b_dmesg, "print the kernel log" }, { "brightness", b_brightness, "show or set the display backlight: brightness [0-100|+|-]" }, { "dhcp", b_dhcp, "request an address for an adapter" },
     { "dirname", b_dirname, "strip the last component from a path" }, { "display", b_display, "show or set the display resolution" }, { "du", b_du, "disk usage (-h)" },
     { "echo", b_echo, "print arguments (-n, -e)" }, { "env", b_env, "list environment variables" },
     { "exit", b_exit, "exit the shell" }, { "export", b_export, "set environment variables" },
@@ -1121,11 +1156,11 @@ static const struct builtin builtins[] = {
     { "help", b_help, "this list" }, { "hexdump", b_hexdump, "hex dump of a file (-n bytes)" },
     { "history", b_history, "show command history (-c clears)" }, { "host", b_nslookup, "look up a host name" }, { "hostname", b_hostname, "print the host name" },
     { "id", b_id, "print user identity" }, { "ifconfig", b_ifconfig, "show or configure network adapters" }, { "install", b_install, "install inFlux to a disk, erasing it (asks first; -y doesn't)" }, { "kill", b_kill, "terminate a process: kill [-9] pid" },
-    { "ls", b_ls, "list directory contents (-l -a -h)" }, { "lsblk", b_lsblk, "list block devices" }, { "lsgpu", b_lsgpu, "show graphics adapters" },
+    { "ln", b_ln, "make a symbolic link: ln -s target link" }, { "ls", b_ls, "list directory contents (-l -a -h)" }, { "lsblk", b_lsblk, "list block devices" }, { "lsgpu", b_lsgpu, "show graphics adapters" },
     { "lspci", b_lspci, "list PCI devices" }, { "lsusb", b_lsusb, "list USB devices (-v: interfaces and endpoints)" }, { "mkdir", b_mkdir, "create directories (-p)" },
     { "mount", b_mount, "list mounted filesystems" }, { "mv", b_mv, "move or rename files" }, { "netstat", b_netstat, "list TCP connections" },
     { "nproc", b_nproc, "number of processors" }, { "nslookup", b_nslookup, "query DNS for a host name" }, { "ntpdate", b_ntpdate, "set the clock from a time server (SNTP)" }, { "open", b_open, "open a file or folder in the desktop (-a App)" },
-    { "ping", b_ping, "send ICMP echo requests (-c count)" }, { "play", b_play, "play WAV files (Ctrl+C stops)" }, { "printf", b_printf, "formatted output" }, { "ps", b_ps, "list processes (-T shows threads)" },
+    { "ping", b_ping, "send ICMP echo requests (-c count)" }, { "power", b_power, "battery, AC adapter, backlight and processor power state" }, { "play", b_play, "play WAV files (Ctrl+C stops)" }, { "printf", b_printf, "formatted output" }, { "ps", b_ps, "list processes (-T shows threads)" },
     { "pwd", b_pwd, "print the working directory" }, { "reboot", b_reboot, "restart the computer" },
     { "rev", b_rev, "reverse each line" }, { "rm", b_rm, "remove files (-r -f)" },
     { "rmdir", b_rmdir, "remove empty directories" }, { "seq", b_seq, "print a sequence of numbers" },

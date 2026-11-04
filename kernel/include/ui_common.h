@@ -91,6 +91,7 @@ enum { APP_FILES, APP_TERMINAL, APP_EDITOR, APP_CALC, APP_TASKMAN, APP_SETTINGS,
 struct app_info { const char *name; const char *icon; void (*main)(void *arg); bool single_instance; const char *exec; /* a user program instead of a kernel thread */ };
 struct canvas *icon_get(const char *name, int size);
 const char *icon_for_file(const char *name, int type);
+void notify_post(const char *title, const char *body);   /* a banner in the corner of the screen, with a chime */
 void dialog_message(const char *title, const char *message);
 bool dialog_confirm(const char *title, const char *message, const char *ok_label, bool destructive);
 bool dialog_prompt(const char *title, const char *message, const char *initial, char *out, size_t outsz);

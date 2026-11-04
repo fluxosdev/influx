@@ -55,6 +55,7 @@ struct netif {
     uint64_t lease_expires_ms;     /* time_ms() when the lease runs out (0 = no lease or infinite) */
     uint32_t dhcp_gen;             /* bumped on every reconfiguration; stops superseded lease threads */
     bool up, configured, dhcp;
+    bool loopback;                 /* lo: never the default route, no DHCP */
     uint32_t rx_window;            /* bytes the adapter can buffer; caps TCP's advertised window (0 = no limit) */
     uint64_t rx_packets, tx_packets, rx_bytes, tx_bytes, rx_errors, tx_errors, rx_dropped;
     int (*send)(struct netif *n, const void *frame, size_t len);
@@ -181,6 +182,12 @@ struct http_request {
 /* 0 on success (resp->status holds the HTTP status), -errno with resp->error set otherwise */
 int http_request(const struct http_request *req, struct http_response *resp);
 int http_get(const char *url, struct http_response *resp, volatile bool *cancel);
+/* TLS for https: user programs link user/ui/tls.c (BearSSL); the kernel's stubs (net/http_notls.c) refuse */
+bool http_tls_available(void);
+void *http_tls_open(struct tcp_conn *c, const char *host, int timeout_ms, volatile bool *cancel, char *why, size_t whysz);
+int64_t http_tls_send(void *tls, const void *data, size_t len, int timeout_ms, volatile bool *cancel);
+int64_t http_tls_recv(void *tls, void *buf, size_t len, int timeout_ms, volatile bool *cancel);   /* 0 at the end */
+void http_tls_close(void *tls, bool clean);   /* sends close_notify when clean; the TCP connection stays open */
 void http_response_free(struct http_response *resp);
 const char *http_header(const struct http_response *resp, const char *name, char *out, size_t outsz);
 

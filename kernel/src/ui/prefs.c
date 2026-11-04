@@ -10,6 +10,7 @@
 #include "string.h"
 #include "net.h"
 #include "audio.h"
+#include "sounds.h"
 
 static const char *prefs_dir(void) { return "/home/flux/.config"; }
 
@@ -24,6 +25,7 @@ static void apply(const char *k, const char *v, bool *dark, int *accent, bool *t
     else if (!strcmp(k, "hostname")) { if (*v && strlen(v) < sizeof system_hostname) strlcpy(system_hostname, v, sizeof system_hostname); }
     else if (!strcmp(k, "auto_time")) sntp_enabled = n != 0;
     else if (!strcmp(k, "volume")) audio_set_volume((int)n);
+    else if (!strcmp(k, "sounds")) sounds_enabled = n != 0;
 }
 
 void prefs_load(void) {
@@ -50,9 +52,9 @@ void prefs_save(void) {
     snprintf(buf, sizeof buf,
              "# inFlux settings, written by System Settings\n"
              "dark=%d\naccent=%d\nwallpaper_top=%08x\nwallpaper_bottom=%08x\nclock_24h=%d\n"
-             "tz_offset_minutes=%ld\nhostname=%s\nauto_time=%d\nvolume=%d\n",
+             "tz_offset_minutes=%ld\nhostname=%s\nauto_time=%d\nvolume=%d\nsounds=%d\n",
              theme.dark, theme.accent_index, theme.wallpaper_top, theme.wallpaper_bottom, clock_24h,
-             (long)tz_offset_minutes, system_hostname, sntp_enabled, audio_volume());
+             (long)tz_offset_minutes, system_hostname, sntp_enabled, audio_volume(), sounds_enabled);
     char path[PATH_MAX]; snprintf(path, sizeof path, "%s/settings.conf", prefs_dir());
     int r = vfs_write_file(path, buf, strlen(buf));
     if (r < 0) kprintf("prefs: cannot save %s (%d)\n", path, r);

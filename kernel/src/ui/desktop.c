@@ -9,8 +9,8 @@ static void crash_notice(void *arg) {
     thread_sleep_ms(1500);
     char msg[PATH_MAX + 160];
     const char *name = strrchr(crashlog_previous, '/');
-    snprintf(msg, sizeof msg, "inFlux restarted because of a kernel panic. The report, \"%s\", is in the Crash Reports folder of your home folder.", name ? name + 1 : crashlog_previous);
-    dialog_message("Your computer was restarted because of a problem", msg);
+    snprintf(msg, sizeof msg, "A kernel panic report is in ~/Crash Reports (%s).", name ? name + 1 : crashlog_previous);
+    notify_post("inFlux restarted after a problem", msg);
 }
 
 void desktop_main(void *arg) {

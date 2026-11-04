@@ -13,7 +13,6 @@ void taskman_main(void *arg);
 void settings_main(void *arg);
 void gldemo_main(void *arg);
 void installer_main(void *arg);
-void browser_main(void *arg);
 void player_main(void *arg);
 void diskmgr_main(void *arg);
 
@@ -26,7 +25,7 @@ const struct app_info app_table[APP_COUNT] = {
     [APP_SETTINGS] = { "System Settings", "settings", settings_main, true },
     [APP_GLDEMO]   = { "OpenGL Demo", "gldemo", gldemo_main, false },
     [APP_INSTALLER] = { "Install inFlux", "drive", installer_main, true },
-    [APP_BROWSER]  = { "Browser", "browser", browser_main, false },
+    [APP_BROWSER]  = { "Browser", "browser", NULL, false, "/bin/browser" },   /* ring 3: it parses whatever the network sends */
     [APP_PLAYER]   = { "Audio Player", "player", player_main, true },
     [APP_DISKMGR]  = { "Disk Manager", "diskmgr", diskmgr_main, true },
 };

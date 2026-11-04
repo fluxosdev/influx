@@ -1,4 +1,8 @@
 #pragma once
+#ifdef INFLUX_USERSPACE
+/* kernel sources compiled into user programs (user/ui): threads and mutexes are pthreads there */
+#include "../../user/ui/shim/sched.h"
+#else
 #include "kernel.h"
 #include "list.h"
 #include "spinlock.h"
@@ -166,3 +170,5 @@ void sem_post(struct semaphore *s);
 int process_spawn(const char *path, int argc, char **argv, struct file *stdio[3], const char *cwd);
 int process_spawn_app(const char *path, int argc, char **argv, const char *cwd, int app_id);
 void syscall_init(void);
+
+#endif /* INFLUX_USERSPACE */

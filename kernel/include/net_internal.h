@@ -33,6 +33,8 @@ struct tcp_hdr {
 #define TCP_URG 0x20
 
 extern const uint8_t eth_broadcast[ETH_ALEN];
+int loopback_output(const void *pkt, size_t len);   /* net_lock held */
+struct netif *netif_loopback(void);
 int arp_output(struct netif *n, uint32_t hop, const void *pkt, size_t len);
 /* the TTL of the IP packet currently being delivered (for ping) */
 extern uint8_t ip_input_ttl;

@@ -1,4 +1,5 @@
 #include "random.h"
+#include "power.h"
 #include "kernel.h"
 #include "arch.h"
 #include "mm.h"
@@ -41,8 +42,10 @@ static void selftest_thread(void *arg) {
     struct file *con;
     if (vfs_open("/dev/console", O_RDWR, &con) < 0) return;
     struct file *stdio[3] = { con, con, con };
-    char *argv[] = { "systest", kernel_cmdline_has("selftest-net") ? "net" : NULL, NULL };
-    int pid = process_spawn("/bin/systest", argv[1] ? 2 : 1, argv, stdio, "/");
+    char *argv[] = { "systest", kernel_cmdline_has("selftest-net") ? "net" : NULL, NULL, NULL };
+    if (kernel_cmdline_has("selftest-fs")) { argv[1] = "fs"; argv[2] = "/mnt/sda"; }   /* a test volume as the first disk */
+    int argc = argv[2] ? 3 : argv[1] ? 2 : 1;
+    int pid = process_spawn("/bin/systest", argc, argv, stdio, "/");
     int status = -1;
     if (pid > 0) process_wait(pid, &status);
     kprintf("SELFTEST: %s (status %d)\n", pid > 0 && status == 0 ? "PASSED" : "FAILED", pid > 0 ? status : pid);
@@ -108,6 +111,7 @@ void kmain(void) {
     sched_init();
     timer_init();
     random_init();
+    cpupower_init();
     sti();
     smp_init();
     vfs_init();

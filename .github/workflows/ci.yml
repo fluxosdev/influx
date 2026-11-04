@@ -1,0 +1,33 @@
+# Builds the ISO and runs `make test`: the host-side filesystem regressions and a headless
+# QEMU boot that runs /bin/systest (the system call checks) and powers off.
+name: ci
+on:
+  push:
+  pull_request:
+jobs:
+  build-and-test:
+    runs-on: ubuntu-24.04
+    timeout-minutes: 30
+    steps:
+      - uses: actions/checkout@v4
+      - name: Install build tools
+        run: |
+          sudo apt-get update
+          sudo apt-get install -y --no-install-recommends gcc make binutils xorriso qemu-system-x86 ovmf
+      - name: Enable KVM
+        run: |
+          if [ -e /dev/kvm ]; then
+            echo 'KERNEL=="kvm", GROUP="kvm", MODE="0666", OPTIONS+="static_node=kvm"' | sudo tee /etc/udev/rules.d/99-kvm.rules
+            sudo udevadm control --reload-rules && sudo udevadm trigger --name-match=kvm
+          fi
+      - name: Build
+        run: make -j"$(nproc)"
+      - name: Test
+        run: SELFTEST_TIMEOUT=600 make test
+      - name: Keep the ISO
+        if: always()
+        uses: actions/upload-artifact@v4
+        with:
+          name: influx-iso
+          path: build/influx.iso
+          if-no-files-found: ignore

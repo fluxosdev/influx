@@ -56,14 +56,24 @@ int vfs_normalize(const char *cwd, const char *path, char *out, size_t n) {
 
 /* Walk from root; result is referenced. When only the FINAL component is missing, *parent_out gets its
  * (referenced) directory and last_comp its name; on any other failure both are cleared, so callers
- * can't create the entry somewhere else. */
-static struct vnode *walk(const char *norm, struct vnode **parent_out, char *last_comp) {
+ * can't create the entry somewhere else.
+ *
+ * Symbolic links are followed by rewriting the path: the link's target replaces the components up
+ * to and including the link (relative targets are taken from the link's directory), the result is
+ * normalized and the walk starts over, at most 40 times. The final component is followed only when
+ * follow_last is set (unlink, rename and lstat act on the link itself). */
+#define MAX_LINKS 40
+static struct vnode *walk_ex(const char *norm, struct vnode **parent_out, char *last_comp, bool follow_last) {
+    char path[PATH_MAX];
+    strlcpy(path, norm, sizeof path);
+    int links = 0;
+restart:;
     struct vnode *cur = root_vnode;
     if (cur->mount_root) cur = cur->mount_root;
     vnode_ref(cur);
-    if (parent_out) *parent_out = NULL;
+    if (parent_out) { if (*parent_out) vnode_unref(*parent_out); *parent_out = NULL; }
     if (last_comp) last_comp[0] = 0;
-    const char *p = norm;
+    const char *p = path;
     while (*p == '/') p++;
     while (*p) {
         const char *e = p; while (*e && *e != '/') e++;
@@ -74,17 +84,30 @@ static struct vnode *walk(const char *norm, struct vnode **parent_out, char *las
         if (last_comp) strcpy(last_comp, comp);
         if (cur->type != VN_DIR || !cur->ops->lookup) goto fail;
         struct vnode *next = cur->ops->lookup(cur, comp);
+        const char *rest = e; while (*rest == '/') rest++;
         if (!next) {
-            while (*e == '/') e++;
-            if (*e || !parent_out) goto fail;   /* an intermediate directory is missing */
+            if (*rest || !parent_out) goto fail;   /* an intermediate directory is missing */
             if (*parent_out) vnode_unref(*parent_out);
             *parent_out = cur;
             return NULL;
         }
+        if (next->type == VN_LNK && (*rest || follow_last)) {
+            char target[PATH_MAX], np[PATH_MAX * 2];
+            int64_t n = next->ops->read ? next->ops->read(next, 0, target, sizeof target - 1) : -1;
+            vnode_unref(next);
+            if (n <= 0 || ++links > MAX_LINKS) goto fail;
+            target[n] = 0;
+            size_t dirlen = (size_t)(p - path);   /* up to the link's own name */
+            if (target[0] == '/') snprintf(np, sizeof np, "%s/%s", target, rest);
+            else snprintf(np, sizeof np, "%.*s/%s/%s", (int)dirlen, path, target, rest);
+            vnode_unref(cur);
+            if (vfs_normalize("/", np, path, sizeof path) < 0) { if (parent_out && *parent_out) { vnode_unref(*parent_out); *parent_out = NULL; } return NULL; }
+            goto restart;
+        }
         if (next->mount_root) { struct vnode *m = next->mount_root; vnode_ref(m); vnode_unref(next); next = m; }
         if (parent_out) { if (*parent_out) vnode_unref(*parent_out); *parent_out = cur; } else vnode_unref(cur);
         cur = next;
-        p = e; while (*p == '/') p++;
+        p = rest;
     }
     return cur;
 fail:
@@ -92,6 +115,20 @@ fail:
     if (parent_out && *parent_out) { vnode_unref(*parent_out); *parent_out = NULL; }
     if (last_comp) last_comp[0] = 0;
     return NULL;
+}
+static struct vnode *walk(const char *norm, struct vnode **parent_out, char *last_comp) {
+    if (parent_out) *parent_out = NULL;
+    return walk_ex(norm, parent_out, last_comp, true);
+}
+
+/* the link itself, not what it points to */
+struct vnode *vfs_lookup_nofollow(const char *path) {
+    char norm[PATH_MAX];
+    if (vfs_normalize("/", path, norm, sizeof norm) < 0) return NULL;
+    struct vnode *parent = NULL;
+    struct vnode *v = walk_ex(norm, &parent, NULL, false);
+    if (parent) vnode_unref(parent);
+    return v;
 }
 
 struct vnode *vfs_lookup_rel(const char *cwd, const char *path) {
@@ -251,7 +288,7 @@ static int create_node(const char *path, int type) {
     char norm[PATH_MAX]; int nr = vfs_normalize("/", path, norm, sizeof norm); if (nr < 0) return nr;
     struct vnode *parent = NULL; char last[NAME_MAX + 1];
     mutex_lock(&vfs_mutex);
-    struct vnode *v = walk(norm, &parent, last);
+    struct vnode *v = walk_ex(norm, &parent, last, false);
     if (v) { vnode_unref(v); if (parent) vnode_unref(parent); mutex_unlock(&vfs_mutex); return -EEXIST; }
     if (!parent || !last[0]) { mutex_unlock(&vfs_mutex); return -ENOENT; }
     int r = 0;
@@ -262,6 +299,35 @@ static int create_node(const char *path, int type) {
     return r;
 }
 int vfs_mkdir(const char *path) { return create_node(path, VN_DIR); }
+
+int vfs_symlink(const char *target, const char *linkpath) {
+    size_t tl = strlen(target);
+    if (!tl) return -ENOENT;
+    if (tl >= PATH_MAX) return -ENAMETOOLONG;
+    int r = create_node(linkpath, VN_LNK);
+    if (r < 0) return r;
+    struct vnode *v = vfs_lookup_nofollow(linkpath);
+    if (!v) return -EIO;
+    int64_t w = v->ops->write ? v->ops->write(v, 0, target, tl) : -EPERM;
+    if (w >= 0 && v->ops->sync) v->ops->sync(v);
+    vnode_unref(v);
+    if (w != (int64_t)tl) { vfs_unlink(linkpath); return w < 0 ? (int)w : -EIO; }
+    return 0;
+}
+int vfs_readlink(const char *path, char *buf, size_t n) {
+    struct vnode *v = vfs_lookup_nofollow(path);
+    if (!v) return -ENOENT;
+    int r = v->type != VN_LNK ? -EINVAL : (int)v->ops->read(v, 0, buf, n);
+    vnode_unref(v);
+    return r;
+}
+int vfs_lstat(const char *path, struct stat *st) {
+    struct vnode *v = vfs_lookup_nofollow(path);
+    if (!v) return -ENOENT;
+    st->type = v->type; st->size = v->size; st->mtime = v->mtime; st->mode = v->mode; st->ino = v->ino; st->nlink = 1;
+    vnode_unref(v);
+    return 0;
+}
 int vfs_create(const char *path) { return create_node(path, VN_FILE); }
 
 int vfs_unlink(const char *path) {
@@ -269,7 +335,7 @@ int vfs_unlink(const char *path) {
     if (!strcmp(norm, "/")) return -EACCES;
     struct vnode *parent = NULL; char last[NAME_MAX + 1];
     mutex_lock(&vfs_mutex);
-    struct vnode *v = walk(norm, &parent, last);
+    struct vnode *v = walk_ex(norm, &parent, last, false);
     if (!v) { if (parent) vnode_unref(parent); mutex_unlock(&vfs_mutex); return -ENOENT; }
     int r = 0;
     if (v->mount_root || is_mount_root(v)) r = -EBUSY;   /* walk() already stepped into the mounted fs */
@@ -322,6 +388,17 @@ int vfs_write_file(const char *path, const void *data, size_t size) {
 int vfs_rename(const char *oldp, const char *newp) {
     char a[PATH_MAX], b[PATH_MAX]; int nr;
     if ((nr = vfs_normalize("/", oldp, a, sizeof a)) < 0 || (nr = vfs_normalize("/", newp, b, sizeof b)) < 0) return nr;
+    struct vnode *la = vfs_lookup_nofollow(a); if (!la) return -ENOENT;
+    if (la->type == VN_LNK) {   /* the link itself moves */
+        char t[PATH_MAX]; int64_t n = la->ops->read(la, 0, t, sizeof t - 1); vnode_unref(la);
+        if (n <= 0) return -EIO;
+        t[n] = 0;
+        if (!strcmp(a, b)) return 0;
+        vfs_unlink(b);
+        int r = vfs_symlink(t, b);
+        return r < 0 ? r : vfs_unlink(a);
+    }
+    vnode_unref(la);
     struct vnode *va = vfs_lookup(a); if (!va) return -ENOENT;
     if (!strcmp(a, b)) { vnode_unref(va); return 0; }
     /* the same file under another name (FAT is case-insensitive): copying onto itself would lose it */

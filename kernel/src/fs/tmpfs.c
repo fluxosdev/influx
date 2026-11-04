@@ -39,7 +39,7 @@ static struct tnode *tn_new(struct tnode *parent, const char *name, int type) {
     struct tnode *t = kzalloc(sizeof *t);
     strlcpy(t->vn.name, name, sizeof t->vn.name);
     t->vn.type = type; t->vn.ops = &tmpfs_ops; t->vn.refcount = 1;   /* held by the tree */
-    t->vn.ino = next_ino++; t->vn.mtime = time_unix(); t->vn.mode = type == VN_DIR ? 0755 : 0644;
+    t->vn.ino = next_ino++; t->vn.mtime = time_unix(); t->vn.mode = type == VN_DIR ? 0755 : type == VN_LNK ? 0777 : 0644;
     t->vn.parent = parent ? &parent->vn : NULL;
     t->vn.fs_name = "tmpfs";
     t->parent = parent;

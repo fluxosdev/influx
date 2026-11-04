@@ -3,6 +3,7 @@
 #include "net_internal.h"
 #include "mm.h"
 #include "string.h"
+#define ENOBUFS_ 105
 
 struct mutex net_lock = MUTEX_INIT;
 static struct netif *ifaces[8];
@@ -19,9 +20,48 @@ int net_register(struct netif *n) {
 int netif_count(void) { return nifaces; }
 struct netif *netif_at(int i) { return i >= 0 && i < nifaces ? ifaces[i] : NULL; }
 struct netif *netif_default(void) {
-    for (int i = 0; i < nifaces; i++) if (ifaces[i]->up && ifaces[i]->configured) return ifaces[i];
-    for (int i = 0; i < nifaces; i++) if (ifaces[i]->up) return ifaces[i];
+    for (int i = 0; i < nifaces; i++) if (ifaces[i]->up && ifaces[i]->configured && !ifaces[i]->loopback) return ifaces[i];
+    for (int i = 0; i < nifaces; i++) if (ifaces[i]->up && !ifaces[i]->loopback) return ifaces[i];
     return NULL;
+}
+
+/* ---- loopback (lo, 127.0.0.1/8): packets to ourselves are queued here and delivered by the network
+ * thread, so a protocol never re-enters itself from its own output path ---- */
+#define LO_QUEUE 128
+static struct { uint8_t *pkt[LO_QUEUE]; uint16_t len[LO_QUEUE]; int head, count; } loq;   /* net_lock */
+static struct netif lo;
+static int lo_poll(struct netif *n) {
+    int done = 0;
+    while (loq.count) {
+        uint8_t *p = loq.pkt[loq.head]; uint16_t l = loq.len[loq.head];
+        loq.head = (loq.head + 1) % LO_QUEUE; loq.count--;
+        n->rx_packets++; n->rx_bytes += l;
+        ip_input(n, p, l);
+        kfree(p);
+        done++;
+    }
+    return done;
+}
+/* net_lock held: an IP packet for this machine */
+int loopback_output(const void *pkt, size_t len) {
+    if (loq.count == LO_QUEUE) { lo.tx_errors++; return -ENOBUFS_; }
+    uint8_t *c = kmalloc_try(len);
+    if (!c) return -ENOMEM;
+    memcpy(c, pkt, len);
+    int i = (loq.head + loq.count) % LO_QUEUE;
+    loq.pkt[i] = c; loq.len[i] = (uint16_t)len; loq.count++;
+    lo.tx_packets++; lo.tx_bytes += len;
+    net_kick();
+    return 0;
+}
+struct netif *netif_loopback(void) { return &lo; }
+static int lo_send(struct netif *n, const void *frame, size_t len) { return 0; }   /* never used: ip_output hands packets to loopback_output */
+static void loopback_init(void) {
+    strcpy(lo.name, "lo"); strcpy(lo.driver, "loopback");
+    lo.ip = IP4(127, 0, 0, 1); lo.netmask = IP4(255, 0, 0, 0);
+    lo.up = lo.configured = lo.loopback = lo.irq_driven = true;
+    lo.send = lo_send; lo.poll = lo_poll;
+    net_register(&lo);
 }
 struct netif *netif_find(const char *name) {
     for (int i = 0; i < nifaces; i++) if (!strcmp(ifaces[i]->name, name)) return ifaces[i];
@@ -49,11 +89,12 @@ static void net_thread(void *arg) {
 
 void net_init(void) {
     sem_init(&kick, 0);
+    loopback_init();
     e1000_init();
     ne2000_init();
-    if (!nifaces) { kprintf("net: no network adapters found\n"); return; }
+    if (nifaces == 1) kprintf("net: no network adapters found (loopback only)\n");
     thread_create(kernel_process, "net", net_thread, NULL);
-    for (int i = 0; i < nifaces; i++) dhcp_start(ifaces[i]);
+    for (int i = 0; i < nifaces; i++) if (!ifaces[i]->loopback) dhcp_start(ifaces[i]);
     sntp_start();
 }
 

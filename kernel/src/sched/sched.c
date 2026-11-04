@@ -5,6 +5,7 @@
 #include "fs.h"
 #include "simd.h"
 #include "uvm.h"
+#include "power.h"
 #include "uaccess.h"
 
 extern void context_switch(uint64_t *old_rsp, uint64_t new_rsp);
@@ -66,7 +67,7 @@ static void idle_loop(void *arg) {
             schedule();
             continue;
         }
-        sti(); hlt();
+        cpu_idle_wait();   /* hlt, or mwait into a deep C-state (arch/cpupower.c) */
         __atomic_fetch_and(&idle_cpus, ~bit, __ATOMIC_SEQ_CST);
     }
 }
@@ -650,6 +651,7 @@ void sched_tick(struct regs *r) {
     cur->cpu_ticks++;
     c->ticks++;
     if (cur == c->idle) c->idle_ticks++;
+    cpupower_tick();
     bool resched = --cur->slice <= 0;
     if (c->id == 0) {   /* the BSP wakes sleepers for everyone */
         bool unclaimed = false;

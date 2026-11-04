@@ -3,12 +3,14 @@
 inFlux is a small x86-64, Unix-like operating system with a preemptive,
 multithreaded kernel and a macOS-style desktop. It boots with the Limine
 bootloader, drives SATA (AHCI) and NVMe disks, reads and writes btrfs
-volumes with its own filesystem driver, and browses the web over its own
-TCP/IP stack.
+volumes with its own filesystem driver, and browses the web (HTTP and HTTPS)
+over its own TCP/IP stack. User programs see the Linux x86-64 system call
+interface, so ordinary POSIX C code built against musl runs unchanged.
 
-**This entire operating system was written by Claude**, Anthropic's AI model,
-in a single session: kernel, drivers, filesystems, window server, applications,
-shell, user-space C library and build system.
+**This operating system was written by Claude**, Anthropic's AI model:
+kernel, drivers, filesystems, window server, applications, shell and build
+system. The user-space C library is musl and TLS is BearSSL (both vendored
+in `third_party`).
 
 ## Features
 
@@ -31,11 +33,41 @@ shell, user-space C library and build system.
   compositing, glyph rendering and the blur; the OpenGL renderer, image decoder
   and all user programs are compiled with `-mavx`. The CPU's extensions are
   listed in Settings → About
-- Processes with file descriptor tables, working directories, exit status and
-  `wait`; kernel-side killing of faulting user programs
-- `syscall`/`sysret` fast system calls (31 calls: files, directories, process
-  spawning, pipes, sleep, uname, sysinfo, process listing, block devices)
-- Static ELF64 loader for user programs
+- **Linux x86-64 system call ABI** (`syscall`/`sysret`, about 150 calls):
+  files and directories (`openat` family, `getdents64`, `fcntl`, `pread`/`pwritev`,
+  symbolic links), `poll`/`ppoll`/`select`, pipes, BSD sockets, `fork`
+  (copy-on-write), `execve`, `wait4`, `clone` threads, futexes, `mmap`/
+  `mprotect`/`munmap`/`brk`, signals, `clock_gettime`/`nanosleep`,
+  `getrandom`, process groups and sessions. inFlux's own calls (desktop
+  windows, menus, dialogs, notifications, process and disk listings) live at
+  0x1000 and up
+- **Virtual memory per process**: areas with their own protection, pages
+  allocated on first touch, copy-on-write `fork` with shared-page reference
+  counts. Every kernel access to user memory goes through fault-checked copies,
+  so a bad pointer is `EFAULT`, never a kernel fault
+- **Threads** with per-thread TLS (`FS` base), futexes (wait/wake/requeue,
+  bitsets, timeouts) and `CLONE_CHILD_CLEARTID`, so musl's pthreads work
+- **Signals**: Linux frame layout and `rt_sigreturn`, `SA_SIGINFO`,
+  `SA_RESTART` (interrupted calls restart or return `EINTR`), `SA_ONSTACK`,
+  masks, `sigsuspend`, faults delivered as `SIGSEGV`/`SIGBUS`/`SIGILL`/`SIGFPE`,
+  `SIGPIPE`, `SIGCHLD`, Ctrl+C as `SIGINT` to the terminal's foreground job
+- **ELF loader**: static and position-independent executables, and
+  dynamically linked ones through musl's dynamic linker (`PT_INTERP`,
+  `/lib/ld-musl-x86_64.so.1`), with the System V initial stack and auxiliary
+  vector
+- Kernel CSPRNG (ChaCha20 seeded from RDSEED/RDRAND, timing jitter and
+  interrupt timing): `getrandom`, `/dev/urandom`, TCP sequence numbers
+- Timekeeping: a nanosecond monotonic clock from the invariant TSC, the wall
+  clock kept by SNTP and written back to the RTC
+- Kernel log (`dmesg`), and a **crash reporter**: a panic shows the message,
+  a symbolized backtrace and the log tail on screen and, on an installed
+  system, writes them straight to a reserved file on the EFI partition
+  through the polled disk driver; the next boot saves the report to
+  `~/Crash Reports` and says so
+- **Processor power**: idle CPUs wait in the deepest C-state MWAIT offers
+  (when the APIC timer keeps running there); Intel hardware P-states run in
+  balanced mode, and SpeedStep processors (Haswell) get a load-based
+  frequency governor
 
 ### ACPI
 - **AML interpreter** of its own: loads the DSDT and every SSDT into a
@@ -68,7 +100,11 @@ shell, user-space C library and build system.
 - Block device layer with GPT and MBR partition scanning (`/dev/sda1`,
   `/dev/nvme0n1p1`, ...)
 - Virtual filesystem with a tmpfs root populated from a tar initrd, device
-  nodes, pipes and ttys
+  nodes (`null`, `zero`, `urandom`, `console`, `kmsg`, ...), pipes, ttys with
+  termios and **symbolic links** (tmpfs and btrfs)
+- **ext2/ext3/ext4, read-only**: extents and classic block maps, 64-bit
+  descriptors, hashed directories, symbolic links (Linux disks show up in
+  Files)
 - **btrfs read/write**: chunk mapping, B-tree search and modification with
   leaf/node splits, inline and regular extents, directory items and indexes,
   CRC32C checksums for metadata and data, extent-tree and free-space-tree
@@ -178,16 +214,24 @@ shell, user-space C library and build system.
   as Linux's `e1000e` does.
 - **TCP/IP stack**: Ethernet, ARP (cache, request retries, packets parked
   until the next hop resolves), IPv4 with routing through a default gateway,
-  ICMP echo (answers pings, and `ping`), UDP sockets, a DHCP client that
-  configures the adapter at boot, and a DNS resolver with CNAME following and
-  a TTL cache.
-- **TCP**: active open with MSS negotiation, in-order delivery with an
+  ICMP echo (answers pings, and `ping`), UDP, a loopback interface
+  (127.0.0.1, and the machine's own addresses), a DHCP client that keeps its
+  lease (renewing at T1, rebinding at T2, starting over when it expires) and
+  retries until a server answers, a DNS resolver with CNAME following and a
+  TTL cache, and an **SNTP** client that sets the clock at boot and every four
+  hours (`ntpdate` in the Terminal; Settings → Date & Time).
+- **TCP**: active and passive open (listening sockets with an accept queue),
+  MSS negotiation, in-order delivery with an
   out-of-order queue and duplicate ACKs for fast retransmit, RFC 6298
   retransmission timers with Karn's rule, slow start and congestion avoidance,
   zero-window probing, orderly close and TIME_WAIT. The advertised window is
   capped at what the adapter can buffer.
+- **BSD sockets** for user programs: TCP and UDP, non-blocking connect,
+  `poll`, `SO_ERROR`, timeouts, `socketpair`.
 - **HTTP/1.1 client**: redirects, `Content-Length`, chunked and
-  read-to-close bodies, GET and POST.
+  read-to-close bodies, GET and POST. In user programs it also speaks
+  **HTTPS**: TLS 1.2 with BearSSL, certificates checked against Mozilla's
+  root certificates and the system clock (`wget` in the Terminal).
 - Shell commands: `ifconfig` (show, or set a static address), `dhcp`,
   `ping`, `nslookup`/`host`, `curl` (`-I`, `-i`, `-o file`), `arp`, `netstat`.
 
@@ -215,9 +259,16 @@ shell, user-space C library and build system.
   stop, seek (click the bar, or ← →), volume. In the Terminal: `play
   file.wav` (Ctrl+C stops) and `volume [0-100]`. `/dev/audio` takes raw
   48 kHz signed 16-bit stereo, e.g. `cat sound.raw > /dev/audio`
-- No system sounds yet
+- **System sounds**: notification and alert chimes, synthesized on the fly
+  (Settings → Appearance turns them off)
 
 ### Web browser
+- The Browser is an ordinary **user program** (`/bin/browser`, ring 3): it
+  parses whatever the network sends, so a bug there can no longer take the
+  kernel down. Its code is the same as before, built on `libui`, the kernel's
+  drawing, font, widget and HTTP code compiled for user space.
+- **HTTPS** with certificate validation; HTTP pages that redirect to HTTPS
+  are followed.
 - **Browser** (Dock): address bar that also searches (via wiby.me), back and
   forward, reload/stop, a progress bar, status bar with link targets and load
   times, View Source, Save Page As, and a start page.
@@ -242,6 +293,13 @@ shell, user-space C library and build system.
 - macOS-like menu bar: system menu (About, Settings, Task Manager, Restart,
   Shut Down), per-application menus with keyboard shortcuts, date and time
 - Dock with pinned apps, running indicators, hover tooltips and Trash
+- **Notifications**: banners in the top right corner (downloads, crash
+  reports, low battery; `notify` in the Terminal)
+- Battery level and charging state in the menu bar on laptops (ACPI
+  batteries and AC adapter), and the display backlight through the ACPI
+  video methods (brightness keys, `brightness` in the Terminal)
+- Settings are saved (`~/.config/settings.conf`): appearance, wallpaper,
+  clock, time zone, host name, volume, automatic time, sounds
 - Light and dark appearance, eight accent colors, wallpaper presets
   (default: steel blue)
 - Applications: **Browser**, **Files** (sidebar, icon/list views, history, new folder,
@@ -251,8 +309,9 @@ shell, user-space C library and build system.
 - zsh-like shell: line editing, history (persisted to `~/.zsh_history`), Tab
   completion, aliases, environment variables, globbing, pipes, redirection,
   `&&`/`||`, background jobs, 60+ built-ins, and external programs from `/bin`
-- User programs: `hello`, `cat`, `ls`, `echo`, `primes`, `sleep`, `sysinfo`,
-  `crash`
+- User programs (static, musl): `hello`, `cat`, `ls`, `echo`, `primes`,
+  `sleep`, `sysinfo`, `crash`, `notify`, `wget`, `glcube`, `browser`,
+  `systest` (the system call checks), and `hello-dyn`, a dynamically linked one
 
 Icons come from the [Kora icon theme](https://github.com/bikass/kora), the UI
 uses [Inter](https://fonts.google.com/specimen/Inter) and the terminal uses
@@ -274,7 +333,16 @@ make run        # boots in QEMU with a blank SATA install disk and an HD Audio c
 make run-kvm    # same, with KVM acceleration
 make run-installed       # boot the disk the installer wrote (build/install.img) on BIOS
 make run-installed-uefi  # the same under OVMF UEFI
+make test                # host filesystem regressions + a headless boot that runs /bin/systest
+make test SELFTEST_NET=1 # also DNS, TCP and HTTPS checks (needs the internet)
+make test-fs             # the ext4 driver against a volume made by mkfs.ext4
 ```
+
+`make test` boots the ISO with the Limine option `cmdline: selftest`: the kernel runs
+`/bin/systest`, which checks the system call interface (memory, signals, fork/exec, threads,
+files, symbolic links, pipes, poll, sockets over loopback, time) with its output on the
+serial port, and powers off. The same runs in CI (`.github/workflows/ci.yml`).
+`tools/qmp.py` drives a headless VM's desktop (screenshots, clicks, typing) over QMP.
 
 The build compiles the kernel with the host GCC in freestanding mode, rasterises
 the fonts and icons with the small host tools in `tools/`, packs `build/sysroot`
@@ -331,19 +399,21 @@ kernel/src/drivers  framebuffer, PS/2, AHCI, NVMe, block devices, GPU abstractio
                     (radeon.c, radeon_kms.c), AtomBIOS interpreter (atom.c), EDID (edid.c),
                     Intel Haswell graphics (intel_gfx.c), NE2000, Intel PRO/1000 (e1000.c)
 kernel/src/usb      USB core and hubs (usb.c), xHCI, EHCI, HID, mass storage
-kernel/src/net      Ethernet/ARP, IPv4/ICMP, UDP, TCP, DHCP, DNS, HTTP client
+kernel/src/net      Ethernet/ARP, IPv4/ICMP, UDP, TCP, loopback, DHCP, DNS, SNTP, sockets, HTTP client
 kernel/src/gl       kernel build of the OpenGL renderer and the OpenGL Demo app
 gl                  shared software OpenGL implementation (gl.c / gl.h)
-kernel/src/fs       VFS, tmpfs, initrd, tty, pipes, btrfs
+kernel/src/fs       VFS, tmpfs, initrd, tty, pipes, poll, devices, btrfs, FAT32, ext4 (read-only)
 kernel/src/gfx      canvas primitives, fonts, images
 kernel/src/ui       window server, theme, widgets, dialogs, app registry
-kernel/src/apps     Files, Terminal, shell, Editor, Calculator, Task Manager, Settings, Installer,
-                    Browser (browser.c), HTML parser (html.c) and layout (layout.c)
-user/libc           minimal C library for user programs
-user/bin            user-mode programs
+kernel/src/apps     Files, Terminal, shell, Editor, Calculator, Task Manager, Settings, Installer
+user/bin            user-mode programs (POSIX C, linked with musl)
+user/lib            libinflux: the inFlux-specific system calls
+user/ui             libui: the desktop toolkit for user programs (kernel sources + shims), TLS
+user/apps           the Browser and wget, built on libui
+tests               host filesystem regressions, the QEMU self-test runner, test volumes
 tools               fontgen, imgconv, icon renderer, test-disk builder
 assets              fonts, icons, logo
-third_party         Limine, stb headers
+third_party         Limine, stb headers, musl, BearSSL, Mozilla CA certificates
 ```
 
 ## Limitations
@@ -361,22 +431,27 @@ third_party         Limine, stb headers
 - Networking: IPv4 only, NE2000 and Intel PRO/1000 adapters only (the newer
   chipset LAN of the I218-LM/V on Haswell ultrabooks and the I219 is not
   supported: those need ultra-low-power exit and other quirks), no checksum or
-  segmentation offload, TCP as a client only (no
-  listening sockets), no IP fragment reassembly, DHCP leases are not renewed.
-  The stack is used by the kernel and the desktop; user programs in `/bin`
-  have no socket system calls yet.
-- The browser speaks plain HTTP: no HTTPS (most of today's web), JavaScript
-  or style sheets, so modern sites either redirect to HTTPS (an error page
-  offers the FrogFind text proxy) or render as unstyled documents. Sites
-  built for old computers, such as 68k.news, info.cern.ch, textfiles.com and
-  wiby.me, work well.
+  segmentation offload, no IP fragment reassembly, no AF_UNIX sockets other
+  than `socketpair`.
+- The browser has no JavaScript or style sheets, so modern sites render as
+  unstyled documents. TLS is 1.2 (BearSSL has no TLS 1.3).
+- Processes: `execve` from a multithreaded process fails with `EBUSY`; no
+  job control stops (`SIGSTOP`/`SIGTSTP` are ignored); no hard links;
+  `chmod`/`chown` are accepted but there are no users or permission checks
+  yet; at most 64 descriptors and 64 user processes.
+- ext4 is read-only and does not replay the journal; NTFS and exFAT are not
+  supported. Symbolic links on btrfs follow Linux's layout but have not been
+  checked with `btrfs check`.
+- Power: no suspend (S3); battery, AC and backlight support follows the ACPI
+  specification but has not been tested on a laptop (QEMU has none of them),
+  and the SpeedStep governor has not run on real hardware either.
 - btrfs: single-device volumes with CRC32C checksums only; no compression,
   snapshots, RAID or zoned support. Metadata is updated in place rather than
   copy-on-write, so an interrupted write can leave the volume inconsistent;
   the free space tree is kept consistent, or marked for rebuild if a block
   group uses the bitmap format.
-- The desktop applications run as kernel threads; only `/bin` programs run in
-  ring 3.
+- Apart from the Browser, the desktop applications (Files, Terminal and its
+  shell, Editor, Settings, ...) still run as kernel threads.
 - The Radeon driver was written from the Linux radeon register definitions
   and has not been run on real HD 4000 hardware yet; it never touches the 3D
   engine (that needs the R700 CP microcode and a command-stream backend), so
@@ -398,4 +473,5 @@ third_party         Limine, stb headers
 
 inFlux's own code is released under the MIT license. Third-party components keep
 their licenses: Limine (BSD-2-Clause), stb (public domain/MIT), Inter and
-Source Code Pro (SIL Open Font License), Kora icons (GPL-3.0).
+Source Code Pro (SIL Open Font License), Kora icons (GPL-3.0), musl (MIT),
+BearSSL (MIT), the Mozilla CA certificate bundle (MPL-2.0).

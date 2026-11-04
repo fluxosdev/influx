@@ -228,16 +228,25 @@ static bool chunked_feed(struct chunked *c, const struct buf *raw, struct buf *b
     return true;
 }
 
+/* the transport: plain TCP, or TLS over it for https */
+static int64_t xsend(struct tcp_conn *c, void *tls, const void *d, size_t n, int timeout, volatile bool *cancel) {
+    return tls ? http_tls_send(tls, d, n, timeout, cancel) : tcp_send(c, d, n, timeout, cancel);
+}
+static int64_t xrecv(struct tcp_conn *c, void *tls, void *d, size_t n, int timeout, volatile bool *cancel) {
+    return tls ? http_tls_recv(tls, d, n, timeout, cancel) : tcp_recv(c, d, n, timeout, cancel);
+}
+
 static int fetch_once(const struct http_request *req, const char *url, const char *method, const void *rbody, size_t rbody_len,
                       struct http_response *resp) {
     struct url u;
     if (!url_parse(url, &u) || !u.host[0]) { set_error(resp, "The address “%s” is not valid.", url); return -EINVAL; }
-    if (!strcmp(u.scheme, "https")) { set_error(resp, "Secure (HTTPS) connections are not supported."); return -EPROTO; }
-    if (strcmp(u.scheme, "http")) { set_error(resp, "The “%s:” scheme is not supported.", u.scheme); return -EPROTO; }
+    bool secure = !strcmp(u.scheme, "https");
+    if (secure && !http_tls_available()) { set_error(resp, "Secure (HTTPS) connections are not supported here."); return -EPROTO; }
+    if (!secure && strcmp(u.scheme, "http")) { set_error(resp, "The “%s:” scheme is not supported.", u.scheme); return -EPROTO; }
     /* the request is built first: one that does not fit is refused before anything is sent (cut short,
      * it would lose its final blank line and the server would wait for the rest until we time out) */
     char hosthdr[300];
-    if (u.port != 80) snprintf(hosthdr, sizeof hosthdr, "%s:%u", u.host, u.port); else strlcpy(hosthdr, u.host, sizeof hosthdr);
+    if (u.port != (secure ? 443 : 80)) snprintf(hosthdr, sizeof hosthdr, "%s:%u", u.host, u.port); else strlcpy(hosthdr, u.host, sizeof hosthdr);
     /* control characters, spaces and non-ASCII would break (or inject into) the request line */
     static const char hex[] = "0123456789ABCDEF";
     char *epath = kmalloc(3 * sizeof u.path);
@@ -277,10 +286,17 @@ static int fetch_once(const struct http_request *req, const char *url, const cha
         kfree(head);
         return -err;
     }
-    int64_t sent = tcp_send(c, head, hl, SEND_TIMEOUT, req->cancel);
+    void *tls = NULL;
+    if (secure) {
+        if (req->progress) req->progress(req->progress_ctx, "Securing", 0, 0);
+        char why[160];
+        tls = http_tls_open(c, u.host, CONNECT_TIMEOUT, req->cancel, why, sizeof why);
+        if (!tls) { tcp_abort(c); kfree(head); set_error(resp, "A secure connection to %s could not be established: %s", u.host, why); return -EPROTO; }
+    }
+    int64_t sent = xsend(c, tls, head, hl, SEND_TIMEOUT, req->cancel);
     kfree(head);
-    if (sent >= 0 && rbody && rbody_len) sent = tcp_send(c, rbody, rbody_len, SEND_TIMEOUT, req->cancel);
-    if (sent < 0) { tcp_abort(c); set_error(resp, "Sending the request failed: %s.", strerr((int)-sent)); return (int)sent; }
+    if (sent >= 0 && rbody && rbody_len) sent = xsend(c, tls, rbody, rbody_len, SEND_TIMEOUT, req->cancel);
+    if (sent < 0) { if (tls) http_tls_close(tls, false); tcp_abort(c); set_error(resp, "Sending the request failed: %s.", strerr((int)-sent)); return (int)sent; }
 
     if (req->progress) req->progress(req->progress_ctx, "Waiting", 0, 0);
     struct buf raw = { 0 }, body = { 0 };
@@ -292,7 +308,7 @@ static int fetch_once(const struct http_request *req, const char *url, const cha
     uint8_t *tmp = kmalloc(8192);
     int result = 0;
     for (;;) {
-        int64_t n = tcp_recv(c, tmp, 8192, RECV_TIMEOUT, req->cancel);
+        int64_t n = xrecv(c, tls, tmp, 8192, RECV_TIMEOUT, req->cancel);
         if (n < 0) {
             result = (int)n;
             set_error(resp, "Receiving the response failed: %s.", strerr((int)-n));
@@ -358,6 +374,7 @@ static int fetch_once(const struct http_request *req, const char *url, const cha
         if (req->progress) req->progress(req->progress_ctx, "Receiving", got, content_length > 0 ? (size_t)content_length : 0);
     }
     kfree(tmp);
+    if (tls) http_tls_close(tls, result == 0 && complete);
     if (result == 0 && complete) tcp_close(c); else tcp_abort(c);
     if (result == 0 && header_end) {
         if (!chunked_enc && !no_body) {
@@ -402,7 +419,7 @@ int http_request(const struct http_request *req, struct http_response *resp) {
         strlcpy(err, resp->error, sizeof err);
         http_response_free(resp);
         memset(resp, 0, sizeof *resp);
-        if (!strncmp(url, "https:", 6)) {
+        if (!strncmp(url, "https:", 6) && !http_tls_available()) {
             /* the page moved to a secure address we cannot follow */
             strlcpy(resp->final_url, url, sizeof resp->final_url);
             set_error(resp, "The site redirected to a secure (HTTPS) address, which is not supported.");

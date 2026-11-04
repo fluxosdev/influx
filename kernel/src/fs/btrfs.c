@@ -37,7 +37,7 @@ static int write_inode(struct btrfs_fs *fs, uint64_t ino, const struct btrfs_ino
 }
 static void fill_vnode(struct bnode *b, const struct btrfs_inode_item *ii) {
     uint32_t fmt = ii->mode & 0170000;
-    b->vn.type = fmt == 040000 ? VN_DIR : VN_FILE;
+    b->vn.type = fmt == 040000 ? VN_DIR : fmt == 0120000 ? VN_LNK : VN_FILE;
     b->vn.size = ii->size; b->vn.mtime = ii->mtime.sec; b->vn.mode = ii->mode & 07777; b->vn.ino = b->ino;
 }
 static struct bnode *get_bnode(struct btrfs_fs *fs, uint64_t ino, const char *name) {
@@ -108,7 +108,7 @@ static int b_readdir(struct vnode *dirv, int index, struct dirent *out) {
             if (i == index) {
                 size_t nl = MIN(di->name_len, NAME_MAX);
                 memcpy(out->name, di + 1, nl); out->name[nl] = 0;
-                out->type = di->type == BTRFS_FT_DIR ? VN_DIR : VN_FILE;
+                out->type = di->type == BTRFS_FT_DIR ? VN_DIR : di->type == BTRFS_FT_SYMLINK ? VN_LNK : VN_FILE;
                 out->ino = di->location.objectid;
                 struct btrfs_inode_item ii;
                 if (read_inode(fs, di->location.objectid, &ii, NULL) == 0) { out->size = ii.size; out->mtime = ii.mtime.sec; } else { out->size = 0; out->mtime = 0; }
@@ -529,14 +529,14 @@ static struct vnode *b_create(struct vnode *dirv, const char *name, int type) {
     uint64_t ino = fs->next_ino++;
     struct btrfs_inode_item ii = { 0 };
     ii.generation = fs->transid; ii.transid = fs->transid; ii.nlink = 1; ii.uid = 0; ii.gid = 0;
-    ii.mode = type == VN_DIR ? (040000 | 0755) : (0100000 | 0644);
+    ii.mode = type == VN_DIR ? (040000 | 0755) : type == VN_LNK ? (0120000 | 0777) : (0100000 | 0644);
     uint64_t t = now_sec();
     ii.atime.sec = ii.ctime.sec = ii.mtime.sec = ii.otime.sec = t;
     struct btrfs_key k = { ino, BTRFS_INODE_ITEM_KEY, 0 };
     uint64_t index = next_dir_index(fs, dir->ino);
     int r = btrfs_insert_item(fs, &fs->fs_tree, &k, &ii, sizeof ii, NULL);
     if (r == 0) {
-        r = add_dir_entry(fs, dir->ino, name, ino, type == VN_DIR ? BTRFS_FT_DIR : BTRFS_FT_REG_FILE, index);
+        r = add_dir_entry(fs, dir->ino, name, ino, type == VN_DIR ? BTRFS_FT_DIR : type == VN_LNK ? BTRFS_FT_SYMLINK : BTRFS_FT_REG_FILE, index);
         if (r == 0) touch_dir(fs, dir->ino, 2 * nl);
         else undo_create(fs, dir->ino, name, ino, index);   /* the commit below must not write a half-made entry */
     }

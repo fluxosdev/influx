@@ -7,9 +7,10 @@
  * a window draws into its own canvas here, and window_end_draw sends the
  * changed rectangle to the window server.
  */
-#define _GNU_SOURCE
 #include "ui.h"
 #include "mm.h"
+#include "simd.h"
+#include <stdio.h>
 #include <errno.h>
 #include <limits.h>
 #include <fcntl.h>
@@ -230,6 +231,7 @@ bool dialog_prompt(const char *title, const char *message, const char *initial, 
     struct user_dialog d = { (uint64_t)title, (uint64_t)message, (uint64_t)initial, (uint64_t)out, (uint32_t)outsz, 0 };
     return sc6(SYS_UI_DIALOG, 2, (long)&d, 0, 0, 0) > 0;
 }
+void notify_post(const char *title, const char *body) { sc6(0x1026, (long)title, (long)body, 0, 0, 0); }
 int app_launch(int id, const char *arg) { return (int)sc6(SYS_APP_LAUNCH, id, (long)arg, 0, 0, 0); }
 void app_open_path(const char *path) { sc6(SYS_APP_OPEN, (long)path, 0, 0, 0, 0); }
 

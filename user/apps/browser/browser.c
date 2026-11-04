@@ -171,9 +171,10 @@ static struct html_doc *home_page(void) {
              "<li><a href=\"http://wiby.me/\">wiby.me</a> — a search engine for classic web pages</li>"
              "<li><a href=\"http://danluu.com/\">danluu.com</a> — essays, in plain HTML</li>"
              "<li><a href=\"http://example.com/\">example.com</a></li>"
-             "</ul><h3>About</h3><p>This browser speaks HTTP/1.1 over inFlux's own TCP/IP stack and NE2000 driver. "
+             "</ul><h3>About</h3><p>This browser speaks HTTP/1.1 and HTTPS (TLS 1.2 with BearSSL, checked against Mozilla's root certificates) "
+             "over inFlux's own TCP/IP stack, and runs as an ordinary user program. "
              "It lays out HTML with tables, lists, forms and images (PNG, JPEG, GIF, BMP). "
-             "Secure (HTTPS) sites, JavaScript and style sheets are not supported.</p>"
+             "JavaScript and style sheets are not supported, so modern sites appear as plain documents.</p>"
              "<p><font size=2 color=\"#6E6E73\">⌘L address bar · ⌘R reload · ⌘[ back · ⌘] forward · ⌘U view source</font></p>"
              "</td></tr></table><br></body></html>", net);
     struct html_doc *d = html_parse(html, strlen(html), "utf-8", HOME_URL);
@@ -233,6 +234,8 @@ static struct html_doc *doc_from_response(struct job *j, struct http_response *r
     snprintf(path, sizeof path, "/home/flux/Downloads/%s", name);
     if (vfs_write_file(path, r->body, r->body_len) == 0) {
         snprintf(msg, sizeof msg, "The file (%zu bytes, %s) was saved to %s.", r->body_len, ct, path);
+        char note[260]; snprintf(note, sizeof note, "%s was saved to Downloads.", name);
+        notify_post("Download complete", note);
         return error_page(url, "Download complete", msg, false);
     }
     snprintf(msg, sizeof msg, "This %s file cannot be displayed, and saving it to %s failed.", ct, path);

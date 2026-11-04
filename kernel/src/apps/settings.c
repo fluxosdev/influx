@@ -7,6 +7,7 @@
 #include "installer.h"
 #include "simd.h"
 #include "net.h"
+#include "sounds.h"
 
 #define SIDEBAR_W 200
 enum { PANE_GENERAL, PANE_APPEARANCE, PANE_WALLPAPER, PANE_DISPLAYS, PANE_DATETIME, PANE_STORAGE, PANE_ABOUT, NPANES };
@@ -213,6 +214,9 @@ static void draw(struct settings *s) {
         font_draw(c, font_ui_semibold, cx, cy + 214, theme.text, "Menu bar clock");
         ui_switch(c, cx + 200, cy + 210, clock_24h);
         font_draw(c, font_ui, cx + 246, cy + 214, theme.text_secondary, "Use 24-hour time");
+        font_draw(c, font_ui_semibold, cx, cy + 254, theme.text, "Sound effects");
+        ui_switch(c, cx + 200, cy + 250, sounds_enabled);
+        font_draw(c, font_ui, cx + 246, cy + 254, theme.text_secondary, "Chimes for notifications and alerts");
         break; }
     case PANE_WALLPAPER: {
         font_draw(c, font_ui, cx, cy, theme.text_secondary, "Choose a desktop gradient.");
@@ -362,6 +366,7 @@ static void click(struct settings *s, int x, int y) {
         if (rect_contains(rect_make(cx + 140, cy + 24, 120, 80), x, y)) { theme_apply(true, theme.accent_index); wm_theme_changed(); prefs_save(); }
         for (int i = 0; i < 8; i++) if (rect_contains(rect_make(cx + i * 30, cy + 172, 22, 22), x, y)) { theme_apply(theme.dark, i); wm_theme_changed(); prefs_save(); }
         if (rect_contains(rect_make(cx + 200, cy + 210, 40, 24), x, y)) { clock_24h = !clock_24h; wm_dirty_all(); prefs_save(); }
+        if (rect_contains(rect_make(cx + 200, cy + 250, 40, 24), x, y)) { sounds_enabled = !sounds_enabled; wm_dirty_all(); prefs_save(); if (sounds_enabled) sound_play(SOUND_NOTIFY); }
         break;
     case PANE_WALLPAPER:
         for (size_t i = 0; i < ARRAY_LEN(wallpapers); i++) { int wx = cx + (i % 4) * 130, wy = cy + 30 + (i / 4) * 110; if (rect_contains(rect_make(wx, wy, 120, 80), x, y)) { theme_set_wallpaper(wallpapers[i].top, wallpapers[i].bottom); wm_theme_changed(); prefs_save(); } }

@@ -7,6 +7,7 @@
  * through the FADT reset register.
  */
 #include "acpi_internal.h"
+#include "power.h"
 #include "io.h"
 #include "mm.h"
 #include "string.h"
@@ -223,6 +224,7 @@ static void power_button_pressed(void) {
 /* Notify() from AML: a control-method power button reports 0x80 */
 void acpi_notify(struct aml_node *n, uint64_t value) {
     if (value == 0x80 && ns_hid_matches(n, "PNP0C0C")) { power_button_pressed(); return; }
+    if (power_notify(n, value)) return;
     char path[96]; ns_path(n, path, sizeof path);
     kprintf("acpi: Notify(%s, 0x%lx)\n", path, value);
 }
