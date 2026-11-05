@@ -30,6 +30,7 @@ void gpu_init(void) {
     }
     if (!found_vga) strcpy(software_gpu.name, "Software Rasterizer (linear framebuffer)");
     radeon_init();
+    amdgpu_init();
     intel_gfx_init();
     bochs_init();
     gpu_register(&software_gpu);

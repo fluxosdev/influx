@@ -376,7 +376,7 @@ void radeon_init(void) {
         if (pd->vendor != 0x1002 || pd->class_code != 0x03) continue;
         const struct chip_info *ci = NULL;
         for (size_t k = 0; k < ARRAY_LEN(chips); k++) if (pd->device >= chips[k].lo && pd->device <= chips[k].hi) ci = &chips[k];
-        if (!ci) { kprintf("radeon: ATI device %04x is not an R700; software path\n", pd->device); continue; }
+        if (!ci) { if (!amdgpu_supported(pd->device)) kprintf("radeon: ATI device %04x is not an R700; software path\n", pd->device); continue; }
         if (probe(pd, ci)) return;
     }
 }

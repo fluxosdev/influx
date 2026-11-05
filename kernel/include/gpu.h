@@ -37,6 +37,8 @@ int gpu_count(void);
 struct gpu_device *gpu_at(int i);
 struct gpu_device *gpu_primary(void);      /* the device driving the framebuffer */
 void radeon_init(void);
+void amdgpu_init(void);
+bool amdgpu_supported(uint16_t device);    /* a Navi 14 the amdgpu driver handles */
 void intel_gfx_init(void);
 void bochs_init(void);
 
