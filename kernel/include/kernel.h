@@ -25,7 +25,7 @@
 #define USER_STACK_SIZE  (256 * 1024)
 #define USER_HEAP_BASE   0x0000100000000000ULL
 
-#define INFLUX_VERSION "0.1.0"
+#define INFLUX_VERSION "0.0.1"
 
 extern uint64_t hhdm_offset;
 static inline void *P2V(uint64_t p) { return (void *)(p + hhdm_offset); }
