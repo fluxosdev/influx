@@ -293,7 +293,8 @@ static void draw(struct files *f) {
     gfx_hline(c, SIDEBAR_W, H - STATUS_H, W - SIDEBAR_W, theme.separator);
     int nsel = 0; for (int i = 0; i < f->nentries; i++) if (f->sel[i]) nsel++;
     char status[128];
-    char avail[32]; format_size(pmm_free_bytes(), avail, sizeof avail);
+    uint64_t dtot, dfree;
+    char avail[32]; format_size(vfs_space(f->path, &dtot, &dfree, NULL) ? dfree : pmm_free_bytes(), avail, sizeof avail);
     if (nsel) snprintf(status, sizeof status, "%d of %d selected, %s available", nsel, f->nentries, avail);
     else snprintf(status, sizeof status, "%d item%s, %s available", f->nentries, f->nentries == 1 ? "" : "s", avail);
     font_draw_centered(c, font_ui_small, rect_make(SIDEBAR_W, H - STATUS_H, W - SIDEBAR_W, STATUS_H), theme.text_secondary, status);

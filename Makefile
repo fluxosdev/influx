@@ -1,7 +1,8 @@
 # inFlux build system
 # Targets: all (ISO), system (kernel + initrd, no ISO tools needed), kernel, initrd, run, run-kvm, disk, clean
-# DEVTOOLS=1 puts the developer tools bundle (build/devtools, made by tools/toolchain/build-devtools.sh:
-# gcc, binutils, make, BusyBox) into the system image at /usr, with /bin/sh, so inFlux can build itself.
+# DEVTOOLS=1 adds the developer tools bundle (build/devtools, made by tools/toolchain/build-devtools.sh:
+# gcc, binutils, make, BusyBox) as a second boot module, build/devtools.tar: /usr and /bin/sh. The live
+# system unpacks it next to the system image; the installer puts it on the installed disk as a package.
 
 CC      := gcc
 LD      := gcc
@@ -97,7 +98,7 @@ FONT_FILES := $(foreach s,$(FONT_SPECS),$(SYSROOT)/sys/fonts/$(word 1,$(subst :,
 ICON_PNGS  := $(wildcard assets/icons/png/*.png)
 ICON_FILES := $(patsubst assets/icons/png/%.png,$(SYSROOT)/sys/icons/%.img,$(ICON_PNGS))
 
-.PHONY: all system kernel initrd run run-kvm run-nogui disk clean distclean tools test test-fs test-btrfs test-devtools
+.PHONY: all system kernel initrd run run-kvm run-nogui disk clean distclean tools test test-fs test-btrfs test-devtools test-persist
 
 all: $(ISO)
 
@@ -233,23 +234,30 @@ SKEL_FILES := $(shell find sysroot -type f 2>/dev/null)
 
 initrd: $(INITRD)
 
-# DEVTOOLS=1: the toolchain bundle at /usr and BusyBox's sh as /bin/sh
+# DEVTOOLS=1: the toolchain bundle at /usr and BusyBox's sh as /bin/sh, as a module of its own
 ifeq ($(DEVTOOLS),1)
 DEVTOOLS_DIR := $(BUILD)/devtools
 DEVTOOLS_OVERLAY := $(BUILD)/devtools-overlay
-INITRD_ROOTS_EXTRA := $(DEVTOOLS_DIR)=usr $(DEVTOOLS_OVERLAY)
+DEVTOOLS_IMG := $(BUILD)/devtools.tar
 $(DEVTOOLS_DIR)/bin/gcc:
 	@echo "DEVTOOLS=1 needs $(DEVTOOLS_DIR): run tools/toolchain/build-devtools.sh first" >&2; exit 1
+$(DEVTOOLS_IMG): $(DEVTOOLS_DIR)/bin/gcc $(MKINITRD) FORCE
+	rm -rf $(DEVTOOLS_OVERLAY) && mkdir -p $(DEVTOOLS_OVERLAY)/bin && ln -s /usr/bin/busybox $(DEVTOOLS_OVERLAY)/bin/sh
+	$(MKINITRD) $@.tmp $(DEVTOOLS_DIR)=usr $(DEVTOOLS_OVERLAY)
+	@if cmp -s $@.tmp $@; then rm $@.tmp; else mv $@.tmp $@; fi
 endif
+# which modules the ISO carries: a change rebuilds it
+ISO_VARIANT := $(BUILD)/.iso-variant
+$(ISO_VARIANT): FORCE
+	@mkdir -p $(BUILD); echo 'DEVTOOLS=$(DEVTOOLS)' | cmp -s - $@ || echo 'DEVTOOLS=$(DEVTOOLS)' > $@
 
-$(INITRD): $(FONT_FILES) $(ICON_FILES) $(UPROGS) $(UPROGS_DYN) $(UAPPS) $(LDSO) $(CA_BUNDLE) $(SKEL_FILES) $(KERNEL) $(MKINITRD) $(if $(DEVTOOLS_DIR),$(DEVTOOLS_DIR)/bin/gcc) FORCE
+$(INITRD): $(FONT_FILES) $(ICON_FILES) $(UPROGS) $(UPROGS_DYN) $(UAPPS) $(LDSO) $(CA_BUNDLE) $(SKEL_FILES) $(KERNEL) $(MKINITRD) FORCE
 	@mkdir -p $(SYSROOT)/boot/limine
 	cp -r sysroot/. $(SYSROOT)/
 	cp $(KERNEL) $(SYSROOT)/boot/influx.elf
 	nm -n $(KERNEL) | grep -i ' t ' > $(SYSROOT)/boot/influx.map
 	cp $(LIMINE)/BOOTX64.EFI $(LIMINE)/BOOTIA32.EFI $(LIMINE)/limine-bios.sys $(SYSROOT)/boot/limine/
-	$(if $(DEVTOOLS_OVERLAY),rm -rf $(DEVTOOLS_OVERLAY) && mkdir -p $(DEVTOOLS_OVERLAY)/bin && ln -s /usr/bin/busybox $(DEVTOOLS_OVERLAY)/bin/sh)
-	$(MKINITRD) $@.tmp $(SYSROOT) $(INITRD_ROOTS_EXTRA)
+	$(MKINITRD) $@.tmp $(SYSROOT)
 	@if cmp -s $@.tmp $@; then rm $@.tmp; else mv $@.tmp $@; fi
 
 # ---- ISO ----
@@ -266,13 +274,15 @@ define MKISO
 	$(BUILD)/limine bios-install $(2) 2>/dev/null
 endef
 
-$(ISO): $(KERNEL) $(INITRD) limine.conf $(BUILD)/limine
+$(ISO): $(KERNEL) $(INITRD) $(DEVTOOLS_IMG) $(ISO_VARIANT) limine.conf $(BUILD)/limine
 	rm -rf $(BUILD)/iso
 	mkdir -p $(BUILD)/iso/boot/limine $(BUILD)/iso/EFI/BOOT
 	cp $(KERNEL) $(BUILD)/iso/boot/influx.elf
 	cp $(INITRD) $(BUILD)/iso/boot/initrd.tar
 	cp limine.conf $(LIMINE)/limine-bios.sys $(LIMINE)/limine-bios-cd.bin \
 	   $(LIMINE)/limine-uefi-cd.bin $(BUILD)/iso/boot/limine/
+	$(if $(DEVTOOLS_IMG),cp $(DEVTOOLS_IMG) $(BUILD)/iso/boot/devtools.tar && \
+	   sed -i 's|^    module_string: initrd$$|&\n    module_path: boot():/boot/devtools.tar\n    module_string: devtools|' $(BUILD)/iso/boot/limine/limine.conf)
 	cp $(LIMINE)/BOOTX64.EFI $(LIMINE)/BOOTIA32.EFI $(BUILD)/iso/EFI/BOOT/
 	$(call MKISO,$(BUILD)/iso,$@)
 
@@ -280,7 +290,7 @@ $(ISO): $(KERNEL) $(INITRD) limine.conf $(BUILD)/limine
 # make test: the host-side filesystem regressions, then a headless boot that runs /bin/systest
 # (boot option 'selftest'; SELFTEST_NET=1 adds the DNS/TCP checks, which need the internet)
 SELFTEST_ISO := $(BUILD)/influx-selftest.iso
-SELFTEST_CMDLINE := selftest$(if $(SELFTEST_NET), selftest-net)$(if $(SELFTEST_FS), selftest-fs)$(if $(SELFTEST_BTRFS), selftest-btrfs)$(if $(SELFTEST_DEVTOOLS), selftest-devtools)
+SELFTEST_CMDLINE := selftest$(if $(SELFTEST_NET), selftest-net)$(if $(SELFTEST_FS), selftest-fs)$(if $(SELFTEST_BTRFS), selftest-btrfs)$(if $(SELFTEST_DEVTOOLS), selftest-devtools)$(if $(SELFTEST_INSTALL), selftest-install)$(if $(SELFTEST_V1), selftest-v1)
 $(SELFTEST_ISO): $(ISO) FORCE
 	rm -rf $(BUILD)/iso-selftest
 	cp -r $(BUILD)/iso $(BUILD)/iso-selftest
@@ -296,6 +306,13 @@ test-btrfs:
 	rm -f $(BUILD)/test-btrfs.img && truncate -s 256M $(BUILD)/test-btrfs.img
 	$(MAKE) $(SELFTEST_ISO) SELFTEST_BTRFS=1
 	SELFTEST_DISK=$(BUILD)/test-btrfs.img bash tests/run-selftest.sh $(SELFTEST_ISO)
+
+# make test-persist: install onto a blank disk, then two boots from it: everything written outside /tmp survives,
+# and a system update replaces only the image files nobody changed
+test-persist:
+	rm -f $(BUILD)/test-persist.img && truncate -s 1G $(BUILD)/test-persist.img
+	$(MAKE) $(SELFTEST_ISO) SELFTEST_INSTALL=1
+	bash tests/run-persist.sh $(SELFTEST_ISO) $(BUILD)/test-persist.img
 
 # make test-devtools: a DEVTOOLS=1 image runs gcc, g++, sh and make on inFlux (needs build/devtools)
 test-devtools:

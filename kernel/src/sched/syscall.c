@@ -945,15 +945,10 @@ static int64_t do_syscall(struct regs *r) {
         if (nr == 138) { struct file *f = fd_get(p, (int)a1); if (!f) return -EBADF; if (f->path) sv = vfs_lookup(f->path); }
         else { if ((e = resolve_at(p, AT_FDCWD, a1, path, false)) < 0) return e; if (!(sv = vfs_lookup(path))) return -ENOENT; }
         if (sv) {
-            char mp[PATH_MAX]; const char *fp = nr == 138 ? fd_get(p, (int)a1)->path : path; size_t best = 0;
-            for (int i = 0; i < vfs_mount_count(); i++) {
-                struct vnode *root = vfs_mount_at(i, mp, sizeof mp);
-                size_t ml = strlen(mp);
-                if (root && root->fs_total && ml > best && !strncmp(fp, mp, ml) && (fp[ml] == '/' || !fp[ml])) {
-                    best = ml;
-                    sf.type = root->fs_name && !strcmp(root->fs_name, "btrfs") ? 0x9123683E : 0x4d44;
-                    sf.blocks = (int64_t)(root->fs_total / 4096); sf.bfree = sf.bavail = (int64_t)(root->fs_free / 4096);
-                }
+            uint64_t tot, fre; const char *fsn = NULL;
+            if (vfs_space(nr == 138 ? fd_get(p, (int)a1)->path : path, &tot, &fre, &fsn)) {
+                sf.type = fsn && !strcmp(fsn, "btrfs") ? 0x9123683E : 0x4d44;
+                sf.blocks = (int64_t)(tot / 4096); sf.bfree = sf.bavail = (int64_t)(fre / 4096);
             }
             vnode_unref(sv);
         }

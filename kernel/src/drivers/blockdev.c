@@ -210,6 +210,7 @@ static void scan_partitions(struct blockdev *d) {
         if (bwhy) { kprintf("blockdev: %s: GPT unusable (primary: %s, backup: %s), partitions ignored\n", d->name, why, bwhy); return; }
         kprintf("blockdev: %s: primary GPT invalid (%s), using the backup\n", d->name, why);
     }
+    memcpy(d->gpt_guid, h.guid, 16);
     scan_gpt(d, &h, entries);
     kfree(entries);
 }

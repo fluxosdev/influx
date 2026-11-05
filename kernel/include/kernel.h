@@ -61,6 +61,11 @@ struct boot_info {
     uint64_t rsdp;
     uint64_t kernel_phys, kernel_virt;
     uint64_t mem_total;          /* bytes of usable RAM */
+    uint32_t boot_media;         /* where the initrd came from: 0 a disk, 1 optical (live CD), 2 network */
+    uint8_t boot_disk_guid[16];  /* that disk's GPT GUID (all zeros: unknown) */
+    /* more modules than the system image: packages (e.g. "devtools"), unpacked over it on a live system */
+    struct boot_package { const void *data; uint64_t size; char name[32]; } packages[4];
+    int npackages;
 };
 extern struct boot_info boot_info;
 extern char system_hostname[64];

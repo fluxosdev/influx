@@ -30,14 +30,14 @@ static int mount_one(struct blockdev *d) {
     char mp[64];
     snprintf(mp, sizeof mp, d->esp ? "/mnt/.%s" : "/mnt/%s", d->name);   /* dot-name hides the ESP */
     vfs_mkdir("/mnt");
-    /* an installed inFlux root volume becomes the persistent home directory */
-    struct vnode *marker = NULL;
-    if (!strcmp(root->fs_name, "btrfs")) { struct vnode *m = root->ops->lookup(root, ".influx_root"); if (m) { marker = m; } }
-    if (marker) {
-        bool home_taken = false;
-        for (int i = 0; i < vfs_mount_count(); i++) { char p[64]; if (vfs_mount_at(i, p, sizeof p) && !strcmp(p, "/home")) home_taken = true; }
-        if (!home_taken) { strcpy(mp, "/home"); kprintf("storage: %s is the installed inFlux root, mounting at /home\n", d->name); }
-        vnode_unref(marker);
+    /* the installed inFlux volume of the disk we booted from becomes the root filesystem (sysroot.c) */
+    if (!strcmp(root->fs_name, "btrfs")) {
+        struct vnode *marker = root->ops->lookup(root, ".influx_root");
+        if (marker) {
+            vnode_unref(marker);
+            root->priv = d;
+            if (sysroot_attach(d, root)) return 0;
+        }
     }
     int r = vfs_mount(mp, root);
     if (r == 0) root->priv = d;
@@ -82,7 +82,7 @@ void storage_unmount(struct blockdev *d) {
 bool storage_mount_point(struct blockdev *v, char *out, size_t n) {
     for (int i = 0; i < vfs_mount_count(); i++) {
         char mp[64]; struct vnode *root = vfs_mount_at(i, mp, sizeof mp);
-        if (root && root->priv == v && strcmp(mp, "/")) { if (out) strlcpy(out, mp, n); return true; }
+        if (root && root->priv == v) { if (out) strlcpy(out, mp, n); return true; }
     }
     return false;
 }
@@ -91,11 +91,11 @@ int storage_mount_volume(struct blockdev *v) {
     if (storage_mount_point(v, NULL, 0)) return -EBUSY;
     return mount_one(v);
 }
-/* the installed system's home volume stays mounted */
+/* the root volume stays mounted */
 int storage_unmount_volume(struct blockdev *v) {
     char mp[64];
     if (!storage_mount_point(v, mp, sizeof mp)) return -EINVAL;
-    if (!strcmp(mp, "/home")) return -EBUSY;
+    if (!strcmp(mp, "/")) return -EBUSY;
     for (int i = 0; i < vfs_mount_count(); i++) {
         char p[64]; struct vnode *r = vfs_mount_at(i, p, sizeof p);
         if (!r || strcmp(p, mp)) continue;

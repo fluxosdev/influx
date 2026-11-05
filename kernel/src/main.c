@@ -65,6 +65,44 @@ static int selftest_btrfs(struct file *stdio[3]) {
     return pid > 0 ? status : -1;
 }
 
+int selftest_install(const char *next_cmdline);
+int selftest_next_stage(const char *next_cmdline);
+int selftest_update_image(int nfiles, const char *const *names, const char *const *contents);
+
+static int run_systest(struct file *stdio[3], char *a1, char *a2) {
+    char *argv[] = { "systest", a1, a2, NULL };
+    int pid = process_spawn("/bin/systest", a2 ? 3 : a1 ? 2 : 1, argv, stdio, "/");
+    int status = -1;
+    if (pid > 0) process_wait(pid, &status);
+    return pid > 0 ? status : -1;
+}
+
+/* make test-persist (tests/run-persist.sh): install, then two boots from the disk */
+static int selftest_persist(struct file *stdio[3]) {
+    bool v1 = kernel_cmdline_has("selftest-v1");   /* the install is turned into the first layout, which must move */
+    if (kernel_cmdline_has("selftest-install")) return selftest_install(v1 ? "selftest selftest-v1 selftest-persist-1" : "selftest selftest-persist-1");
+    if (kernel_cmdline_has("selftest-persist-1")) {
+        if (v1) { char *b; size_t n; bool ok = vfs_read_file("/home/flux/from-v1", (void **)&b, &n) == 0; if (ok) kfree(b);
+                  kprintf("%s the first layout's home directory is at /home/flux\n", ok ? "PASS" : "FAIL"); if (!ok) return 1; }
+        int st = run_systest(stdio, "posix", "/home/flux");   /* the POSIX file checks on the root volume */
+        struct vnode *gcc = vfs_lookup("/usr/bin/gcc");       /* the developer tools package: build on the disk */
+        if (gcc) { vnode_unref(gcc); if (st == 0) st = run_systest(stdio, "devtools", NULL); }
+        if (st == 0) st = run_systest(stdio, "persist", "write");
+        /* a system update: one new file, one the user left alone, one the user changed */
+        static const char *const names[] = { "./etc/persist-image-added", "./etc/hosts", "./etc/motd" };
+        static const char *const contents[] = { "added by the update\n", "127.0.0.1 localhost updated\n", "the update's motd\n" };
+        if (st == 0) st = selftest_update_image(3, names, contents);
+        if (st == 0) st = selftest_next_stage("selftest selftest-persist-2");
+        return st;
+    }
+    if (kernel_cmdline_has("selftest-persist-2")) {
+        int st = run_systest(stdio, "persist", "check");
+        if (st == 0) st = selftest_next_stage("");   /* done: the disk boots normally from now on */
+        return st;
+    }
+    return 0;
+}
+
 /* boot option 'selftest' (CI): run /bin/systest with its output on the serial port, then power off */
 static void selftest_thread(void *arg) {
     thread_sleep_ms(kernel_cmdline_has("selftest-net") ? 8000 : 500);   /* DHCP first for the network checks */
@@ -78,6 +116,7 @@ static void selftest_thread(void *arg) {
     int status = -1;
     if (pid > 0) process_wait(pid, &status);
     if (pid > 0 && status == 0 && kernel_cmdline_has("selftest-btrfs")) status = selftest_btrfs(stdio);
+    if (pid > 0 && status == 0) status = selftest_persist(stdio);
     if (pid > 0 && status == 0 && kernel_cmdline_has("selftest-devtools")) {   /* a DEVTOOLS=1 image: gcc, sh, make */
         char *dargv[] = { "systest", "devtools", NULL };
         int dpid = process_spawn("/bin/systest", 2, dargv, stdio, "/");
@@ -86,6 +125,7 @@ static void selftest_thread(void *arg) {
     }
     kprintf("SELFTEST: %s (status %d)\n", pid > 0 && status == 0 ? "PASSED" : "FAILED", pid > 0 ? status : pid);
     vfs_close(con);
+    vfs_sync();   /* an installed system's root is a disk now */
     thread_sleep_ms(200);
     acpi_shutdown();
 }
@@ -103,6 +143,7 @@ static void init_thread(void *arg) {
     net_init();
     syscall_init();
     vfs_mkdir("/tmp"); vfs_mkdir("/etc");
+    sysroot_boot_done();     /* no root switch once the desktop runs */
     if (kernel_cmdline_has("selftest")) thread_create(kernel_process, "selftest", selftest_thread, NULL);
     desktop_main(NULL);
 }
@@ -120,12 +161,28 @@ void kmain(void) {
     boot_info.kernel_virt = kaddr_request.response->virtual_base;
     boot_info.rsdp = rsdp_request.response ? (uint64_t)rsdp_request.response->address : 0;
     if (boot_info.rsdp >= hhdm_offset) boot_info.rsdp -= hhdm_offset;
-    if (module_request.response && module_request.response->module_count > 0) {
-        struct limine_file *m = module_request.response->modules[0];
-        boot_info.initrd = m->address; boot_info.initrd_size = m->size;
+    /* the module named "initrd" (or the first) is the system image; others are packages */
+    for (uint64_t i = 0; module_request.response && i < module_request.response->module_count; i++) {
+        struct limine_file *m = module_request.response->modules[i];
+#if LIMINE_API_REVISION >= 3
+        const char *name = m->string ? m->string : "";
+#else
+        const char *name = m->cmdline ? m->cmdline : "";
+#endif
+        if (!boot_info.initrd && (!strcmp(name, "initrd") || !name[0] || i == module_request.response->module_count - 1)) {
+            boot_info.initrd = m->address; boot_info.initrd_size = m->size;
+            boot_info.boot_media = m->media_type;
+            memcpy(boot_info.boot_disk_guid, &m->gpt_disk_uuid, 16);
+        } else if (boot_info.npackages < 4) {
+            struct boot_package *bp = &boot_info.packages[boot_info.npackages++];
+            bp->data = m->address; bp->size = m->size;
+            strlcpy(bp->name, name[0] ? name : "package", sizeof bp->name);
+        }
     }
     kprintf("boot: hhdm=%lx kernel phys=%lx virt=%lx initrd=%p (%lu KiB)\n", hhdm_offset,
             boot_info.kernel_phys, boot_info.kernel_virt, boot_info.initrd, boot_info.initrd_size / 1024);
+    { const uint8_t *g = boot_info.boot_disk_guid;
+      kprintf("boot: from %s, disk GUID %02x%02x%02x%02x-...-%02x%02x%02x%02x\n", boot_info.boot_media == 1 ? "optical media" : boot_info.boot_media == 2 ? "the network" : "a disk", g[0], g[1], g[2], g[3], g[12], g[13], g[14], g[15]); }
 
     gdt_init();
     idt_init();
@@ -153,6 +210,10 @@ void kmain(void) {
     vfs_init();
     devices_init();
     if (boot_info.initrd) initrd_unpack(boot_info.initrd, boot_info.initrd_size, "/");
+    for (int i = 0; i < boot_info.npackages; i++) {   /* a live system: packages over the system image */
+        kprintf("initrd: package '%s' (%lu KiB)\n", boot_info.packages[i].name, boot_info.packages[i].size / 1024);
+        initrd_unpack(boot_info.packages[i].data, boot_info.packages[i].size, "/");
+    }
     /* the initrd module memory is bootloader-reclaimable; we copied it, leave it */
 
     char brand[64]; cpu_get_brand(brand, sizeof brand);

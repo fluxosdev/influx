@@ -17,16 +17,17 @@ struct blockdev {
     struct vnode *vn;
     bool esp;                        /* EFI System Partition: mounted hidden */
     volatile bool removed;           /* unplugged: I/O fails, the struct stays for stale users */
+    uint8_t gpt_guid[16];            /* a GPT disk's GUID (all zeros otherwise) */
 };
 void blockdev_register(struct blockdev *d);   /* registers the disk, scans partitions */
 void blockdev_unregister(struct blockdev *d); /* hot unplug: drop the disk and its partitions from /dev */
 void blockdev_alloc_name(const char *prefix, char *out, size_t n);   /* first free name: sda, sdb, ... */
 void blockdev_rescan(struct blockdev *d);     /* drop and re-read the partition table */
-void storage_mount(struct blockdev *d);       /* mount the disk's filesystems under /mnt (or /home) */
+void storage_mount(struct blockdev *d);       /* mount the disk's filesystems under /mnt (an installed system's volume at /) */
 void storage_unmount(struct blockdev *d);     /* unmount everything on the disk */
 bool storage_mount_point(struct blockdev *v, char *out, size_t n);   /* is this volume mounted, and where */
 int storage_mount_volume(struct blockdev *v);    /* 0, -EBUSY (already mounted), -EINVAL (no FAT32/btrfs) */
-int storage_unmount_volume(struct blockdev *v);  /* 0, -EINVAL (not mounted), -EBUSY (the system's /home) */
+int storage_unmount_volume(struct blockdev *v);  /* 0, -EINVAL (not mounted), -EBUSY (the root volume) */
 int blockdev_count(void);
 struct blockdev *blockdev_at(int i);
 struct blockdev *blockdev_find(const char *name);

@@ -315,7 +315,7 @@ static void draw(struct settings *s) {
         uint64_t total = pmm_total_bytes(), used = pmm_used_bytes();
         for (int i = -1; i < vfs_mount_count(); i++) {
             char name[64], mp[PATH_MAX]; uint64_t t, u; const char *fs; const char *bus = "Memory";
-            if (i < 0) { strcpy(name, "System (RAM disk)"); t = total; u = used; fs = "tmpfs"; strcpy(mp, "/"); }
+            if (i < 0) { if (vfs_root_is_disk()) continue; strcpy(name, "System (RAM disk)"); t = total; u = used; fs = "tmpfs"; strcpy(mp, "/"); }
             else { struct vnode *r = vfs_mount_at(i, mp, sizeof mp); if (!r) continue; strlcpy(name, r->name[0] ? r->name : vfs_basename(mp), sizeof name); t = r->fs_total; u = t > r->fs_free ? t - r->fs_free : 0; fs = r->fs_name ? r->fs_name : "?"; bus = "Disk"; }
             ui_panel(c, rect_make(cx, sy, cw, 70), theme.bg_secondary);
             struct canvas *ic = icon_get(i < 0 ? "computer" : "drive", 64);

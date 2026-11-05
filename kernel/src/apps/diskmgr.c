@@ -89,7 +89,7 @@ static bool is_volume(struct blockdev *d) { return d->parent || !has_partitions(
 static struct vnode *mount_root(struct blockdev *v, char *mp, size_t n) {
     for (int i = 0; i < vfs_mount_count(); i++) {
         char p[64]; struct vnode *r = vfs_mount_at(i, p, sizeof p);
-        if (r && r->priv == v && strcmp(p, "/")) { if (mp) strlcpy(mp, p, n); return r; }
+        if (r && r->priv == v) { if (mp) strlcpy(mp, p, n); return r; }
     }
     return NULL;
 }
@@ -195,7 +195,7 @@ static bool largest_free(struct dm *m, struct blockdev *d, uint64_t *first, uint
 static bool can_mount(struct dm *m) {
     if (!m->sel || !is_volume(m->sel)) return false;
     char mp[64];
-    if (mount_root(m->sel, mp, sizeof mp)) return strcmp(mp, "/home") != 0;
+    if (mount_root(m->sel, mp, sizeof mp)) return strcmp(mp, "/") != 0;   /* the system volume stays */
     struct item *it = item_of(m, m->sel);
     return it && it->fs != FS_NONE;
 }

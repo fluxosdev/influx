@@ -26,6 +26,8 @@ jobs:
         run: SELFTEST_TIMEOUT=600 make test
       - name: Test on btrfs (links, rename, modes, times on a volume the kernel formats)
         run: SELFTEST_TIMEOUT=600 make test-btrfs
+      - name: Test persistence (install, then two boots from the disk; a faked system update)
+        run: SELFTEST_TIMEOUT=600 make test-persist
       - name: Keep the ISO
         if: always()
         uses: actions/upload-artifact@v4

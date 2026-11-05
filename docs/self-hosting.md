@@ -63,7 +63,7 @@ The gaps found by the first survey, and where each stands:
 | Exec read the whole ELF into one kernel buffer | **Done.** It reads headers and segments straight from the file, 64 KiB at a time. |
 | No data/page cache: every exec copies `cc1` again, and file `mmap` copies the whole file | **Open.** This is Phase 1 items 8–9. Correctness doesn't depend on it, but speed and memory under `-j` do. |
 | `readdir` by index rescans the directory (O(n²) per listing) | **Open.** Cheap in practice: btrfs tree blocks are cached. |
-| Only `/home` is persistent; `/` is rebuilt from the initrd | **Open** (Phase 4). |
+| Only `/home` was persistent; `/` was rebuilt from the initrd | **Done** (Phase 4, first item). An installed system's btrfs volume is `/` (`kernel/src/fs/sysroot.c`), except `/dev`, `/tmp` and `/mnt`. The system image is synced onto it when it changes, using a manifest. The toolchain is a package that the installer puts on the disk, and `pkg install` updates it. `make test-persist` covers all of this. |
 | The build used GNU tar's `--format`/`--owner`/`--mtime` | **Done.** `tools/mkinitrd.c` writes a sorted, reproducible ustar archive. `xorriso` is still needed for the ISO, but `make system` builds without it. |
 
 Limits a build may hit:
@@ -185,8 +185,10 @@ in QEMU and pass `make test`'s selftest.
 
 ## Phase 4: Close the development loop (L2)
 
-- **Persistent system files:** move `/usr` (the toolchain) and the source tree to the btrfs root volume instead of the initrd, by mounting more of it than `/home` or bind-mounting `/usr`.
-  - Add a minimal tarball package step (`pkg install devtools.tar`), so the toolchain can be updated without rebuilding the ISO.
+- **Persistent system files:** done.
+  - The installed volume is the root filesystem.
+  - `DEVTOOLS=1` makes the toolchain a boot module. The installer copies it onto the disk (the 64 MB EFI partition couldn't hold it).
+  - `pkg install FILE.tar [NAME]` installs or updates a package, with the same keep-your-changes rules as the system image.
 - **`make install-local`:** copy `influx.elf` and `initrd.tar` to the ESP through the FAT32 driver. Keep the previous pair as a second Limine entry, "inFlux (previous)", so a bad kernel is one reboot away from recovery.
   - The crash reporter already writes to the ESP.
 - **ISO on inFlux** (optional for L2): port xorriso (autotools with libisofs/libburn, heavy), or write `tools/mkiso.c` (ISO 9660 + El Torito + the hybrid layout Limine expects).

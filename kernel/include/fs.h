@@ -32,6 +32,7 @@
 #define PATH_MAX 1024
 
 struct vnode;
+struct blockdev;
 struct file;
 struct dirent { char name[NAME_MAX + 1]; int type; uint64_t size; uint64_t mtime; uint64_t ino; };
 struct stat { int type; uint64_t size; uint64_t mtime; uint32_t mode; uint64_t ino; uint32_t nlink; uint32_t mtime_nsec; };
@@ -159,6 +160,27 @@ struct vnode *vfs_mount_at(int i, char *path, size_t n);
 struct vnode *tmpfs_create_root(const char *fsname);
 /* initrd */
 void initrd_unpack(const void *tar, size_t size, const char *dest);
+struct initrd_entry {
+    char path[PATH_MAX];          /* relative to the archive root: "" is the root itself */
+    char type;                    /* '0' file, '5' directory, '2' symbolic link, '1' hard link */
+    uint32_t mode; uint64_t mtime;
+    const void *data; uint64_t size;
+    char link[PATH_MAX];          /* symbolic link target, or the archive path a hard link names */
+};
+int initrd_foreach(const void *tar, size_t size, int (*fn)(void *ctx, const struct initrd_entry *e), void *ctx);
+/* the namespace's root becomes newroot; the tmpfs directories named in keep (NULL-terminated, e.g. /dev)
+ * stay, mounted over the new root's directories of those names, and everything else of the old tmpfs
+ * root is freed */
+int vfs_switch_root(struct vnode *newroot, const char *const *keep);
+bool vfs_root_is_disk(void);
+/* the disk volume that holds an absolute, normalized path: false when it is in memory (tmpfs) */
+bool vfs_space(const char *path, uint64_t *total, uint64_t *free, const char **fs_name);                                /* an installed system's volume is mounted at / */
+/* sysroot.c: an installed system's btrfs volume as the root filesystem */
+bool sysroot_attach(struct blockdev *d, struct vnode *vol); /* during boot only; false: mount it elsewhere */
+void sysroot_boot_done(void);                               /* the desktop starts: no root switch after this */
+/* installs or updates a package (a tar of files relative to root) under root, keeping files changed
+ * since the last version; name picks its manifest in root/var/lib/influx */
+int sysroot_sync(const char *root, const char *name, const void *tar, size_t size);
 /* devfs */
 void devfs_init(void);
 struct vnode *devfs_add(const char *name, int type, const struct vnode_ops *ops, void *priv, uint64_t size);

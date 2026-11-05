@@ -67,12 +67,12 @@ static void save_previous(const struct crash_hdr *h, const char *text, size_t le
 }
 char crashlog_previous[PATH_MAX];   /* path of the report saved at this boot ("" = none) */
 
-/* the ESP of the disk that holds /home (an installed inFlux) */
+/* the ESP of the disk that holds / (an installed inFlux) */
 static bool find_esp(char *mp, size_t n) {
     struct blockdev *home = NULL;
     for (int i = 0; i < vfs_mount_count(); i++) {
         char p[PATH_MAX]; struct vnode *r = vfs_mount_at(i, p, sizeof p);
-        if (r && !strcmp(p, "/home")) home = r->priv;
+        if (r && !strcmp(p, "/")) home = r->priv;
     }
     if (!home || !home->parent) return false;
     for (int i = 0; i < vfs_mount_count(); i++) {

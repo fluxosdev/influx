@@ -186,6 +186,82 @@ int vfs_unmount(const char *path) {
     return -ENOENT;
 }
 int vfs_mount_count(void) { return nmounts; }
+
+bool vfs_root_is_disk(void) { return root_vnode->mount_root != NULL; }
+
+bool vfs_space(const char *path, uint64_t *total, uint64_t *free, const char **fs_name) {
+    size_t best = 0; bool disk = false;
+    mutex_lock(&mount_lock);
+    for (int i = 0; i < nmounts; i++) {
+        size_t ml = strlen(mounts[i].path);
+        if (ml < best || strncmp(path, mounts[i].path, ml) || !(path[ml] == '/' || !path[ml] || ml == 1)) continue;
+        best = ml + 1;   /* "/" (length 1) loses to any longer match */
+        struct vnode *r = mounts[i].root;
+        disk = r->fs_total != 0;
+        if (disk) { *total = r->fs_total; *free = r->fs_free; if (fs_name) *fs_name = r->fs_name; }
+    }
+    mutex_unlock(&mount_lock);
+    return disk;
+}
+
+/* removes the old tmpfs tree under dir, except the top-level names in keep (and mount points) */
+static void drop_tree(struct vnode *dir, const char *const *keep) {
+    struct dirent d;
+    int i = 0;
+    while (dir->ops->readdir && dir->ops->readdir(dir, i, &d) == 0) {
+        bool kept = false;
+        for (int k = 0; keep && keep[k]; k++) if (!strcmp(keep[k] + 1, d.name)) kept = true;   /* "/dev" -> "dev" */
+        struct vnode *c = kept ? NULL : dir->ops->lookup(dir, d.name);
+        if (c && c->type == VN_DIR && !c->mount_root) drop_tree(c, NULL);
+        bool busy = c && c->mount_root;
+        if (c) vnode_unref(c);
+        if (kept || busy || dir->ops->unlink(dir, d.name) < 0) i++;   /* stays: look at the next one */
+    }
+}
+
+int vfs_switch_root(struct vnode *newroot, const char *const *keep) {
+    if (root_vnode->mount_root) return -EBUSY;
+    if (newroot->type != VN_DIR) return -ENOTDIR;
+    /* the tmpfs directories that carry on, and the mounts outside them (moved onto the new root) */
+    struct vnode *kept[8] = { 0 }; int nk = 0;
+    for (; keep && keep[nk] && nk < 8; nk++) { vfs_mkdir(keep[nk]); kept[nk] = vfs_lookup_nofollow(keep[nk]); if (kept[nk] && kept[nk]->type != VN_DIR) { vnode_unref(kept[nk]); kept[nk] = NULL; } }
+    struct { char path[PATH_MAX]; struct vnode *root; } *moved = kzalloc(VFS_MAX_MOUNTS * sizeof *moved);
+    int nmoved = 0;
+    for (int i = 0; i < nmounts; ) {
+        bool under_kept = false;
+        for (int k = 0; k < nk; k++) { size_t l = strlen(keep[k]); if (!strncmp(mounts[i].path, keep[k], l) && (mounts[i].path[l] == '/' || !mounts[i].path[l])) under_kept = true; }
+        if (under_kept) { i++; continue; }
+        strlcpy(moved[nmoved].path, mounts[i].path, PATH_MAX);
+        moved[nmoved].root = mounts[i].root; vnode_ref(mounts[i].root);
+        nmoved++;
+        vfs_unmount(mounts[i].path);   /* shifts the table down: i stays */
+    }
+    mutex_lock(&mount_lock);
+    root_vnode->mount_root = newroot;
+    vnode_ref(newroot);
+    newroot->parent = NULL;
+    memmove(&mounts[1], &mounts[0], nmounts * sizeof mounts[0]);   /* "/" first: it is the oldest mount */
+    strlcpy(mounts[0].path, "/", PATH_MAX); mounts[0].mountpoint = root_vnode; mounts[0].root = newroot;
+    vnode_ref(root_vnode);
+    nmounts++;
+    mutex_unlock(&mount_lock);
+    int r = 0;
+    for (int k = 0; k < nk; k++) {
+        if (!kept[k]) continue;
+        int e = vfs_mount(keep[k], kept[k]);
+        if (e < 0) { kprintf("vfs: cannot keep %s over the new root (%d)\n", keep[k], e); r = e; }
+        vnode_unref(kept[k]);
+    }
+    for (int i = 0; i < nmoved; i++) {
+        int e = vfs_mount(moved[i].path, moved[i].root);
+        if (e < 0) kprintf("vfs: cannot move the mount at %s onto the new root (%d)\n", moved[i].path, e);
+        vnode_unref(moved[i].root);
+    }
+    kfree(moved);
+    drop_tree(root_vnode, keep);   /* the unpacked initrd: the disk holds the system now */
+    kprintf("vfs: %s is the root filesystem\n", newroot->fs_name ? newroot->fs_name : "?");
+    return r;
+}
 static bool is_mount_root(struct vnode *v) { mutex_lock(&mount_lock); bool r = false; for (int i = 0; i < nmounts; i++) if (mounts[i].root == v) r = true; mutex_unlock(&mount_lock); return r; }
 /* may return NULL if the table shrank since vfs_mount_count(); fs roots are never freed */
 struct vnode *vfs_mount_at(int i, char *path, size_t n) {

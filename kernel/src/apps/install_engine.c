@@ -110,11 +110,11 @@ static int copy_tree(const char *src, const char *dst) {
     return r;
 }
 
-/* the installed system's disk: its root volume is mounted at /home (Disk Manager, the installer app and `install` use this too) */
+/* the installed system's disk: its volume is mounted at / (Disk Manager, the installer app and `install` use this too) */
 bool install_is_system_disk(struct blockdev *d) {
     for (int i = 0; i < vfs_mount_count(); i++) {
         char p[64]; struct vnode *r = vfs_mount_at(i, p, sizeof p);
-        if (!r || strcmp(p, "/home")) continue;
+        if (!r || strcmp(p, "/")) continue;
         /* r->priv is only a blockdev for disk volumes: match it against the disk's devices, don't dereference it */
         for (int j = 0; j < blockdev_count(); j++) { struct blockdev *b = blockdev_at(j); if (b && (void *)b == r->priv && (b == d || b->parent == d)) return true; }
     }
@@ -122,16 +122,15 @@ bool install_is_system_disk(struct blockdev *d) {
 }
 
 bool install_is_installed_system(void) {
-    for (int i = 0; i < vfs_mount_count(); i++) { char mp[PATH_MAX]; vfs_mount_at(i, mp, sizeof mp); if (!strcmp(mp, "/home")) return true; }
-    return false;
+    return vfs_root_is_disk();
 }
 
 int install_run(struct blockdev *disk, install_progress_fn progress, void *ctx) {
     if (!disk || disk->parent) return -EINVAL;
     char msg[160];
     #define STEP(pct, ...) do { snprintf(msg, sizeof msg, __VA_ARGS__); kprintf("install: %s\n", msg); if (progress) progress(ctx, pct, msg); } while (0)
-    /* the loop below would unmount /home and write_gpt would wipe the running system's files */
-    if (install_is_system_disk(disk)) { STEP(100, "%s holds the running system (its volume is mounted at /home); choose another disk", disk->name); return -EBUSY; }
+    /* write_gpt would wipe the running system's files */
+    if (install_is_system_disk(disk)) { STEP(100, "%s holds the running system; choose another disk", disk->name); return -EBUSY; }
     if (disk->sector_size != 512) { STEP(100, "%s has %u-byte sectors; only 512-byte sector disks are supported", disk->name, disk->sector_size); return -EINVAL; }
     /* never install onto a disk that is currently mounted */
     for (int i = 0; i < blockdev_count(); i++) { struct blockdev *b = blockdev_at(i); if (b && (b == disk || b->parent == disk) && b->fs_type) { for (int m = 0; m < vfs_mount_count(); m++) { char mp[PATH_MAX]; struct vnode *r = vfs_mount_at(m, mp, sizeof mp); if (r && r->priv == b) { STEP(0, "%s is mounted at %s; unmounting", b->name, mp); if (vfs_unmount(mp) == 0) { btrfs_unmount(r); m--; } } } } }
@@ -175,10 +174,18 @@ int install_run(struct blockdev *disk, install_progress_fn progress, void *ctx) 
     struct vnode *root_vn = btrfs_mount(rootp);
     if (!root_vn) { STEP(100, "Cannot mount the new root volume"); return -EIO; }
     if ((r = vfs_mount("/mnt/.install-root", root_vn)) < 0) { STEP(100, "Cannot mount the new root volume (%d)", r); btrfs_unmount(root_vn); return r; }
+    /* the system files come from the image on the EFI partition at the first boot (sysroot.c) */
     STEP(74, "Creating home directory");
-    r = vfs_write_file("/mnt/.install-root/.influx_root", "inFlux root volume\n", 19);
+    r = vfs_write_file("/mnt/.install-root/.influx_root", "inFlux root volume\nlayout 2\n", 28);
     if (r < 0) STEP(100, "Writing the root volume marker failed (%d)", r);
-    else if ((r = copy_tree("/home/flux", "/mnt/.install-root/flux")) < 0) STEP(100, "Copying the home directory failed (%d)", r);
+    else if ((r = vfs_mkdir("/mnt/.install-root/home")) < 0) STEP(100, "Creating /home failed (%d)", r);
+    else if ((r = copy_tree("/home/flux", "/mnt/.install-root/home/flux")) < 0) STEP(100, "Copying the home directory failed (%d)", r);
+    /* packages the live system booted with (e.g. the developer tools) go onto the disk, not the EFI partition */
+    for (int i = 0; r == 0 && i < boot_info.npackages; i++) {
+        STEP(80, "Installing %s (%lu KiB)", boot_info.packages[i].name, boot_info.packages[i].size / 1024);
+        if ((r = sysroot_sync("/mnt/.install-root", boot_info.packages[i].name, boot_info.packages[i].data, boot_info.packages[i].size)) < 0)
+            STEP(100, "Installing %s failed (%d)", boot_info.packages[i].name, r);
+    }
     /* write-back errors of buffered btrfs data only show up here: sync the whole volume and check */
     int s = root_vn->ops->sync(root_vn);
     vfs_unmount("/mnt/.install-root");

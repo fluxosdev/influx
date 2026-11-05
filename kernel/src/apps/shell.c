@@ -590,11 +590,12 @@ static int b_df(struct ctx *c, int argc, char **argv) {
     char a[16], b[16], d[16];
     uint64_t t = pmm_total_bytes(), u = heap_used_bytes();
     if (h) { format_size_h(t, a, 16); format_size_h(u, b, 16); format_size_h(t - u, d, 16); } else { snprintf(a, 16, "%lu", t / 1024); snprintf(b, 16, "%lu", u / 1024); snprintf(d, 16, "%lu", (t - u) / 1024); }
-    cprintf(c, "%-16s %10s %10s %10s %4lu%%  /\n", "tmpfs", a, b, d, u * 100 / t);
+    if (!vfs_root_is_disk()) cprintf(c, "%-16s %10s %10s %10s %4lu%%  /\n", "tmpfs", a, b, d, u * 100 / t);
     for (int i = 0; i < vfs_mount_count(); i++) {
         char mp[PATH_MAX]; struct vnode *r = vfs_mount_at(i, mp, sizeof mp);
         if (!r) continue;
         uint64_t tot = r->fs_total, fre = r->fs_free, use = tot > fre ? tot - fre : 0;
+        if (!tot) { tot = t; use = u; fre = t - u; }   /* /dev, /tmp, /mnt: memory */
         if (h) { format_size_h(tot, a, 16); format_size_h(use, b, 16); format_size_h(fre, d, 16); } else { snprintf(a, 16, "%lu", tot / 1024); snprintf(b, 16, "%lu", use / 1024); snprintf(d, 16, "%lu", fre / 1024); }
         cprintf(c, "%-16s %10s %10s %10s %4lu%%  %s\n", r->fs_name ? r->fs_name : "?", a, b, d, tot ? use * 100 / tot : 0, mp);
     }
@@ -638,7 +639,7 @@ static int b_install(struct ctx *c, int argc, char **argv) {
     const char *n = dev; if (!strncmp(n, "/dev/", 5)) n += 5;
     struct blockdev *d = blockdev_find(n);
     if (!d || d->parent) { eprintf(c, "install: %s is not a whole disk\n", dev); return 1; }
-    if (install_is_system_disk(d)) { eprintf(c, "install: %s holds the running system (mounted at /home); choose another disk\n", dev); return 1; }
+    if (install_is_system_disk(d)) { eprintf(c, "install: %s holds the running system; choose another disk\n", dev); return 1; }
     if (!yes) {   /* read the answer like any builtin reads its input: a line from the terminal (cooked) or a pipe */
         char sz[16], ans[16]; format_size_h(d->sectors * d->sector_size, sz, sizeof sz);
         cprintf(c, "Everything on /dev/%s (%s, %s) will be erased.\nType yes to install inFlux on it: ", d->name, d->model[0] ? d->model : "disk", sz);
@@ -1102,6 +1103,38 @@ static int b_whoami(struct ctx *c, int argc, char **argv) { cputs(c, "flux\n"); 
 static int b_hostname(struct ctx *c, int argc, char **argv) { if (argc > 1) strlcpy(system_hostname, argv[1], sizeof system_hostname); else cprintf(c, "%s\n", system_hostname); return 0; }
 static int b_id(struct ctx *c, int argc, char **argv) { cputs(c, "uid=501(flux) gid=20(staff) groups=20(staff),80(admin)\n"); return 0; }
 static int b_nproc(struct ctx *c, int argc, char **argv) { cputs(c, "1\n"); return 0; }
+/* pkg: packages are tar files of system paths, kept like the system image (fs/sysroot.c) */
+static int b_pkg(struct ctx *c, int argc, char **argv) {
+    if (argc >= 3 && !strcmp(argv[1], "install")) {
+        char p[PATH_MAX]; resolve(c->sh, argv[2], p, sizeof p);
+        char name[64];
+        if (argc >= 4) strlcpy(name, argv[3], sizeof name);
+        else { strlcpy(name, vfs_basename(p), sizeof name); char *dot = strstr(name, ".tar"); if (dot) *dot = 0; }
+        if (!name[0] || strchr(name, '/') || !strcmp(name, "image")) { eprintf(c, "pkg: bad package name '%s'\n", name); return 1; }
+        void *data; size_t sz;
+        int r = vfs_read_file(p, &data, &sz);
+        if (r < 0) { eprintf(c, "pkg: %s: %s\n", argv[2], errstr(r)); return 1; }
+        cprintf(c, "installing %s from %s (%lu KiB)...\n", name, argv[2], (unsigned long)(sz / 1024));
+        r = sysroot_sync("/", name, data, sz);
+        kfree(data);
+        if (r < 0) { eprintf(c, "pkg: %s: %s (files that could not be written are named in dmesg)\n", name, errstr(r)); return 1; }
+        cprintf(c, "%s installed%s\n", name, vfs_root_is_disk() ? "" : " (in memory: this is a live system)");
+        return 0;
+    }
+    if (argc == 2 && !strcmp(argv[1], "list")) {
+        struct vnode *d = vfs_lookup("/var/lib/influx");
+        struct dirent de;
+        for (int i = 0; d && vfs_readdir(d, i, &de) == 0; i++) {
+            size_t l = strlen(de.name);
+            if (l > 9 && !strcmp(de.name + l - 9, ".manifest")) cprintf(c, "%.*s\n", (int)(l - 9), de.name);
+        }
+        if (d) vnode_unref(d);
+        return 0;
+    }
+    eprintf(c, "usage: pkg install FILE.tar [NAME] | pkg list\n");
+    return 1;
+}
+
 static int b_source(struct ctx *c, int argc, char **argv) {
     if (argc < 2) return 1;
     char p[PATH_MAX]; resolve(c->sh, argv[1], p, sizeof p); void *data; size_t sz;
@@ -1167,7 +1200,7 @@ static const struct builtin builtins[] = {
     { "rev", b_rev, "reverse each line" }, { "rm", b_rm, "remove files (-r -f)" },
     { "rmdir", b_rmdir, "remove empty directories" }, { "seq", b_seq, "print a sequence of numbers" },
     { "shutdown", b_shutdown, "power off the computer" }, { "sleep", b_sleep, "pause for N seconds" },
-    { "sort", b_sort, "sort lines (-r -n -u)" }, { "source", b_source, "run commands from a file" },
+    { "sort", b_sort, "sort lines (-r -n -u)" }, { "source", b_source, "run commands from a file" }, { "pkg", b_pkg, "install a package tar (pkg install FILE.tar), list packages" },
     { "stat", b_stat, "show file status" }, { "sync", b_sync, "flush filesystem buffers to disk" },
     { "tail", b_tail, "last lines of input (-n N)" }, { "tee", b_tee, "copy input to a file and stdout" },
     { "touch", b_touch, "create files or update timestamps" }, { "tree", b_tree, "show a directory tree" },

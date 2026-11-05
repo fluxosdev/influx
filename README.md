@@ -191,8 +191,21 @@ in `third_party`).
   System Partition (Limine for BIOS and UEFI, kernel, system image,
   `limine.conf`) and a btrfs root volume. The partitioning, FAT32 formatter,
   `mkfs.btrfs` and Limine's BIOS stage-2 install are all implemented in the
-  kernel. The installed system boots on BIOS and UEFI firmware; its root
-  volume holds the persistent home directory, mounted at `/home`.
+  kernel. The installed system boots on BIOS and UEFI firmware.
+- **The installed system's btrfs volume is the root filesystem**, so
+  everything written anywhere survives a restart. The exceptions are `/dev`,
+  `/tmp` (empty at every boot) and `/mnt` (where other disks mount).
+  - The system image on the EFI partition is installed onto the volume at boot,
+    but only when it has changed. A manifest decides file by file: files you
+    changed are kept, files nobody changed are updated, files dropped from the
+    image are removed, and `/home` is only seeded.
+  - Packages work the same way. Boot modules such as the developer tools are
+    put on the disk by the installer, and `pkg install file.tar` installs or
+    updates one on a running system.
+  - A live CD never takes over an installed disk: it mounts it under `/mnt`.
+    The boot option `volatile` runs an installed system from memory.
+  - Systems installed before this have their home directory moved to `/home`
+    on the first boot.
 - **Display resolution**: System Settings → Displays has a resolution
   dropdown with the common modes the display supports (on a Radeon R700, the
   monitor's own EDID modes). On QEMU, VirtualBox and Bochs (DISPI mode
@@ -342,6 +355,7 @@ make test                # host filesystem regressions + a headless boot that ru
 make test SELFTEST_NET=1 # also DNS, TCP and HTTPS checks (needs the internet)
 make test-fs             # the ext4 driver against a volume made by mkfs.ext4
 make test-btrfs          # the POSIX file checks on a disk the kernel formats as btrfs
+make test-persist        # install, then two boots from the disk: what is written survives, updates merge
 make system              # just build/influx.elf and build/initrd.tar (no xorriso needed)
 ```
 
@@ -352,7 +366,7 @@ make system              # just build/influx.elf and build/initrd.tar (no xorris
 ```sh
 tools/toolchain/build-devtools.sh      # gcc, g++, binutils, make, BusyBox for inFlux -> build/devtools (20-60 min)
 tools/toolchain/hermetic-build.sh      # build inFlux on Linux with only those tools on PATH
-make DEVTOOLS=1                        # an ISO with the tools at /usr and BusyBox as /bin/sh
+make DEVTOOLS=1                        # an ISO with the tools as a boot module: /usr and /bin/sh (the installer puts them on the disk)
 make test-devtools                     # boot it and run gcc, g++, sh and make -j4 on inFlux
 ```
 

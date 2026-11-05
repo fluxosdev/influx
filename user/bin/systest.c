@@ -446,6 +446,42 @@ static void test_devtools(void) {
     CHECK("ar + nm", run_ok((char *[]){ "/bin/sh", "-c", "cd /tmp/dt && ar rcs libm.a m0.o m1.o && nm libm.a | grep -c ' T f'", NULL }, out, sizeof out) && !strcmp(out, "2\n"));
 }
 
+/* ---- make test-persist: what one boot writes, the next must find (`systest persist write|check`) ---- */
+static void test_persist(const char *stage) {
+    struct statfs sf;
+    char buf[128];
+    struct stat st;
+    CHECK("/ is the installed btrfs volume", statfs("/", &sf) == 0 && sf.f_type == 0x9123683E);
+    CHECK("/tmp is still memory", statfs("/tmp", &sf) == 0 && sf.f_type != 0x9123683E);
+    if (!strcmp(stage, "write")) {
+        mkdir("/usr", 0755);   /* only DEVTOOLS images have it */
+        CHECK("files anywhere: /usr/local, /opt, /var", mkdir("/usr/local", 0755) == 0 && mkdir("/usr/local/persist", 0755) == 0 &&
+              write_file("/usr/local/persist/data", "kept across restarts\n", 0640) && mkdir("/opt", 0755) == 0 &&
+              symlink("/usr/local/persist/data", "/opt/data-link") == 0 && link("/usr/local/persist/data", "/usr/local/persist/hard") == 0 &&
+              mkdir("/var/private", 0700) == 0);
+        CHECK("a program installed under /usr/local/bin", mkdir("/usr/local/bin", 0755) == 0 &&
+              write_file("/usr/local/bin/hi", "#!/bin/echo persisted\n", 0755));
+        CHECK("change a file of the system image (/etc/motd)", write_file("/etc/motd", "my own motd\n", 0644));
+        CHECK("home and /tmp", write_file("/home/flux/persist-home", "home\n", 0600) && write_file("/tmp/should-vanish", "x", 0644));
+        sync();
+        return;
+    }
+    CHECK("a file in /usr/local survived, with its mode", read_file("/usr/local/persist/data", buf, sizeof buf) && !strcmp(buf, "kept across restarts\n") &&
+          stat("/usr/local/persist/data", &st) == 0 && (st.st_mode & 07777) == 0640 && st.st_nlink == 2);
+    CHECK("a symbolic link in /opt survived", readlink("/opt/data-link", buf, sizeof buf) == 23 && read_file("/opt/data-link", buf, sizeof buf) && !strcmp(buf, "kept across restarts\n"));
+    CHECK("a directory's mode survived", stat("/var/private", &st) == 0 && S_ISDIR(st.st_mode) && (st.st_mode & 07777) == 0700);
+    CHECK("an installed program still runs", run_capture((char *[]){ "/usr/local/bin/hi", NULL }, buf, sizeof buf) == 0 && !strcmp(buf, "persisted /usr/local/bin/hi\n"));
+    CHECK("the home directory survived", read_file("/home/flux/persist-home", buf, sizeof buf) && !strcmp(buf, "home\n"));
+    CHECK("/tmp starts empty", access("/tmp/should-vanish", F_OK) == -1 && errno == ENOENT);
+    CHECK("system update: a new file arrived", read_file("/etc/persist-image-added", buf, sizeof buf) && !strcmp(buf, "added by the update\n"));
+    CHECK("system update: a file nobody changed was updated", read_file("/etc/hosts", buf, sizeof buf) && !strcmp(buf, "127.0.0.1 localhost updated\n"));
+    CHECK("system update: a file the user changed was kept", read_file("/etc/motd", buf, sizeof buf) && !strcmp(buf, "my own motd\n"));
+    int fd = open("/dev/null", O_WRONLY);
+    CHECK("/dev still works", fd >= 0 && write(fd, "x", 1) == 1);
+    if (fd >= 0) close(fd);
+    CHECK("other disks still mount under /mnt (the EFI partition)", access("/mnt/.sda2/limine.conf", F_OK) == 0);
+}
+
 /* ---- pipes, poll, socketpair ---- */
 static void test_ipc(void) {
     int p[2]; pipe2(p, O_NONBLOCK);
@@ -605,6 +641,13 @@ int main(int argc, char **argv) {
         setvbuf(stdout, NULL, _IOLBF, 0);
         printf("systest: POSIX file checks in %s\n", argv[2]);
         test_posix(argv[2]);
+        printf("systest: %d of %d checks passed\n", checks - failures, checks);
+        return failures;
+    }
+    if (argc > 2 && !strcmp(argv[1], "persist")) {
+        setvbuf(stdout, NULL, _IOLBF, 0);
+        printf("systest: persistence checks (%s)\n", argv[2]);
+        test_persist(argv[2]);
         printf("systest: %d of %d checks passed\n", checks - failures, checks);
         return failures;
     }
