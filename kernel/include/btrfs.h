@@ -75,6 +75,7 @@ uint32_t crc32_ieee(const void *data, size_t n);
 
 #define BTRFS_FT_REG_FILE 1
 #define BTRFS_FT_DIR 2
+#define BTRFS_FT_FIFO 5
 #define BTRFS_FT_SYMLINK 7
 #define BTRFS_INODE_NODATASUM 1
 

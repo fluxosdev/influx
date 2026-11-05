@@ -101,17 +101,19 @@ struct linux_stat {
     int64_t atime, atime_ns, mtime, mtime_ns, ctime, ctime_ns; int64_t reserved[3];
 };
 static uint32_t mode_of(int type, uint32_t perm) {
-    uint32_t fmt = type == VN_DIR ? 0040000 : type == VN_DEV ? 0020000 : type == VN_BLK ? 0060000 : type == VN_LNK ? 0120000 : 0100000;
+    uint32_t fmt = type == VN_DIR ? 0040000 : type == VN_DEV ? 0020000 : type == VN_BLK ? 0060000 : type == VN_LNK ? 0120000 : type == VN_FIFO ? 0010000 : 0100000;
     if (perm & 0170000) return perm;   /* already carries a type (sockets) */
     return fmt | (perm & 07777 ? perm & 07777 : (type == VN_DIR ? 0755 : 0644));
 }
 static void fill_stat(struct linux_stat *ls, struct vnode *v) {
     memset(ls, 0, sizeof *ls);
     ls->dev = (uint64_t)(uintptr_t)v->ops & 0xFFFF; ls->ino = v->ino ? v->ino : (uint64_t)(uintptr_t)v >> 4;
-    ls->nlink = v->type == VN_DIR ? 2 : 1;
+    ls->nlink = v->nlink ? v->nlink : v->type == VN_DIR ? 2 : 1;
     ls->mode = mode_of(v->type, v->mode);
     ls->size = (int64_t)v->size; ls->blksize = 4096; ls->blocks = (int64_t)((v->size + 511) / 512);
-    ls->atime = ls->mtime = ls->ctime = (int64_t)v->mtime;
+    ls->atime = ls->mtime = (int64_t)v->mtime; ls->atime_ns = ls->mtime_ns = v->mtime_nsec;   /* access times are not kept */
+    if (v->ctime) { ls->ctime = (int64_t)v->ctime; ls->ctime_ns = v->ctime_nsec; } else { ls->ctime = ls->mtime; ls->ctime_ns = ls->mtime_ns; }
+
 }
 static int64_t stat_path(struct process *p, const char *abs, uint64_t ust, bool follow) {
     struct vnode *v = follow ? vfs_lookup(abs) : vfs_lookup_nofollow(abs);
@@ -200,7 +202,7 @@ static int64_t sys_getdents64(struct process *p, int fd, uint64_t ubuf, size_t l
         uint64_t ino = d.ino ? d.ino : f->pos + 1, next = f->pos + 1;
         memcpy(rec, &ino, 8); memcpy(rec + 8, &next, 8);
         uint16_t rl = (uint16_t)reclen; memcpy(rec + 16, &rl, 2);
-        rec[18] = d.type == VN_DIR ? 4 : d.type == VN_DEV ? 2 : d.type == VN_BLK ? 6 : d.type == VN_LNK ? 10 : 8;
+        rec[18] = d.type == VN_DIR ? 4 : d.type == VN_DEV ? 2 : d.type == VN_BLK ? 6 : d.type == VN_LNK ? 10 : d.type == VN_FIFO ? 1 : 8;
         memcpy(rec + 19, d.name, nl);
         if (copy_to_user(ubuf + o, rec, reclen) < 0) return o ? (int64_t)o : -EFAULT;
         o += reclen;
@@ -452,6 +454,29 @@ static int64_t sys_rt_sigprocmask(struct thread *t, int how, uint64_t uset, uint
     if (uold && copy_to_user(uold, &old, 8) < 0) return -EFAULT;
     return 0;
 }
+/* ITIMER_REAL for every process: one kernel thread, started by the first alarm, checks the
+ * deadlines every 10 ms and sends SIGALRM */
+static void itimer_thread(void *arg) {
+    for (;;) {
+        thread_sleep_ms(10);
+        uint64_t now = time_ms();
+        procs_lock();
+        struct process *list[64];
+        int n = process_list(list, 64);
+        for (int i = 0; i < n; i++) {
+            struct process *q = list[i];
+            if (!q->is_user || q->exited || !q->alarm_at_ms || q->alarm_at_ms > now) continue;
+            q->alarm_at_ms = q->alarm_interval_ms ? now + q->alarm_interval_ms : 0;
+            signal_send(q, SIGALRM);
+        }
+        procs_unlock();
+    }
+}
+static void itimer_start(void) {
+    static int started;
+    if (!__atomic_exchange_n(&started, 1, __ATOMIC_SEQ_CST)) thread_create(kernel_process, "itimer", itimer_thread, NULL);
+}
+
 static int64_t sys_kill(int pid, int sig) {
     struct process *self = current_thread->proc;
     if (sig < 0 || sig > NSIG) return -EINVAL;
@@ -742,9 +767,10 @@ static int64_t do_syscall(struct regs *r) {
         int dirfd = nr == 257 ? (int)a1 : AT_FDCWD;
         uint64_t up = nr == 257 ? a2 : a1;
         int flags = nr == 257 ? (int)a3 : nr == 85 ? (O_CREAT | O_WRONLY | O_TRUNC) : (int)a2;
+        uint32_t mode = (uint32_t)(nr == 257 ? a4 : nr == 85 ? a2 : a3) & 07777 & ~p->umask;
         if ((e = resolve_at(p, dirfd, up, path, false)) < 0) return e;
         struct file *f;
-        if ((e = vfs_open_rel("/", path, flags & ~O_CLOEXEC, &f)) < 0) return e;
+        if ((e = vfs_open_mode("/", path, flags & ~O_CLOEXEC, mode, &f)) < 0) return e;
         return fd_install(p, f, flags & O_CLOEXEC, 0); }
     case 3: return fd_close(p, (int)a1);
     case 4: case 6: if ((e = resolve_at(p, AT_FDCWD, a1, path, false)) < 0) return e; return stat_path(p, path, a2, nr == 4);
@@ -771,7 +797,20 @@ static int64_t do_syscall(struct regs *r) {
     case 295: case 296: { struct file *f = fd_get(p, (int)a1); if (!f) return -EBADF; return do_rwv(f, a2, (int)a3, nr == 296, (int64_t)a4); }
     case 21: case 269: case 439: {   /* access, faccessat, faccessat2 */
         if ((e = resolve_at(p, nr == 21 ? AT_FDCWD : (int)a1, nr == 21 ? a1 : a2, path, false)) < 0) return e;
-        struct vnode *v = vfs_lookup(path); if (!v) return -ENOENT; vnode_unref(v); return 0; }
+        int how = (int)(nr == 21 ? a2 : a3), fl = nr == 439 ? (int)a4 : 0;
+        if (how & ~7) return -EINVAL;
+        struct vnode *v = (fl & AT_SYMLINK_NOFOLLOW) ? vfs_lookup_nofollow(path) : vfs_lookup(path);
+        if (!v) return -ENOENT;
+        /* files have no owners yet, so everyone gets the owner's bits; root may execute anything with an
+         * execute bit and read or write anything, as on Linux */
+        uint32_t m = v->mode & 07777; bool root = p->euid == 0;
+        e = 0;
+        if ((how & 1) && v->type != VN_DIR && !(m & 0111)) e = -EACCES;
+        if ((how & 1) && v->type == VN_DIR && !root && !(m & 0100)) e = -EACCES;
+        if (!root && (how & 2) && !(m & 0200)) e = -EACCES;
+        if (!root && (how & 4) && !(m & 0400)) e = -EACCES;
+        vnode_unref(v);
+        return e; }
     case 22: case 293: {   /* pipe, pipe2 */
         struct file *rd, *wr; pipe_create(&rd, &wr);
         int fl = nr == 293 ? (int)a2 : 0;
@@ -817,8 +856,14 @@ static int64_t do_syscall(struct regs *r) {
         int d1 = nr == 82 ? AT_FDCWD : (int)a1, d2 = nr == 82 ? AT_FDCWD : (int)a3;
         if ((e = resolve_at(p, d1, nr == 82 ? a1 : a2, path, false)) < 0) return e;
         if ((e = resolve_at(p, d2, nr == 82 ? a2 : a4, path2, false)) < 0) return e;
-        return vfs_rename(path, path2); }
-    case 83: case 258: if ((e = resolve_at(p, nr == 83 ? AT_FDCWD : (int)a1, nr == 83 ? a1 : a2, path, false)) < 0) return e; return vfs_mkdir(path);
+        if (nr == 316 && a5) {   /* RENAME_NOREPLACE (checked, then renamed: not atomic against a racing create) */
+            if (a5 & ~1ULL) return -EINVAL;
+            struct vnode *ex = vfs_lookup_nofollow(path2);
+            if (ex) { vnode_unref(ex); return -EEXIST; }
+        }
+        return vfs_rename_posix(path, path2); }
+    case 83: case 258: if ((e = resolve_at(p, nr == 83 ? AT_FDCWD : (int)a1, nr == 83 ? a1 : a2, path, false)) < 0) return e;
+        return vfs_mkdir_mode(path, (uint32_t)(nr == 83 ? a2 : a3) & 07777 & ~p->umask);
     case 84: case 87: case 263: {   /* rmdir, unlink, unlinkat */
         if ((e = resolve_at(p, nr == 263 ? (int)a1 : AT_FDCWD, nr == 263 ? a2 : a1, path, false)) < 0) return e;
         struct stat st; if (vfs_lstat(path, &st) < 0) return -ENOENT;
@@ -837,14 +882,81 @@ static int64_t do_syscall(struct regs *r) {
         if (tl < 0) return tl;
         if ((e = resolve_at(p, nr == 88 ? AT_FDCWD : (int)a2, nr == 88 ? a2 : a3, path, false)) < 0) return e;
         return vfs_symlink(path2, path); }
-    case 86: case 265: return -EPERM;   /* hard links */
-    case 90: case 91: case 92: case 93: case 94: case 268: case 260: return 0;   /* chmod/chown family: permissions are not enforced yet */
+    case 86: case 265: {   /* link, linkat (AT_SYMLINK_FOLLOW is not supported: the link itself gets the name) */
+        if ((e = resolve_at(p, nr == 86 ? AT_FDCWD : (int)a1, nr == 86 ? a1 : a2, path, false)) < 0) return e;
+        if ((e = resolve_at(p, nr == 86 ? AT_FDCWD : (int)a3, nr == 86 ? a2 : a4, path2, false)) < 0) return e;
+        return vfs_link(path, path2); }
+    case 90: case 91: case 268: {   /* chmod, fchmod, fchmodat */
+        struct vnode *v;
+        uint32_t mode = (uint32_t)(nr == 268 ? a3 : a2);
+        if (nr == 91) { struct file *f = fd_get(p, (int)a1); if (!f) return -EBADF; v = f->vn; vnode_ref(v); }
+        else {
+            if ((e = resolve_at(p, nr == 90 ? AT_FDCWD : (int)a1, nr == 90 ? a1 : a2, path, false)) < 0) return e;
+            v = (nr == 268 && (a4 & AT_SYMLINK_NOFOLLOW)) ? vfs_lookup_nofollow(path) : vfs_lookup(path);
+            if (!v) return -ENOENT;
+            if (v->type == VN_LNK) { vnode_unref(v); return -ENOTSUP; }   /* Linux can't chmod a link either */
+        }
+        struct vattr va = { .valid = VA_MODE, .mode = mode & 07777 };
+        e = vfs_setattr(v, &va);
+        vnode_unref(v);
+        return e; }
+    case 92: case 93: case 94: case 260: return 0;   /* chown family: files have no owners yet */
+    case 280: case 235: case 261: case 132: {   /* utimensat, utimes, futimesat, utime: only the modification time is kept */
+        struct kts ts[2]; bool now = false;
+        uint64_t ut = nr == 280 ? a3 : nr == 261 ? a3 : a2;
+        if (!ut) now = true;
+        else if (nr == 280) { if (copy_from_user(ts, ut, sizeof ts) < 0) return -EFAULT; }
+        else if (nr == 132) { int64_t ub[2]; if (copy_from_user(ub, ut, sizeof ub) < 0) return -EFAULT; ts[0] = (struct kts){ ub[0], 0 }; ts[1] = (struct kts){ ub[1], 0 }; }
+        else { int64_t tv[4]; if (copy_from_user(tv, ut, sizeof tv) < 0) return -EFAULT; ts[0] = (struct kts){ tv[0], tv[1] * 1000 }; ts[1] = (struct kts){ tv[2], tv[3] * 1000 }; }
+        #define UTIME_NOW  ((1l << 30) - 1l)
+        #define UTIME_OMIT ((1l << 30) - 2l)
+        if (!now) for (int i = 0; i < 2; i++) if (ts[i].nsec != UTIME_NOW && ts[i].nsec != UTIME_OMIT && (ts[i].nsec < 0 || ts[i].nsec >= 1000000000)) return -EINVAL;
+        struct vnode *v;
+        uint64_t upath = nr == 280 || nr == 261 ? a2 : a1;
+        if (nr == 280 && !upath) { struct file *f = fd_get(p, (int)a1); if (!f) return -EBADF; v = f->vn; vnode_ref(v); }   /* futimens */
+        else {
+            if ((e = resolve_at(p, nr == 280 || nr == 261 ? (int)a1 : AT_FDCWD, upath, path, nr == 280 && (a4 & AT_EMPTY_PATH))) < 0) return e;
+            v = (nr == 280 && (a4 & AT_SYMLINK_NOFOLLOW)) ? vfs_lookup_nofollow(path) : vfs_lookup(path);
+            if (!v) return -ENOENT;
+        }
+        struct vattr va = { .valid = VA_MTIME };
+        if (now || ts[1].nsec == UTIME_NOW) vfs_now(&va.mtime, &va.mtime_nsec);
+        else if (ts[1].nsec == UTIME_OMIT) va.valid = 0;
+        else { if (ts[1].sec < 0) { vnode_unref(v); return -EINVAL; } va.mtime = (uint64_t)ts[1].sec; va.mtime_nsec = (uint32_t)ts[1].nsec; }
+        #undef UTIME_NOW
+        #undef UTIME_OMIT
+        e = va.valid ? vfs_setattr(v, &va) : 0;
+        vnode_unref(v);
+        return e; }
+    case 133: case 259: {   /* mknod, mknodat: FIFOs and regular files (no device nodes) */
+        if ((e = resolve_at(p, nr == 133 ? AT_FDCWD : (int)a1, nr == 133 ? a1 : a2, path, false)) < 0) return e;
+        uint32_t mode = (uint32_t)(nr == 133 ? a2 : a3), fmt = mode & 0170000, perm = mode & 07777 & ~p->umask;
+        if (fmt == 0010000) return vfs_mkfifo(path, perm);
+        if (fmt == 0 || fmt == 0100000) { struct file *f; e = vfs_open_mode("/", path, O_CREAT | O_EXCL | O_WRONLY, perm, &f); if (e == 0) vfs_close(f); return e; }
+        return -EPERM; }
     case 95: { uint32_t old = p->umask; p->umask = (uint32_t)a1 & 0777; return old; }
     case 162: vfs_sync(); return 0;
     case 137: case 138: {   /* statfs, fstatfs */
         struct { int64_t type, bsize, blocks, bfree, bavail, files, ffree; int32_t fsid[2]; int64_t namelen, frsize, flags, spare[4]; } sf;
         memset(&sf, 0, sizeof sf);
-        sf.type = 0x9123683E; sf.bsize = sf.frsize = 4096; sf.namelen = NAME_MAX; sf.blocks = (int64_t)(pmm_total_bytes() / 4096); sf.bfree = sf.bavail = (int64_t)(pmm_free_bytes() / 4096);
+        sf.type = 0x01021994 /* tmpfs */; sf.bsize = sf.frsize = 4096; sf.namelen = NAME_MAX; sf.blocks = (int64_t)(pmm_total_bytes() / 4096); sf.bfree = sf.bavail = (int64_t)(pmm_free_bytes() / 4096);
+        /* a disk volume: its root carries the totals */
+        struct vnode *sv = NULL;
+        if (nr == 138) { struct file *f = fd_get(p, (int)a1); if (!f) return -EBADF; if (f->path) sv = vfs_lookup(f->path); }
+        else { if ((e = resolve_at(p, AT_FDCWD, a1, path, false)) < 0) return e; if (!(sv = vfs_lookup(path))) return -ENOENT; }
+        if (sv) {
+            char mp[PATH_MAX]; const char *fp = nr == 138 ? fd_get(p, (int)a1)->path : path; size_t best = 0;
+            for (int i = 0; i < vfs_mount_count(); i++) {
+                struct vnode *root = vfs_mount_at(i, mp, sizeof mp);
+                size_t ml = strlen(mp);
+                if (root && root->fs_total && ml > best && !strncmp(fp, mp, ml) && (fp[ml] == '/' || !fp[ml])) {
+                    best = ml;
+                    sf.type = root->fs_name && !strcmp(root->fs_name, "btrfs") ? 0x9123683E : 0x4d44;
+                    sf.blocks = (int64_t)(root->fs_total / 4096); sf.bfree = sf.bavail = (int64_t)(root->fs_free / 4096);
+                }
+            }
+            vnode_unref(sv);
+        }
         return copy_to_user(a2, &sf, sizeof sf) < 0 ? -EFAULT : 0; }
     /* poll */
     case 7: return do_poll(p, a1, a2, (int64_t)(int32_t)a3);
@@ -860,6 +972,14 @@ static int64_t do_syscall(struct regs *r) {
     case 270: {   /* pselect6 */
         int64_t ms = -1;
         if (a5) { struct kts ts; if (copy_from_user(&ts, a5, sizeof ts) < 0) return -EFAULT; ms = ts.sec * 1000 + (ts.nsec + 999999) / 1000000; }
+        if (a6) {   /* { const sigset_t *ss; size_t ss_len }: the mask to wait with, as ppoll (make waits for SIGCHLD so) */
+            struct { uint64_t ss, len; } sm; if (copy_from_user(&sm, a6, sizeof sm) < 0) return -EFAULT;
+            if (sm.ss) {
+                if (sm.len != 8) return -EINVAL;
+                uint64_t m; if (copy_from_user(&m, sm.ss, 8) < 0) return -EFAULT;
+                t->saved_sigmask = t->sigmask; t->restore_sigmask = true; t->sigmask = m & ~SIG_UNBLOCKABLE;
+            }
+        }
         return do_select(p, (int)a1, a2, a3, a4, ms); }
     /* memory */
     case 9: {   /* mmap */
@@ -1004,6 +1124,28 @@ static int64_t do_syscall(struct regs *r) {
         si.uptime = (int64_t)(time_ms() / 1000); si.totalram = pmm_total_bytes(); si.freeram = pmm_free_bytes(); si.mem_unit = 1;
         struct process *l[64]; si.procs = (uint16_t)process_list(l, 64);
         return copy_to_user(a1, &si, sizeof si) < 0 ? -EFAULT : 0; }
+    case 37: {   /* alarm */
+        uint64_t now = time_ms(), left = p->alarm_at_ms > now ? (p->alarm_at_ms - now + 999) / 1000 : p->alarm_at_ms ? 1 : 0;
+        p->alarm_interval_ms = 0;
+        p->alarm_at_ms = a1 ? now + (uint64_t)(uint32_t)a1 * 1000 : 0;
+        if (a1) itimer_start();
+        return (int64_t)left; }
+    case 36: case 38: {   /* getitimer, setitimer: ITIMER_REAL only */
+        struct { int64_t isec, iusec, vsec, vusec; } it;
+        if ((int)a1 != 0) return (int)a1 == 1 || (int)a1 == 2 ? -ENOTSUP : -EINVAL;
+        uint64_t now = time_ms(), left = p->alarm_at_ms > now ? p->alarm_at_ms - now : p->alarm_at_ms ? 1 : 0;
+        it.isec = (int64_t)(p->alarm_interval_ms / 1000); it.iusec = (int64_t)(p->alarm_interval_ms % 1000) * 1000;
+        it.vsec = (int64_t)(left / 1000); it.vusec = (int64_t)(left % 1000) * 1000;
+        if (nr == 36) return copy_to_user(a2, &it, sizeof it) < 0 ? -EFAULT : 0;
+        struct { int64_t isec, iusec, vsec, vusec; } nv;
+        if (copy_from_user(&nv, a2, sizeof nv) < 0) return -EFAULT;
+        if (nv.isec < 0 || nv.vsec < 0 || nv.iusec < 0 || nv.iusec >= 1000000 || nv.vusec < 0 || nv.vusec >= 1000000) return -EINVAL;
+        if (a3 && copy_to_user(a3, &it, sizeof it) < 0) return -EFAULT;
+        uint64_t val = (uint64_t)nv.vsec * 1000 + ((uint64_t)nv.vusec + 999) / 1000;
+        p->alarm_interval_ms = (uint64_t)nv.isec * 1000 + ((uint64_t)nv.iusec + 999) / 1000;
+        p->alarm_at_ms = val ? now + val : 0;
+        if (val) itimer_start();
+        return 0; }
     case 97: case 302: {   /* getrlimit, prlimit64 */
         int res = nr == 97 ? (int)a1 : (int)a2; uint64_t uold = nr == 97 ? a2 : a4;
         if (nr == 302 && a1 && (int)a1 != p->pid) return -ESRCH;

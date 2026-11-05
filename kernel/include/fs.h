@@ -8,6 +8,7 @@
 #define VN_DEV  3      /* character device */
 #define VN_BLK  4      /* block device */
 #define VN_LNK  5      /* symbolic link: its data is the target path */
+#define VN_FIFO 6      /* named pipe (mkfifo) */
 
 #define O_RDONLY  0x0000
 #define O_WRONLY  0x0001
@@ -33,7 +34,12 @@
 struct vnode;
 struct file;
 struct dirent { char name[NAME_MAX + 1]; int type; uint64_t size; uint64_t mtime; uint64_t ino; };
-struct stat { int type; uint64_t size; uint64_t mtime; uint32_t mode; uint64_t ino; uint32_t nlink; };
+struct stat { int type; uint64_t size; uint64_t mtime; uint32_t mode; uint64_t ino; uint32_t nlink; uint32_t mtime_nsec; };
+
+/* attribute changes (chmod, utimensat): the fields named in 'valid' */
+#define VA_MODE  1
+#define VA_MTIME 2
+struct vattr { uint32_t valid; uint32_t mode; uint64_t mtime; uint32_t mtime_nsec; };
 
 struct vnode_ops {
     int64_t (*read)(struct vnode *v, uint64_t off, void *buf, size_t n);
@@ -41,7 +47,7 @@ struct vnode_ops {
     int (*truncate)(struct vnode *v, uint64_t size);
     struct vnode *(*lookup)(struct vnode *dir, const char *name);
     int (*readdir)(struct vnode *dir, int index, struct dirent *out);   /* 0 ok, -1 end */
-    struct vnode *(*create)(struct vnode *dir, const char *name, int type);
+    struct vnode *(*create)(struct vnode *dir, const char *name, int type, uint32_t mode);   /* mode: permission bits */
     int (*unlink)(struct vnode *dir, const char *name);
     int (*ioctl)(struct vnode *v, int cmd, void *arg);
     void (*release)(struct vnode *v);
@@ -52,6 +58,14 @@ struct vnode_ops {
     /* optional: which of POLLIN/POLLOUT/POLLHUP/POLLERR hold now (no poll: always readable and writable).
      * Objects with a poll must call poll_notify() whenever the answer may have changed. */
     int (*poll)(struct vnode *v, int events);
+    /* optional: change the attributes in a->valid (no setattr: chmod and utimensat are accepted and ignored) */
+    int (*setattr)(struct vnode *v, const struct vattr *a);
+    /* optional: a hard link 'name' in dir to target, a file on the same filesystem (no link: EPERM) */
+    int (*link)(struct vnode *dir, const char *name, struct vnode *target);
+    /* optional: move olddir/oldname to newdir/newname on the same filesystem in one step, replacing
+     * what newname names (the vfs has checked that the replacement is allowed). Without it,
+     * vfs_rename copies the file and unlinks the old name. */
+    int (*rename)(struct vnode *olddir, const char *oldname, struct vnode *newdir, const char *newname);
 };
 
 #define POLLIN   0x001
@@ -73,8 +87,12 @@ struct vnode {
     char name[NAME_MAX + 1];
     int type;
     uint64_t size;
-    uint64_t mtime;
+    uint64_t mtime;               /* seconds since the epoch, plus mtime_nsec */
+    uint32_t mtime_nsec;
+    uint64_t ctime;               /* last change of contents or attributes */
+    uint32_t ctime_nsec;
     uint32_t mode;
+    uint32_t nlink;               /* hard links (0 is taken as 1) */
     uint64_t ino;
     const struct vnode_ops *ops;
     void *priv;
@@ -109,9 +127,19 @@ int vfs_stat(const char *path, struct stat *st);
 int vfs_stat_rel(const char *cwd, const char *path, struct stat *st);
 int vfs_readdir(struct vnode *dir, int index, struct dirent *d);
 int vfs_mkdir(const char *path);
+int vfs_mkdir_mode(const char *path, uint32_t mode);
+int vfs_mkfifo(const char *path, uint32_t mode);
 int vfs_create(const char *path);
+/* open, creating the file with these permission bits (already masked by the umask) */
+int vfs_open_mode(const char *cwd, const char *path, int flags, uint32_t mode, struct file **out);
+int vfs_setattr(struct vnode *v, const struct vattr *a);
+int vfs_link(const char *oldpath, const char *newpath);
+void vfs_copy_mode(const char *src, const char *dst);     /* after a copy: dst gets src's permission bits */   /* hard link; oldpath's last component is not followed */
+void vfs_now(uint64_t *sec, uint32_t *nsec);              /* the wall clock, for timestamps */
+void vnode_touch(struct vnode *v);                        /* mtime = ctime = now */
 int vfs_unlink(const char *path);
-int vfs_rename(const char *oldp, const char *newp);
+int vfs_rename(const char *oldp, const char *newp);          /* falls back to copy + unlink across filesystems */
+int vfs_rename_posix(const char *oldp, const char *newp);    /* rename(2): EXDEV across filesystems */
 int vfs_symlink(const char *target, const char *linkpath);
 int vfs_readlink(const char *path, char *buf, size_t n);   /* bytes, not NUL-terminated */
 int vfs_lstat(const char *path, struct stat *st);

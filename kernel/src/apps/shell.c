@@ -399,7 +399,9 @@ static int copy_path(struct ctx *c, const char *src, const char *dst, bool rec, 
         return res;
     }
     void *data; size_t sz; int r = vfs_read_file(src, &data, &sz); if (r < 0) return r;
-    r = vfs_write_file(dst, data, sz); kfree(data); return r;
+    r = vfs_write_file(dst, data, sz); kfree(data);
+    if (r == 0) vfs_copy_mode(src, dst);
+    return r;
 }
 /* the (normalized) target is the source itself or lies inside it */
 static bool path_within(const char *p, const char *base) { size_t l = strlen(base); return !strcmp(base, "/") || (!strncmp(p, base, l) && (p[l] == 0 || p[l] == '/')); }
@@ -1228,15 +1230,25 @@ static int run_pipeline(struct shell *sh, struct ctx *base, struct stage *st, in
             lastname = s->argv[0]; njobs++;
         } else {
             char p[PATH_MAX];
-            if (strchr(s->argv[0], '/')) resolve(sh, s->argv[0], p, sizeof p); else snprintf(p, sizeof p, "/bin/%s", s->argv[0]);
             struct stat stt;
-            if (vfs_stat(p, &stt) < 0 || stt.type != VN_FILE) {
+            bool found = false;
+            if (strchr(s->argv[0], '/')) { resolve(sh, s->argv[0], p, sizeof p); found = vfs_stat(p, &stt) == 0 && stt.type == VN_FILE; }
+            else {   /* the first match on $PATH */
+                const char *path = env_get(sh, "PATH"); if (!path) path = "/usr/bin:/bin";
+                while (!found && *path) {
+                    const char *e = strchr(path, ':'); size_t dl = e ? (size_t)(e - path) : strlen(path);
+                    if (dl && (size_t)snprintf(p, sizeof p, "%.*s/%s", (int)dl, path, s->argv[0]) < sizeof p) found = vfs_stat(p, &stt) == 0 && stt.type == VN_FILE;
+                    path += dl + (e ? 1 : 0);
+                }
+            }
+            if (!found) {
                 eprintf(base, "zsh: command not found: %s\n", s->argv[0]); status = 127;
                 if (in) vfs_close(in); if (out) vfs_close(out); if (err) vfs_close(err);
                 in = next_in; continue;
             }
             struct file *stdio[3] = { in, out, err };
-            int pid = process_spawn(p, s->argc, s->argv, stdio, sh->proc->cwd);
+            char *envv[65]; for (int k = 0; k < sh->nenv; k++) envv[k] = sh->env[k]; envv[sh->nenv] = NULL;   /* the shell's variables are the program's environment */
+            int pid = process_spawn_env(p, s->argc, s->argv, envv, stdio, sh->proc->cwd);
             if (pid < 0) { eprintf(base, "zsh: %s: %s\n", s->argv[0], pid == -ENOEXEC ? "exec format error" : errstr(pid)); status = 126; }
             else { if (!background && last) sh->tty->fg_pid = pid; pids[njobs] = pid; jobs[njobs].b = NULL; lastname = s->argv[0]; njobs++; }
         }
@@ -1450,7 +1462,7 @@ void shell_main(void *arg) {
     sh->tty = ss->tty; sh->proc = current_thread->proc;
     sh->tty_f = tty_file(sh->tty);
     spin_lock(&sh->tty->lock); sh->tty->intr_flag = &sh->cancel; spin_unlock(&sh->tty->lock);   /* Ctrl+C stops ping, play, sleep, ... */
-    env_set(sh, "HOME", "/home/flux"); env_set(sh, "USER", "flux"); env_set(sh, "SHELL", "/bin/zsh"); env_set(sh, "PATH", "/bin");
+    env_set(sh, "HOME", "/home/flux"); env_set(sh, "USER", "flux"); env_set(sh, "SHELL", "/bin/zsh"); env_set(sh, "PATH", "/usr/bin:/bin");
     env_set(sh, "TERM", "xterm-256color"); env_set(sh, "PWD", sh->proc->cwd); env_set(sh, "HOSTNAME", "influx"); env_set(sh, "EDITOR", "editor");
     alias_set(sh, "ll", "ls -l"); alias_set(sh, "la", "ls -la"); alias_set(sh, "l", "ls -lah"); alias_set(sh, "..", "cd .."); alias_set(sh, "cls", "clear");
     nbuiltins = ARRAY_LEN(builtins);

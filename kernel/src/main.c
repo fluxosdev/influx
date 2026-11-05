@@ -36,6 +36,35 @@ void storage_init(void);
 void net_init(void);
 void fb_boot_progress(const char *msg);
 
+struct blockdev;
+struct blockdev *blockdev_find(const char *name);
+int blockdev_read(struct blockdev *d, uint64_t lba, uint32_t count, void *buf);
+int btrfs_mkfs(struct blockdev *d, const char *label);
+struct vnode *btrfs_mount(struct blockdev *d);
+int btrfs_unmount(struct vnode *root);
+
+/* selftest-btrfs: format the first disk with inFlux's own mkfs.btrfs and run `systest posix` on it.
+ * Only a disk whose first 128 KiB (partition tables, the btrfs superblock) are all zeros is touched. */
+static int selftest_btrfs(struct file *stdio[3]) {
+    struct blockdev *d = blockdev_find("sda");
+    if (!d) { kprintf("selftest-btrfs: no disk sda\n"); return -1; }
+    uint8_t *buf = kmalloc(128 * 1024);
+    bool blank = buf && blockdev_read(d, 0, 256, buf) == 0;
+    for (int i = 0; blank && i < 128 * 1024; i++) if (buf[i]) blank = false;
+    kfree(buf);
+    if (!blank) { kprintf("selftest-btrfs: sda is not blank; not formatting it\n"); return -1; }
+    int r = btrfs_mkfs(d, "selftest");
+    struct vnode *root = r == 0 ? btrfs_mount(d) : NULL;
+    if (!root || vfs_mount("/mnt/selftest-btrfs", root) < 0) { kprintf("selftest-btrfs: cannot format or mount sda (%d)\n", r); return -1; }
+    char *argv[] = { "systest", "posix", "/mnt/selftest-btrfs", NULL };
+    int pid = process_spawn("/bin/systest", 3, argv, stdio, "/");
+    int status = -1;
+    if (pid > 0) process_wait(pid, &status);
+    vfs_unmount("/mnt/selftest-btrfs");
+    if (btrfs_unmount(root) < 0) { kprintf("selftest-btrfs: write-back on unmount failed\n"); return -1; }
+    return pid > 0 ? status : -1;
+}
+
 /* boot option 'selftest' (CI): run /bin/systest with its output on the serial port, then power off */
 static void selftest_thread(void *arg) {
     thread_sleep_ms(kernel_cmdline_has("selftest-net") ? 8000 : 500);   /* DHCP first for the network checks */
@@ -48,6 +77,13 @@ static void selftest_thread(void *arg) {
     int pid = process_spawn("/bin/systest", argc, argv, stdio, "/");
     int status = -1;
     if (pid > 0) process_wait(pid, &status);
+    if (pid > 0 && status == 0 && kernel_cmdline_has("selftest-btrfs")) status = selftest_btrfs(stdio);
+    if (pid > 0 && status == 0 && kernel_cmdline_has("selftest-devtools")) {   /* a DEVTOOLS=1 image: gcc, sh, make */
+        char *dargv[] = { "systest", "devtools", NULL };
+        int dpid = process_spawn("/bin/systest", 2, dargv, stdio, "/");
+        status = -1;
+        if (dpid > 0) process_wait(dpid, &status);
+    }
     kprintf("SELFTEST: %s (status %d)\n", pid > 0 && status == 0 ? "PASSED" : "FAILED", pid > 0 ? status : pid);
     vfs_close(con);
     thread_sleep_ms(200);

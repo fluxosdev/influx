@@ -15,7 +15,7 @@ static void btrfs_register_flusher(struct btrfs_fs *fs);
 struct bnode { struct vnode vn; struct btrfs_fs *fs; uint64_t ino; struct bnode *hnext; uint8_t *wbuf; uint64_t wsize, wcap; bool wdirty; uint64_t wdirty_since; uint32_t wfails; uint64_t wretry_at; };
 static const struct vnode_ops btrfs_ops;
 
-static uint64_t now_sec(void) { return time_unix(); }
+static struct btrfs_timespec now_ts(void) { uint64_t sec; uint32_t nsec; vfs_now(&sec, &nsec); return (struct btrfs_timespec){ sec, nsec }; }
 
 static int read_inode(struct btrfs_fs *fs, uint64_t ino, struct btrfs_inode_item *out, struct btrfs_path *pp) {
     struct btrfs_key k = { ino, BTRFS_INODE_ITEM_KEY, 0 };
@@ -37,8 +37,11 @@ static int write_inode(struct btrfs_fs *fs, uint64_t ino, const struct btrfs_ino
 }
 static void fill_vnode(struct bnode *b, const struct btrfs_inode_item *ii) {
     uint32_t fmt = ii->mode & 0170000;
-    b->vn.type = fmt == 040000 ? VN_DIR : fmt == 0120000 ? VN_LNK : VN_FILE;
-    b->vn.size = ii->size; b->vn.mtime = ii->mtime.sec; b->vn.mode = ii->mode & 07777; b->vn.ino = b->ino;
+    b->vn.type = fmt == 040000 ? VN_DIR : fmt == 0120000 ? VN_LNK : fmt == 010000 ? VN_FIFO : VN_FILE;
+    b->vn.size = b->wbuf ? b->wsize : ii->size;   /* buffered writes are newer than the inode */
+    if (!b->wdirty) { b->vn.mtime = ii->mtime.sec; b->vn.mtime_nsec = ii->mtime.nsec; }
+    b->vn.ctime = ii->ctime.sec; b->vn.ctime_nsec = ii->ctime.nsec;
+    b->vn.mode = ii->mode & 07777; b->vn.ino = b->ino; b->vn.nlink = ii->nlink;
 }
 static struct bnode *get_bnode(struct btrfs_fs *fs, uint64_t ino, const char *name) {
     uint32_t h = (uint32_t)ino % 256;
@@ -108,7 +111,7 @@ static int b_readdir(struct vnode *dirv, int index, struct dirent *out) {
             if (i == index) {
                 size_t nl = MIN(di->name_len, NAME_MAX);
                 memcpy(out->name, di + 1, nl); out->name[nl] = 0;
-                out->type = di->type == BTRFS_FT_DIR ? VN_DIR : di->type == BTRFS_FT_SYMLINK ? VN_LNK : VN_FILE;
+                out->type = di->type == BTRFS_FT_DIR ? VN_DIR : di->type == BTRFS_FT_SYMLINK ? VN_LNK : di->type == BTRFS_FT_FIFO ? VN_FIFO : VN_FILE;
                 out->ino = di->location.objectid;
                 struct btrfs_inode_item ii;
                 if (read_inode(fs, di->location.objectid, &ii, NULL) == 0) { out->size = ii.size; out->mtime = ii.mtime.sec; } else { out->size = 0; out->mtime = 0; }
@@ -403,7 +406,8 @@ static int rewrite_file(struct btrfs_fs *fs, struct bnode *b, const uint8_t *con
     r = write_content(fs, b->ino, content, size, (ii.flags & BTRFS_INODE_NODATASUM) != 0, &nbytes);
     if (r < 0) return r;
     ii.size = size; ii.nbytes = nbytes; ii.transid = fs->transid; ii.sequence++;
-    ii.mtime.sec = ii.ctime.sec = now_sec(); ii.mtime.nsec = ii.ctime.nsec = 0;
+    ii.mtime.sec = b->vn.mtime; ii.mtime.nsec = b->vn.mtime_nsec;   /* when it was written, not when it was flushed */
+    ii.ctime = now_ts();
     write_inode(fs, b->ino, &ii);
     fill_vnode(b, &ii);
     r = btrfs_commit(fs);
@@ -421,7 +425,7 @@ static int64_t write_buffered(struct bnode *b, uint64_t off, const void *buf, si
     memcpy(b->wbuf + off, buf, n);
     b->wsize = newsize;
     if (!b->wdirty) { b->wdirty = true; b->wdirty_since = system_ticks; }
-    b->vn.size = newsize; b->vn.mtime = now_sec();
+    b->vn.size = newsize; vnode_touch(&b->vn);
     return (int64_t)n;
 }
 
@@ -463,6 +467,7 @@ static int b_truncate(struct vnode *v, uint64_t size) {
     if ((r = grow_wbuf(b, size)) < 0) { mutex_unlock(&fs->lock); return r; }
     if (size > b->wsize) memset(b->wbuf + b->wsize, 0, size - b->wsize);
     if (size != b->wsize) { b->wsize = size; if (!b->wdirty) { b->wdirty = true; b->wdirty_since = system_ticks; } b->vn.size = size; }
+    vnode_touch(&b->vn);
     mutex_unlock(&fs->lock);
     return 0;
 }
@@ -504,19 +509,24 @@ static int add_dir_entry(struct btrfs_fs *fs, uint64_t dir, const char *name, ui
     uint8_t *ref = kmalloc(rsz);
     struct btrfs_inode_ref *ir = (struct btrfs_inode_ref *)ref; ir->index = index; ir->name_len = nl; memcpy(ref + sizeof *ir, name, nl);
     struct btrfs_key rk = { ino, BTRFS_INODE_REF_KEY, dir };
-    r = btrfs_insert_item(fs, &fs->fs_tree, &rk, ref, rsz, NULL);
+    r = btrfs_search(fs, &fs->fs_tree, &rk, &p);
+    if (r == 0) {   /* a hard link with another name in the same directory: one item holds both refs */
+        uint32_t old = btrfs_path_size(&p);
+        r = btrfs_resize_item(fs, &p, old + rsz);
+        if (r == 0) { memcpy((uint8_t *)btrfs_path_data(&p) + old, ref, rsz); btrfs_mark_dirty(fs, p.blocks[0]); }
+    } else if (r == 1) r = btrfs_insert_item(fs, &fs->fs_tree, &rk, ref, rsz, NULL);
     kfree(ref);
     return r;
 }
 static void touch_dir(struct btrfs_fs *fs, uint64_t dir, int64_t size_delta) {
     struct btrfs_inode_item ii;
     if (read_inode(fs, dir, &ii, NULL) < 0) return;
-    ii.size += size_delta; ii.mtime.sec = ii.ctime.sec = now_sec(); ii.mtime.nsec = ii.ctime.nsec = 0; ii.transid = fs->transid; ii.sequence++;
+    ii.size += size_delta; ii.mtime = ii.ctime = now_ts(); ii.transid = fs->transid; ii.sequence++;
     write_inode(fs, dir, &ii);
 }
 
 static void undo_create(struct btrfs_fs *fs, uint64_t dir, const char *name, uint64_t ino, uint64_t index);
-static struct vnode *b_create(struct vnode *dirv, const char *name, int type) {
+static struct vnode *b_create(struct vnode *dirv, const char *name, int type, uint32_t mode) {
     struct bnode *dir = (struct bnode *)dirv; struct btrfs_fs *fs = dir->fs;
     if (fs->readonly) return NULL;
     size_t nl = strlen(name);
@@ -529,14 +539,14 @@ static struct vnode *b_create(struct vnode *dirv, const char *name, int type) {
     uint64_t ino = fs->next_ino++;
     struct btrfs_inode_item ii = { 0 };
     ii.generation = fs->transid; ii.transid = fs->transid; ii.nlink = 1; ii.uid = 0; ii.gid = 0;
-    ii.mode = type == VN_DIR ? (040000 | 0755) : type == VN_LNK ? (0120000 | 0777) : (0100000 | 0644);
-    uint64_t t = now_sec();
-    ii.atime.sec = ii.ctime.sec = ii.mtime.sec = ii.otime.sec = t;
+    if (type != VN_DIR && type != VN_LNK && type != VN_FILE && type != VN_FIFO) { mutex_unlock(&fs->lock); return NULL; }
+    ii.mode = type == VN_DIR ? (040000 | (mode & 07777)) : type == VN_LNK ? (0120000 | 0777) : type == VN_FIFO ? (010000 | (mode & 07777)) : (0100000 | (mode & 07777));
+    ii.atime = ii.ctime = ii.mtime = ii.otime = now_ts();
     struct btrfs_key k = { ino, BTRFS_INODE_ITEM_KEY, 0 };
     uint64_t index = next_dir_index(fs, dir->ino);
     int r = btrfs_insert_item(fs, &fs->fs_tree, &k, &ii, sizeof ii, NULL);
     if (r == 0) {
-        r = add_dir_entry(fs, dir->ino, name, ino, type == VN_DIR ? BTRFS_FT_DIR : type == VN_LNK ? BTRFS_FT_SYMLINK : BTRFS_FT_REG_FILE, index);
+        r = add_dir_entry(fs, dir->ino, name, ino, type == VN_DIR ? BTRFS_FT_DIR : type == VN_LNK ? BTRFS_FT_SYMLINK : type == VN_FIFO ? BTRFS_FT_FIFO : BTRFS_FT_REG_FILE, index);
         if (r == 0) touch_dir(fs, dir->ino, 2 * nl);
         else undo_create(fs, dir->ino, name, ino, index);   /* the commit below must not write a half-made entry */
     }
@@ -588,22 +598,15 @@ static void undo_create(struct btrfs_fs *fs, uint64_t dir, const char *name, uin
     delete_key(fs, &ik);
 }
 
-static int b_unlink(struct vnode *dirv, const char *name) {
-    struct bnode *dir = (struct bnode *)dirv; struct btrfs_fs *fs = dir->fs;
-    if (fs->readonly) return -EROFS;
-    mutex_lock(&fs->lock); btrfs_op_begin(fs);
-    flush_all(fs, FLUSH_HEALTHY);
-    uint64_t ino; uint8_t ftype;
-    int r = dir_lookup(fs, dir->ino, name, &ino, &ftype);
-    if (r < 0) { mutex_unlock(&fs->lock); return r; }
-    btrfs_begin(fs);
+/* removes the entry dir/name -> ino (DIR_ITEM, DIR_INDEX and INODE_REF), leaving the inode itself */
+static void remove_entry(struct btrfs_fs *fs, uint64_t dir, const char *name, uint64_t ino) {
+    size_t nl = strlen(name);
     /* find the index via INODE_REF */
     uint64_t index = 0; bool have_index = false;
-    struct btrfs_key rk = { ino, BTRFS_INODE_REF_KEY, dir->ino };
+    struct btrfs_key rk = { ino, BTRFS_INODE_REF_KEY, dir };
     struct btrfs_path p;
     if (btrfs_search(fs, &fs->fs_tree, &rk, &p) == 0) {
         uint8_t *d = btrfs_path_data(&p), *end = d + btrfs_path_size(&p);
-        size_t nl = strlen(name);
         while (d + sizeof(struct btrfs_inode_ref) <= end) {
             struct btrfs_inode_ref *ir = (struct btrfs_inode_ref *)d;
             if (d + sizeof *ir + ir->name_len > end) break;
@@ -620,36 +623,157 @@ static int b_unlink(struct vnode *dirv, const char *name) {
     }
     if (!have_index) {
         /* scan DIR_INDEX entries for the name */
-        struct btrfs_key k = { dir->ino, BTRFS_DIR_INDEX_KEY, 0 };
+        struct btrfs_key k = { dir, BTRFS_DIR_INDEX_KEY, 0 };
         if (btrfs_search(fs, &fs->fs_tree, &k, &p) >= 0) while (!btrfs_path_normalize(fs, &p)) {
             struct btrfs_key *ik = btrfs_path_key(&p);
-            if (ik->objectid != dir->ino || ik->type != BTRFS_DIR_INDEX_KEY) break;
+            if (ik->objectid != dir || ik->type != BTRFS_DIR_INDEX_KEY) break;
             struct btrfs_dir_item *di = btrfs_path_data(&p);
-            if (btrfs_path_size(&p) >= sizeof *di + strlen(name) && di->name_len == strlen(name) && !memcmp(di + 1, name, di->name_len)) { index = ik->offset; have_index = true; break; }
+            if (btrfs_path_size(&p) >= sizeof *di + nl && di->name_len == nl && !memcmp(di + 1, name, nl) && di->location.objectid == ino) { index = ik->offset; have_index = true; break; }
             if (btrfs_next_item(fs, &p)) break;
         }
     }
-    remove_dir_item_entry(fs, dir->ino, name, ino);
-    if (have_index) { struct btrfs_key ik = { dir->ino, BTRFS_DIR_INDEX_KEY, index }; delete_key(fs, &ik); }
+    remove_dir_item_entry(fs, dir, name, ino);
+    if (have_index) { struct btrfs_key ik = { dir, BTRFS_DIR_INDEX_KEY, index }; delete_key(fs, &ik); }
+}
+
+/* one name fewer for ino: with the last one go the inode, its data and its cached vnode */
+static void drop_link(struct btrfs_fs *fs, uint64_t ino) {
     struct btrfs_inode_item ii;
-    if (read_inode(fs, ino, &ii, NULL) == 0) {
-        if (ii.nlink <= 1) {
-            remove_extents(fs, ino);
-            /* xattrs and any leftovers */
-            for (int guard = 0; guard < 1000; guard++) {
-                struct btrfs_key k = { ino, 0, 0 }; struct btrfs_path q;
-                if (btrfs_search(fs, &fs->fs_tree, &k, &q) < 0 || btrfs_path_normalize(fs, &q)) break;
-                if (btrfs_path_key(&q)->objectid != ino) break;
-                btrfs_delete_item(fs, &q);
-            }
-            { uint32_t h = (uint32_t)ino % 256; for (struct bnode *db = fs->inode_cache[h]; db; db = db->hnext) if (db->ino == ino) { db->wdirty = false; kfree(db->wbuf); db->wbuf = NULL; } }
-            drop_bnode(fs, ino);
-        } else { ii.nlink--; ii.ctime.sec = now_sec(); write_inode(fs, ino, &ii); }
+    if (read_inode(fs, ino, &ii, NULL) < 0) return;
+    if (ii.nlink > 1) {
+        ii.nlink--; ii.ctime = now_ts(); ii.transid = fs->transid; ii.sequence++;
+        write_inode(fs, ino, &ii);
+        uint32_t h = (uint32_t)ino % 256;
+        for (struct bnode *b = fs->inode_cache[h]; b; b = b->hnext) if (b->ino == ino) fill_vnode(b, &ii);
+        return;
     }
+    remove_extents(fs, ino);
+    /* xattrs and any leftovers */
+    for (int guard = 0; guard < 1000; guard++) {
+        struct btrfs_key k = { ino, 0, 0 }; struct btrfs_path q;
+        if (btrfs_search(fs, &fs->fs_tree, &k, &q) < 0 || btrfs_path_normalize(fs, &q)) break;
+        if (btrfs_path_key(&q)->objectid != ino) break;
+        btrfs_delete_item(fs, &q);
+    }
+    { uint32_t h = (uint32_t)ino % 256; for (struct bnode *db = fs->inode_cache[h]; db; db = db->hnext) if (db->ino == ino) { db->wdirty = false; kfree(db->wbuf); db->wbuf = NULL; } }
+    drop_bnode(fs, ino);
+}
+
+static int b_unlink(struct vnode *dirv, const char *name) {
+    struct bnode *dir = (struct bnode *)dirv; struct btrfs_fs *fs = dir->fs;
+    if (fs->readonly) return -EROFS;
+    mutex_lock(&fs->lock); btrfs_op_begin(fs);
+    flush_all(fs, FLUSH_HEALTHY);
+    uint64_t ino; uint8_t ftype;
+    int r = dir_lookup(fs, dir->ino, name, &ino, &ftype);
+    if (r < 0) { mutex_unlock(&fs->lock); return r; }
+    btrfs_begin(fs);
+    remove_entry(fs, dir->ino, name, ino);
+    drop_link(fs, ino);
     touch_dir(fs, dir->ino, -2 * (int64_t)strlen(name));
     r = btrfs_commit(fs);
     update_space(fs);
     refresh_vnode(dir);
+    mutex_unlock(&fs->lock);
+    return r < 0 ? r : 0;
+}
+
+static uint8_t ftype_of(uint32_t mode) { uint32_t f = mode & 0170000; return f == 040000 ? BTRFS_FT_DIR : f == 0120000 ? BTRFS_FT_SYMLINK : f == 010000 ? BTRFS_FT_FIFO : BTRFS_FT_REG_FILE; }
+
+static int b_link(struct vnode *dirv, const char *name, struct vnode *target) {
+    struct bnode *dir = (struct bnode *)dirv, *tb = (struct bnode *)target; struct btrfs_fs *fs = dir->fs;
+    if (fs->readonly) return -EROFS;
+    size_t nl = strlen(name);
+    if (nl == 0 || nl > 255) return -ENAMETOOLONG;
+    mutex_lock(&fs->lock); btrfs_op_begin(fs);
+    flush_all(fs, FLUSH_HEALTHY);
+    uint64_t existing;
+    struct btrfs_inode_item ii;
+    int r = 0;
+    if (dir_lookup(fs, dir->ino, name, &existing, NULL) == 0) r = -EEXIST;
+    else if (read_inode(fs, tb->ino, &ii, NULL) < 0) r = -ENOENT;
+    else if (ii.nlink >= 65000) r = -31;   /* EMLINK */
+    if (r < 0) { mutex_unlock(&fs->lock); return r; }
+    btrfs_begin(fs);
+    r = add_dir_entry(fs, dir->ino, name, tb->ino, ftype_of(ii.mode), next_dir_index(fs, dir->ino));
+    if (r < 0) remove_entry(fs, dir->ino, name, tb->ino);   /* whatever part of the entry got in */
+    else {
+        ii.nlink++; ii.ctime = now_ts(); ii.transid = fs->transid; ii.sequence++;
+        write_inode(fs, tb->ino, &ii);
+        fill_vnode(tb, &ii);
+        touch_dir(fs, dir->ino, 2 * (int64_t)nl);
+    }
+    int cr = btrfs_commit(fs);
+    update_space(fs);
+    refresh_vnode(dir);
+    mutex_unlock(&fs->lock);
+    return r < 0 ? r : cr < 0 ? cr : 0;
+}
+
+/* the vfs has checked the replacement (types, emptiness, not the same file) */
+static int b_rename(struct vnode *odirv, const char *oname, struct vnode *ndirv, const char *nname) {
+    struct bnode *od = (struct bnode *)odirv, *nd = (struct bnode *)ndirv; struct btrfs_fs *fs = od->fs;
+    if (fs->readonly) return -EROFS;
+    size_t nl = strlen(nname);
+    if (nl == 0 || nl > 255) return -ENAMETOOLONG;
+    mutex_lock(&fs->lock); btrfs_op_begin(fs);
+    flush_all(fs, FLUSH_HEALTHY);
+    uint64_t ino, tino; uint8_t ftype, tftype = BTRFS_FT_REG_FILE;
+    int r = dir_lookup(fs, od->ino, oname, &ino, &ftype);
+    if (r < 0) { mutex_unlock(&fs->lock); return r; }
+    bool replace = dir_lookup(fs, nd->ino, nname, &tino, &tftype) == 0;
+    if (replace && tino == ino) { mutex_unlock(&fs->lock); return 0; }
+    btrfs_begin(fs);
+    /* the new entry first: if it can't be added (no space), nothing has changed */
+    uint64_t index = next_dir_index(fs, nd->ino);
+    if (replace) {   /* the replaced name's entries go first: the new DIR_ITEM may share their hash bucket */
+        remove_entry(fs, nd->ino, nname, tino);
+        touch_dir(fs, nd->ino, -2 * (int64_t)nl);
+    }
+    r = add_dir_entry(fs, nd->ino, nname, ino, ftype, index);
+    if (r < 0) {
+        remove_entry(fs, nd->ino, nname, ino);
+        if (replace && add_dir_entry(fs, nd->ino, nname, tino, tftype, index) == 0) touch_dir(fs, nd->ino, 2 * (int64_t)nl);
+        btrfs_commit(fs);
+        mutex_unlock(&fs->lock);
+        return r;
+    }
+    touch_dir(fs, nd->ino, 2 * (int64_t)nl);
+    remove_entry(fs, od->ino, oname, ino);
+    touch_dir(fs, od->ino, -2 * (int64_t)strlen(oname));
+    if (replace) drop_link(fs, tino);
+    struct btrfs_inode_item ii;
+    if (read_inode(fs, ino, &ii, NULL) == 0) {
+        ii.ctime = now_ts(); ii.transid = fs->transid; ii.sequence++;
+        write_inode(fs, ino, &ii);
+        uint32_t h = (uint32_t)ino % 256;
+        for (struct bnode *b = fs->inode_cache[h]; b; b = b->hnext) if (b->ino == ino) { fill_vnode(b, &ii); strlcpy(b->vn.name, nname, sizeof b->vn.name); }
+    }
+    r = btrfs_commit(fs);
+    update_space(fs);
+    refresh_vnode(od); if (nd != od) refresh_vnode(nd);
+    mutex_unlock(&fs->lock);
+    return r < 0 ? r : 0;
+}
+
+static int b_setattr(struct vnode *v, const struct vattr *a) {
+    struct bnode *b = (struct bnode *)v; struct btrfs_fs *fs = b->fs;
+    if (fs->readonly) return -EROFS;
+    mutex_lock(&fs->lock); btrfs_op_begin(fs);
+    struct btrfs_inode_item ii;
+    int r = read_inode(fs, b->ino, &ii, NULL);
+    if (r < 0) { mutex_unlock(&fs->lock); return r; }
+    btrfs_begin(fs);
+    if (a->valid & VA_MODE) ii.mode = (ii.mode & 0170000) | (a->mode & 07777);
+    if (a->valid & VA_MTIME) {
+        ii.mtime.sec = a->mtime; ii.mtime.nsec = a->mtime_nsec;
+        b->vn.mtime = a->mtime; b->vn.mtime_nsec = a->mtime_nsec;   /* a later flush of buffered data keeps it */
+    }
+    ii.ctime = now_ts(); ii.transid = fs->transid; ii.sequence++;
+    write_inode(fs, b->ino, &ii);
+    fill_vnode(b, &ii);
+    if (a->valid & VA_MTIME) { b->vn.mtime = a->mtime; b->vn.mtime_nsec = a->mtime_nsec; }
+    r = btrfs_commit(fs);
     mutex_unlock(&fs->lock);
     return r < 0 ? r : 0;
 }
@@ -665,7 +789,7 @@ static int b_sync(struct vnode *v) {
 }
 static void b_release(struct vnode *v) { /* inodes stay cached */ }
 
-static const struct vnode_ops btrfs_ops = { b_read, b_write, b_truncate, b_lookup, b_readdir, b_create, b_unlink, NULL, b_release, b_sync, b_append };
+static const struct vnode_ops btrfs_ops = { b_read, b_write, b_truncate, b_lookup, b_readdir, b_create, b_unlink, NULL, b_release, b_sync, b_append, NULL, b_setattr, b_link, b_rename };
 
 static uint64_t find_highest_ino(struct btrfs_fs *fs) {
     struct btrfs_key k = { BTRFS_LAST_FREE_OBJECTID, 0, 0 };

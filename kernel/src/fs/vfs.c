@@ -22,6 +22,13 @@ void vnode_unref(struct vnode *v) {
     if (__atomic_sub_fetch(&v->refcount, 1, __ATOMIC_SEQ_CST) == 0 && v->ops && v->ops->release) v->ops->release(v);
 }
 
+void vfs_now(uint64_t *sec, uint32_t *nsec) {
+    int64_t ns = time_realtime_ns();
+    if (ns < 0) ns = 0;
+    *sec = (uint64_t)ns / 1000000000ull; *nsec = (uint32_t)((uint64_t)ns % 1000000000ull);
+}
+void vnode_touch(struct vnode *v) { vfs_now(&v->mtime, &v->mtime_nsec); v->ctime = v->mtime; v->ctime_nsec = v->mtime_nsec; }
+
 /* Lexical normalization (. and .. resolved, slashes collapsed). Fails instead of truncating: a prefix of
  * the requested path names a different file. An empty path is ENOENT (POSIX), never "the cwd". */
 int vfs_normalize(const char *cwd, const char *path, char *out, size_t n) {
@@ -189,7 +196,8 @@ struct vnode *vfs_mount_at(int i, char *path, size_t n) {
     return r;
 }
 
-int vfs_open_rel(const char *cwd, const char *path, int flags, struct file **out) {
+int fifo_open(struct vnode *v, int flags, struct file **out);
+int vfs_open_mode(const char *cwd, const char *path, int flags, uint32_t mode, struct file **out) {
     char norm[PATH_MAX];
     int r = vfs_normalize(cwd, path, norm, sizeof norm); if (r < 0) return r;
     struct vnode *parent = NULL; char last[NAME_MAX + 1];
@@ -198,7 +206,7 @@ int vfs_open_rel(const char *cwd, const char *path, int flags, struct file **out
     if (!v) {
         if (!(flags & O_CREAT) || !parent || !last[0]) { if (parent) vnode_unref(parent); mutex_unlock(&vfs_mutex); return -ENOENT; }
         if (!parent->ops->create) { vnode_unref(parent); mutex_unlock(&vfs_mutex); return -EROFS; }
-        v = parent->ops->create(parent, last, VN_FILE);
+        v = parent->ops->create(parent, last, VN_FILE, mode & 07777);
         if (!v) { vnode_unref(parent); mutex_unlock(&vfs_mutex); return -EIO; }
     }
     else if ((flags & (O_CREAT | O_EXCL)) == (O_CREAT | O_EXCL)) { if (parent) vnode_unref(parent); mutex_unlock(&vfs_mutex); vnode_unref(v); return -EEXIST; }
@@ -206,6 +214,7 @@ int vfs_open_rel(const char *cwd, const char *path, int flags, struct file **out
     mutex_unlock(&vfs_mutex);
     if ((flags & O_DIRECTORY) && v->type != VN_DIR) { vnode_unref(v); return -ENOTDIR; }
     if (v->type == VN_DIR && (flags & O_ACCMODE) != O_RDONLY) { vnode_unref(v); return -EISDIR; }
+    if (v->type == VN_FIFO) { r = fifo_open(v, flags, out); vnode_unref(v); if (r == 0) (*out)->path = strdup(norm); return r; }
     if ((flags & O_TRUNC) && (flags & O_ACCMODE) != O_RDONLY && v->type == VN_FILE && v->ops->truncate && (r = v->ops->truncate(v, 0)) < 0) { vnode_unref(v); return r; }
     struct file *f = kzalloc(sizeof *f);
     f->vn = v; f->flags = flags; f->refcount = 1;
@@ -214,6 +223,7 @@ int vfs_open_rel(const char *cwd, const char *path, int flags, struct file **out
     *out = f;
     return 0;
 }
+int vfs_open_rel(const char *cwd, const char *path, int flags, struct file **out) { return vfs_open_mode(cwd, path, flags, 0644, out); }
 int vfs_open(const char *path, int flags, struct file **out) { return vfs_open_rel("/", path, flags, out); }
 
 int64_t vfs_pread(struct vnode *v, uint64_t off, void *buf, size_t n) {
@@ -272,7 +282,7 @@ int vfs_stat_rel(const char *cwd, const char *path, struct stat *st) {
     char norm[PATH_MAX]; int r = vfs_normalize(cwd, path, norm, sizeof norm); if (r < 0) return r;
     struct vnode *v = vfs_lookup(norm);
     if (!v) return -ENOENT;
-    st->type = v->type; st->size = v->size; st->mtime = v->mtime; st->mode = v->mode; st->ino = v->ino; st->nlink = 1;
+    st->type = v->type; st->size = v->size; st->mtime = v->mtime; st->mtime_nsec = v->mtime_nsec; st->mode = v->mode; st->ino = v->ino; st->nlink = v->nlink ? v->nlink : 1;
     vnode_unref(v);
     return 0;
 }
@@ -284,7 +294,7 @@ int vfs_readdir(struct vnode *dir, int index, struct dirent *d) {
     return dir->ops->readdir(dir, index, d);
 }
 
-static int create_node(const char *path, int type) {
+static int create_node(const char *path, int type, uint32_t mode) {
     char norm[PATH_MAX]; int nr = vfs_normalize("/", path, norm, sizeof norm); if (nr < 0) return nr;
     struct vnode *parent = NULL; char last[NAME_MAX + 1];
     mutex_lock(&vfs_mutex);
@@ -293,18 +303,20 @@ static int create_node(const char *path, int type) {
     if (!parent || !last[0]) { mutex_unlock(&vfs_mutex); return -ENOENT; }
     int r = 0;
     if (!parent->ops->create) r = -EROFS;
-    else { struct vnode *n = parent->ops->create(parent, last, type); if (n) vnode_unref(n); else r = -EIO; }
+    else { struct vnode *n = parent->ops->create(parent, last, type, mode & 07777); if (n) vnode_unref(n); else r = type == VN_FIFO ? -EPERM : -EIO; }
     vnode_unref(parent);
     mutex_unlock(&vfs_mutex);
     return r;
 }
-int vfs_mkdir(const char *path) { return create_node(path, VN_DIR); }
+int vfs_mkdir(const char *path) { return create_node(path, VN_DIR, 0755); }
+int vfs_mkdir_mode(const char *path, uint32_t mode) { return create_node(path, VN_DIR, mode); }
+int vfs_mkfifo(const char *path, uint32_t mode) { return create_node(path, VN_FIFO, mode); }
 
 int vfs_symlink(const char *target, const char *linkpath) {
     size_t tl = strlen(target);
     if (!tl) return -ENOENT;
     if (tl >= PATH_MAX) return -ENAMETOOLONG;
-    int r = create_node(linkpath, VN_LNK);
+    int r = create_node(linkpath, VN_LNK, 0777);
     if (r < 0) return r;
     struct vnode *v = vfs_lookup_nofollow(linkpath);
     if (!v) return -EIO;
@@ -324,11 +336,48 @@ int vfs_readlink(const char *path, char *buf, size_t n) {
 int vfs_lstat(const char *path, struct stat *st) {
     struct vnode *v = vfs_lookup_nofollow(path);
     if (!v) return -ENOENT;
-    st->type = v->type; st->size = v->size; st->mtime = v->mtime; st->mode = v->mode; st->ino = v->ino; st->nlink = 1;
+    st->type = v->type; st->size = v->size; st->mtime = v->mtime; st->mtime_nsec = v->mtime_nsec; st->mode = v->mode; st->ino = v->ino; st->nlink = v->nlink ? v->nlink : 1;
     vnode_unref(v);
     return 0;
 }
-int vfs_create(const char *path) { return create_node(path, VN_FILE); }
+int vfs_create(const char *path) { return create_node(path, VN_FILE, 0644); }
+
+int vfs_setattr(struct vnode *v, const struct vattr *a) {
+    if (v->mount_root) v = v->mount_root;
+    if (!v->ops->setattr) return 0;   /* FAT, ext4, devices: nothing to keep it in */
+    return v->ops->setattr(v, a);
+}
+
+void vfs_copy_mode(const char *src, const char *dst) {
+    struct stat st;
+    if (vfs_stat(src, &st) < 0) return;
+    struct vnode *v = vfs_lookup(dst);
+    if (!v) return;
+    struct vattr a = { .valid = VA_MODE, .mode = st.mode & 07777 };
+    vfs_setattr(v, &a);
+    vnode_unref(v);
+}
+
+int vfs_link(const char *oldpath, const char *newpath) {
+    char a[PATH_MAX], b[PATH_MAX]; int r;
+    if ((r = vfs_normalize("/", oldpath, a, sizeof a)) < 0 || (r = vfs_normalize("/", newpath, b, sizeof b)) < 0) return r;
+    struct vnode *target = vfs_lookup_nofollow(a);
+    if (!target) return -ENOENT;
+    if (target->type == VN_DIR) { vnode_unref(target); return -EPERM; }
+    struct vnode *parent = NULL; char last[NAME_MAX + 1];
+    mutex_lock(&vfs_mutex);
+    struct vnode *v = walk_ex(b, &parent, last, false);
+    if (v) r = -EEXIST;
+    else if (!parent || !last[0]) r = -ENOENT;
+    else if (parent->ops != target->ops || parent->fs != target->fs) r = -EXDEV;
+    else if (!parent->ops->link) r = -EPERM;
+    else r = parent->ops->link(parent, last, target);
+    if (v) vnode_unref(v);
+    if (parent) vnode_unref(parent);
+    mutex_unlock(&vfs_mutex);
+    vnode_unref(target);
+    return r;
+}
 
 int vfs_unlink(const char *path) {
     char norm[PATH_MAX]; int nr = vfs_normalize("/", path, norm, sizeof norm); if (nr < 0) return nr;
@@ -384,10 +433,51 @@ int vfs_write_file(const char *path, const void *data, size_t size) {
     return r < 0 ? r : c;
 }
 
-/* rename = copy + unlink (works across filesystems; directories only when empty) */
+/* Same-filesystem rename through the fs's own operation: one step, replacing the target as POSIX
+ * allows. Returns -EXDEV when the two names are on different filesystems (or the fs has no rename). */
+static int rename_native(const char *a, const char *b) {
+    size_t al = strlen(a);
+    if (!strncmp(b, a, al) && b[al] == '/') return -EINVAL;   /* a directory into itself */
+    struct vnode *pa = NULL, *pb = NULL; char la[NAME_MAX + 1], lb[NAME_MAX + 1];
+    int r;
+    mutex_lock(&vfs_mutex);
+    struct vnode *va = walk_ex(a, &pa, la, false);
+    struct vnode *vb = walk_ex(b, &pb, lb, false);
+    if (!va || !pa || !la[0]) r = -ENOENT;
+    else if (!pb || !lb[0]) r = -ENOENT;
+    /* device nodes live in tmpfs's /dev with ops of their own: those are copied, not moved */
+    else if (pa->ops != pb->ops || pa->fs != pb->fs || !pa->ops->rename || va->ops != pa->ops || (vb && vb->ops != pa->ops)) r = -EXDEV;
+    else if (va->mount_root || is_mount_root(va) || (vb && (vb->mount_root || is_mount_root(vb)))) r = -EBUSY;
+    else if (vb == va) r = 0;   /* two names of one file: nothing to do */
+    else if (vb && va->type == VN_DIR && vb->type != VN_DIR) r = -ENOTDIR;
+    else if (vb && va->type != VN_DIR && vb->type == VN_DIR) r = -EISDIR;
+    else {
+        struct dirent de;
+        if (vb && vb->type == VN_DIR && vb->ops->readdir && vb->ops->readdir(vb, 0, &de) == 0) r = -ENOTEMPTY;
+        else r = pa->ops->rename(pa, la, pb, lb);
+    }
+    if (va) vnode_unref(va);
+    if (vb) vnode_unref(vb);
+    if (pa) vnode_unref(pa);
+    if (pb) vnode_unref(pb);
+    mutex_unlock(&vfs_mutex);
+    return r;
+}
+
+/* rename(2): one step on one filesystem, EXDEV across filesystems (mv copies then) */
+int vfs_rename_posix(const char *oldp, const char *newp) {
+    char a[PATH_MAX], b[PATH_MAX]; int nr;
+    if ((nr = vfs_normalize("/", oldp, a, sizeof a)) < 0 || (nr = vfs_normalize("/", newp, b, sizeof b)) < 0) return nr;
+    if (!strcmp(a, b)) { struct vnode *v = vfs_lookup_nofollow(a); if (!v) return -ENOENT; vnode_unref(v); return 0; }
+    return rename_native(a, b);
+}
+
+/* rename for the desktop and the shell: in one step where the filesystem can, otherwise copy + unlink
+ * (works across filesystems; directories only when empty) */
 int vfs_rename(const char *oldp, const char *newp) {
     char a[PATH_MAX], b[PATH_MAX]; int nr;
     if ((nr = vfs_normalize("/", oldp, a, sizeof a)) < 0 || (nr = vfs_normalize("/", newp, b, sizeof b)) < 0) return nr;
+    if (strcmp(a, b)) { nr = rename_native(a, b); if (nr != -EXDEV) return nr; }
     struct vnode *la = vfs_lookup_nofollow(a); if (!la) return -ENOENT;
     if (la->type == VN_LNK) {   /* the link itself moves */
         char t[PATH_MAX]; int64_t n = la->ops->read(la, 0, t, sizeof t - 1); vnode_unref(la);
@@ -427,6 +517,7 @@ int vfs_rename(const char *oldp, const char *newp) {
     r = vfs_write_file(b, data, sz);
     kfree(data);
     if (r < 0) return r;
+    vfs_copy_mode(a, b);
     return vfs_unlink(a);
 }
 

@@ -27,6 +27,9 @@
 #include <sys/random.h>
 #include <sys/socket.h>
 #include <sys/stat.h>
+#include <sys/statfs.h>
+#include <sys/time.h>
+#include <sys/select.h>
 #include <sys/wait.h>
 #include <dirent.h>
 
@@ -233,6 +236,216 @@ static void test_symlinks(void) {
     unlink("/tmp/sl/loop1"); unlink("/tmp/sl/loop2"); unlink("/tmp/sl/target.txt"); unlink("/tmp/sl-abs"); rmdir("/tmp/sl");
 }
 
+/* runs argv with stdout into buf (NUL-terminated); returns the exit status, or -1 */
+static int run_capture(char *const argv[], char *buf, size_t size) {
+    int pfd[2]; if (pipe(pfd) < 0) return -1;
+    pid_t c = fork();
+    if (c == 0) { dup2(pfd[1], 1); close(pfd[0]); close(pfd[1]); execv(argv[0], argv); _exit(126 + (errno == ENOENT)); }
+    close(pfd[1]);
+    size_t n = 0; ssize_t r;
+    memset(buf, 0, size);
+    while ((r = read(pfd[0], buf + n, size - 1 - n)) > 0) n += (size_t)r;
+    close(pfd[0]);
+    int st;
+    if (waitpid(c, &st, 0) != c || !WIFEXITED(st)) return -1;
+    return WEXITSTATUS(st);
+}
+static bool write_file(const char *path, const char *text, mode_t mode) {
+    int fd = open(path, O_WRONLY | O_CREAT | O_TRUNC, mode);
+    if (fd < 0) return false;
+    bool ok = write(fd, text, strlen(text)) == (ssize_t)strlen(text);
+    return close(fd) == 0 && ok;
+}
+static bool read_file(const char *path, char *buf, size_t size) {
+    int fd = open(path, O_RDONLY); if (fd < 0) return false;
+    memset(buf, 0, size);
+    ssize_t r = read(fd, buf, size - 1);
+    close(fd);
+    return r >= 0;
+}
+
+/* ---- program loading: #! scripts and the execute permission ---- */
+static void test_exec(void) {
+    char out[256];
+    CHECK("#! script: interpreter gets [argument,] script path, arguments", write_file("/tmp/st-script", "#!/bin/echo from-script\nignored\n", 0755) &&
+          run_capture((char *[]){ "/tmp/st-script", "a1", "a2", NULL }, out, sizeof out) == 0 && !strcmp(out, "from-script /tmp/st-script a1 a2\n"));
+    CHECK("#! script without an argument", write_file("/tmp/st-script2", "#!/bin/echo\n", 0755) &&
+          run_capture((char *[]){ "/tmp/st-script2", "x", NULL }, out, sizeof out) == 0 && !strcmp(out, "/tmp/st-script2 x\n"));
+    CHECK("#! script whose interpreter is a script", write_file("/tmp/st-script3", "#!/tmp/st-script2 nested\n", 0755) &&
+          run_capture((char *[]){ "/tmp/st-script3", NULL }, out, sizeof out) == 0 && !strcmp(out, "/tmp/st-script2 nested /tmp/st-script3\n"));
+    CHECK("execve without an execute bit: EACCES", write_file("/tmp/st-noexec", "#!/bin/echo\n", 0644) &&
+          execl("/tmp/st-noexec", "x", (char *)NULL) == -1 && errno == EACCES);
+    CHECK("execve of a script with a missing interpreter: ENOENT", write_file("/tmp/st-badinterp", "#!/nonexistent/sh\n", 0755) &&
+          execl("/tmp/st-badinterp", "x", (char *)NULL) == -1 && errno == ENOENT);
+    CHECK("execve of a directory: EACCES", execl("/tmp", "x", (char *)NULL) == -1 && errno == EACCES);
+    CHECK("access X_OK follows the mode", access("/tmp/st-script", X_OK) == 0 && access("/tmp/st-noexec", X_OK) == -1 && errno == EACCES);
+    unlink("/tmp/st-script"); unlink("/tmp/st-script2"); unlink("/tmp/st-script3"); unlink("/tmp/st-noexec"); unlink("/tmp/st-badinterp");
+}
+
+/* ---- what make, ar, ld and install need from a filesystem; `systest posix DIR` runs it on DIR ---- */
+static void test_posix(const char *dir) {
+    char a[512], b[512], c[512], out[64];
+    struct stat st, st2;
+    mode_t old = umask(022);
+    snprintf(a, sizeof a, "%s/px-mode", dir);
+    int fd = open(a, O_WRONLY | O_CREAT | O_TRUNC, 0777);
+    CHECK("open(O_CREAT, 0777) under umask 022 gives 0755", fd >= 0 && fstat(fd, &st) == 0 && (st.st_mode & 07777) == 0755);
+    if (fd >= 0) close(fd);
+    CHECK("chmod", chmod(a, 0640) == 0 && stat(a, &st) == 0 && (st.st_mode & 07777) == 0640);
+    fd = open(a, O_RDONLY);
+    CHECK("fchmod", fd >= 0 && fchmod(fd, 0711) == 0 && stat(a, &st) == 0 && (st.st_mode & 07777) == 0711);
+    if (fd >= 0) close(fd);
+    CHECK("fchmodat", fchmodat(AT_FDCWD, a, 0600, 0) == 0 && stat(a, &st) == 0 && (st.st_mode & 07777) == 0600);
+    snprintf(b, sizeof b, "%s/px-dir", dir);
+    CHECK("mkdir mode under umask", mkdir(b, 0777) == 0 && stat(b, &st) == 0 && S_ISDIR(st.st_mode) && (st.st_mode & 07777) == 0755);
+    rmdir(b);
+
+    /* timestamps, to the nanosecond */
+    struct timespec ts[2] = { { 0, UTIME_OMIT }, { 1000000000, 123456789 } };
+    CHECK("utimensat sets mtime with nanoseconds", utimensat(AT_FDCWD, a, ts, 0) == 0 && stat(a, &st) == 0 && st.st_mtim.tv_sec == 1000000000 && st.st_mtim.tv_nsec == 123456789);
+    ts[1].tv_nsec = UTIME_OMIT;
+    CHECK("utimensat UTIME_OMIT leaves mtime", utimensat(AT_FDCWD, a, ts, 0) == 0 && stat(a, &st) == 0 && st.st_mtim.tv_sec == 1000000000);
+    fd = open(a, O_WRONLY);
+    struct timespec now; clock_gettime(CLOCK_REALTIME, &now);
+    CHECK("futimens(NULL) sets mtime to now", fd >= 0 && futimens(fd, NULL) == 0 && fstat(fd, &st) == 0 && st.st_mtim.tv_sec >= now.tv_sec - 1 && st.st_mtim.tv_sec <= now.tv_sec + 1);
+    if (fd >= 0) close(fd);
+    struct timeval tv[2] = { { 2000000000, 0 }, { 2000000000, 500000 } };
+    CHECK("utimes (microseconds)", utimes(a, tv) == 0 && stat(a, &st) == 0 && st.st_mtim.tv_sec == 2000000000 && st.st_mtim.tv_nsec == 500000000);
+    write_file(a, "x", 0644);
+    clock_gettime(CLOCK_REALTIME, &now);
+    CHECK("a write updates mtime", stat(a, &st) == 0 && st.st_mtim.tv_sec >= now.tv_sec - 2 && st.st_mtim.tv_sec <= now.tv_sec + 1);
+    struct timespec t1, t2;
+    write_file(a, "1", 0644); stat(a, &st); t1 = st.st_mtim;
+    nanosleep(&(struct timespec){ 0, 30000000 }, NULL);
+    write_file(a, "2", 0644); stat(a, &st); t2 = st.st_mtim;
+    CHECK("writes 30 ms apart get different mtimes", t2.tv_sec > t1.tv_sec || (t2.tv_sec == t1.tv_sec && t2.tv_nsec > t1.tv_nsec));
+
+    /* hard links */
+    snprintf(b, sizeof b, "%s/px-link", dir);
+    write_file(a, "linked data", 0644);
+    CHECK("link", link(a, b) == 0 && stat(a, &st) == 0 && stat(b, &st2) == 0 && st.st_ino == st2.st_ino && st.st_nlink == 2);
+    CHECK("link onto an existing name: EEXIST", link(a, b) == -1 && errno == EEXIST);
+    write_file(b, "via the link", 0644);
+    CHECK("both names see one file", read_file(a, out, sizeof out) && !strcmp(out, "via the link"));
+    CHECK("unlink one name, the other keeps the data", unlink(a) == 0 && stat(b, &st) == 0 && st.st_nlink == 1 && read_file(b, out, sizeof out) && !strcmp(out, "via the link"));
+    snprintf(c, sizeof c, "%s/px-ldir", dir); mkdir(c, 0755);
+    snprintf(a, sizeof a, "%s/px-ldir/second", dir);
+    CHECK("link into another directory", link(b, a) == 0 && stat(b, &st) == 0 && st.st_nlink == 2);
+    snprintf(a, sizeof a, "%s/px-ldir/third", dir);
+    snprintf(out, sizeof out, "%s", "x");
+    CHECK("two links in one directory", link(b, a) == 0 && stat(b, &st) == 0 && st.st_nlink == 3);
+    unlink(a); snprintf(a, sizeof a, "%s/px-ldir/second", dir); unlink(a);
+    CHECK("link counts drop with unlink", stat(b, &st) == 0 && st.st_nlink == 1);
+    CHECK("link to a directory: EPERM", link(c, a) == -1 && errno == EPERM);
+
+    /* rename: replaces in one step; directories move with their contents */
+    snprintf(a, sizeof a, "%s/px-old", dir);
+    write_file(a, "new contents", 0644);
+    write_file(b, "old contents", 0644);
+    CHECK("rename over an existing file", rename(a, b) == 0 && access(a, F_OK) == -1 && read_file(b, out, sizeof out) && !strcmp(out, "new contents"));
+    snprintf(a, sizeof a, "%s/px-ldir/file", dir); write_file(a, "in dir", 0644);
+    snprintf(a, sizeof a, "%s/px-ldir2", dir);
+    CHECK("rename a non-empty directory", rename(c, a) == 0 && ({ char q[600]; snprintf(q, sizeof q, "%s/file", a); read_file(q, out, sizeof out) && !strcmp(out, "in dir"); }));
+    char q[600]; snprintf(q, sizeof q, "%s/inner", a);
+    CHECK("rename a directory into itself: EINVAL", rename(a, q) == -1 && errno == EINVAL);
+    CHECK("rename a file over a directory: EISDIR", rename(b, a) == -1 && errno == EISDIR);
+    CHECK("rename a directory over a file: ENOTDIR", rename(a, b) == -1 && errno == ENOTDIR);
+    snprintf(c, sizeof c, "%s/px-empty", dir); mkdir(c, 0755);
+    CHECK("rename a directory over an empty one", rename(a, c) == 0 && access(a, F_OK) == -1);
+    snprintf(q, sizeof q, "%s/file", c); unlink(q); rmdir(c);
+    snprintf(a, sizeof a, "%s/px-nr", dir); write_file(a, "a", 0644);
+    CHECK("renameat2 RENAME_NOREPLACE", syscall(SYS_renameat2, AT_FDCWD, a, AT_FDCWD, b, 1) == -1 && errno == EEXIST && access(a, F_OK) == 0);
+    unlink(a); unlink(b);
+
+    /* named pipes */
+    snprintf(a, sizeof a, "%s/px-fifo", dir);
+    if (mkfifo(a, 0600) == 0) {
+        CHECK("mkfifo makes a FIFO", stat(a, &st) == 0 && S_ISFIFO(st.st_mode));
+        pid_t ch = fork();
+        if (ch == 0) { int w = open(a, O_WRONLY); _exit(w >= 0 && write(w, "through the fifo", 16) == 16 ? 0 : 1); }
+        int r = open(a, O_RDONLY);
+        memset(out, 0, sizeof out); size_t n = 0; ssize_t k;
+        while (r >= 0 && (k = read(r, out + n, sizeof out - 1 - n)) > 0) n += (size_t)k;
+        if (r >= 0) close(r);
+        int status = -1; waitpid(ch, &status, 0);
+        CHECK("a FIFO carries data between processes, EOF when the writer closes", !strcmp(out, "through the fifo") && WIFEXITED(status) && WEXITSTATUS(status) == 0);
+        int rw = open(a, O_RDWR | O_NONBLOCK);
+        char ch1;
+        CHECK("FIFO opened O_RDWR: no wait, empty read is EAGAIN", rw >= 0 && read(rw, &ch1, 1) == -1 && errno == EAGAIN && write(rw, "z", 1) == 1 && read(rw, &ch1, 1) == 1 && ch1 == 'z');
+        if (rw >= 0) close(rw);
+        CHECK("FIFO: O_NONBLOCK writer with no reader: ENXIO", open(a, O_WRONLY | O_NONBLOCK) == -1 && errno == ENXIO);
+        unlink(a);
+    } else CHECK("mkfifo", false);
+
+    struct statfs sf;
+    CHECK("statfs", statfs(dir, &sf) == 0 && sf.f_bsize > 0 && sf.f_blocks > 0);
+    umask(old);
+}
+
+/* ---- interval timers ---- */
+static volatile int alarms;
+static void on_alarm(int s) { alarms++; }
+static void test_timers(void) {
+    signal(SIGALRM, on_alarm);
+    alarms = 0;
+    CHECK("alarm(1) delivers SIGALRM", alarm(1) == 0 && ({ for (int i = 0; i < 300 && !alarms; i++) nanosleep(&(struct timespec){ 0, 10000000 }, NULL); alarms == 1; }));
+    CHECK("alarm(0) cancels and returns what was left", alarm(5) == 0 && alarm(0) >= 4);
+    alarms = 0;
+    struct itimerval it = { { 0, 30000 }, { 0, 30000 } }, cur;
+    CHECK("setitimer ITIMER_REAL repeats", setitimer(ITIMER_REAL, &it, NULL) == 0 && ({ for (int i = 0; i < 300 && alarms < 3; i++) nanosleep(&(struct timespec){ 0, 10000000 }, NULL); alarms >= 3; }));
+    CHECK("getitimer", getitimer(ITIMER_REAL, &cur) == 0 && cur.it_interval.tv_usec == 30000);
+    memset(&it, 0, sizeof it);
+    setitimer(ITIMER_REAL, &it, NULL);
+    int seen = alarms;
+    nanosleep(&(struct timespec){ 0, 100000000 }, NULL);
+    CHECK("setitimer with zero disarms", alarms == seen);
+    /* pselect's mask: SIGALRM blocked outside, let through while waiting (how make waits for SIGCHLD) */
+    sigset_t blk, none; sigemptyset(&blk); sigaddset(&blk, SIGALRM); sigemptyset(&none);
+    sigprocmask(SIG_BLOCK, &blk, NULL);
+    alarms = 0;
+    setitimer(ITIMER_REAL, &(struct itimerval){ { 0, 0 }, { 0, 50000 } }, NULL);
+    struct timespec t0, t1; clock_gettime(CLOCK_MONOTONIC, &t0);
+    int pr = pselect(0, NULL, NULL, NULL, &(struct timespec){ 3, 0 }, &none);
+    clock_gettime(CLOCK_MONOTONIC, &t1);
+    long waited = (t1.tv_sec - t0.tv_sec) * 1000 + (t1.tv_nsec - t0.tv_nsec) / 1000000;
+    CHECK("pselect: a signal its mask unblocks interrupts it (EINTR)", pr == -1 && errno == EINTR && alarms == 1 && waited < 2000);
+    sigprocmask(SIG_UNBLOCK, &blk, NULL);
+    signal(SIGALRM, SIG_DFL);
+}
+
+/* ---- the developer tools (DEVTOOLS=1 images): compilers, sh and make running on inFlux ---- */
+static bool run_ok(char *const argv[], char *out, size_t size) { return run_capture(argv, out, size) == 0; }
+static void test_devtools(void) {
+    char out[512];
+    mkdir("/tmp/dt", 0755);
+    write_file("/tmp/dt/hello.c", "#include <stdio.h>\nint main(void) { printf(\"built on inFlux: %d\\n\", 6 * 7); return 0; }\n", 0644);
+    CHECK("gcc compiles and links (dynamic)", run_ok((char *[]){ "/usr/bin/gcc", "-O2", "-o", "/tmp/dt/hello", "/tmp/dt/hello.c", NULL }, out, sizeof out));
+    CHECK("the program gcc made runs", run_ok((char *[]){ "/tmp/dt/hello", NULL }, out, sizeof out) && !strcmp(out, "built on inFlux: 42\n"));
+    CHECK("gcc -static", run_ok((char *[]){ "/usr/bin/gcc", "-static", "-o", "/tmp/dt/hello-s", "/tmp/dt/hello.c", NULL }, out, sizeof out) &&
+          run_ok((char *[]){ "/tmp/dt/hello-s", NULL }, out, sizeof out) && !strcmp(out, "built on inFlux: 42\n"));
+    write_file("/tmp/dt/hello.cc", "#include <iostream>\n#include <vector>\nint main() { std::vector<int> v{1, 2, 3}; int s = 0; for (int x : v) s += x; std::cout << \"c++ \" << s << std::endl; }\n", 0644);
+    CHECK("g++ (libstdc++, iostream)", run_ok((char *[]){ "/usr/bin/g++", "-O2", "-o", "/tmp/dt/hellocc", "/tmp/dt/hello.cc", NULL }, out, sizeof out) &&
+          run_ok((char *[]){ "/tmp/dt/hellocc", NULL }, out, sizeof out) && !strcmp(out, "c++ 6\n"));
+    CHECK("/bin/sh (BusyBox ash): arithmetic, loops, command substitution",
+          run_ok((char *[]){ "/bin/sh", "-c", "echo $((6*7)); for i in 1 2 3; do printf %s $i; done; echo; echo $(echo nested)", NULL }, out, sizeof out) && !strcmp(out, "42\n123\nnested\n"));
+    write_file("/tmp/dt/script", "#!/bin/sh\nset -e\ncd /tmp/dt\nx=$(ls hello.c)\ntest -x hello && echo \"script ok $x $1\"\n", 0755);
+    CHECK("a #!/bin/sh script", run_ok((char *[]){ "/tmp/dt/script", "arg", NULL }, out, sizeof out) && !strcmp(out, "script ok hello.c arg\n"));
+    CHECK("sh pipelines and sed/grep/sort/wc",
+          run_ok((char *[]){ "/bin/sh", "-c", "printf 'b\\na\\nc\\n' | sort | sed 's/^/x/' | grep -v xc | tr '\\n' ' ' && ls /usr/bin | wc -l | (read n; test $n -gt 300 && echo many)", NULL }, out, sizeof out) && !strcmp(out, "xa xb many\n"));
+    /* make: a parallel build, then an incremental one that redoes only what changed */
+    for (int i = 0; i < 6; i++) { char p[64], src[128]; snprintf(p, sizeof p, "/tmp/dt/m%d.c", i); snprintf(src, sizeof src, "int f%d(void) { return %d; }\n", i, i + 1); write_file(p, src, 0644); }
+    write_file("/tmp/dt/main.c", "#include <stdio.h>\nint f0(void),f1(void),f2(void),f3(void),f4(void),f5(void);\nint main(void){printf(\"sum %d\\n\",f0()+f1()+f2()+f3()+f4()+f5());return 0;}\n", 0644);
+    write_file("/tmp/dt/Makefile", "OBJ := main.o $(patsubst %.c,%.o,$(wildcard m*.c))\nprog: $(OBJ)\n\t$(CC) -o $@ $^\n%.o: %.c\n\t@echo build $<\n\t@$(CC) -O2 -c -o $@ $<\nclean:\n\trm -f prog *.o\n", 0644);
+    CHECK("make -j4", run_ok((char *[]){ "/usr/bin/make", "-s", "-C", "/tmp/dt", "-j4", "CC=gcc", "prog", NULL }, out, sizeof out) &&
+          run_ok((char *[]){ "/tmp/dt/prog", NULL }, out, sizeof out) && !strcmp(out, "sum 21\n"));
+    nanosleep(&(struct timespec){ 0, 20000000 }, NULL);
+    write_file("/tmp/dt/m3.c", "int f3(void) { return 100; }\n", 0644);
+    CHECK("make rebuilds only what changed", run_ok((char *[]){ "/usr/bin/make", "-s", "-C", "/tmp/dt", "CC=gcc", "prog", NULL }, out, sizeof out) && !strcmp(out, "build m3.c\n") &&
+          run_ok((char *[]){ "/tmp/dt/prog", NULL }, out, sizeof out) && !strcmp(out, "sum 117\n"));
+    CHECK("make: nothing to do when up to date", run_ok((char *[]){ "/usr/bin/make", "-s", "-C", "/tmp/dt", "CC=gcc", "prog", NULL }, out, sizeof out) && !strcmp(out, ""));
+    CHECK("ar + nm", run_ok((char *[]){ "/bin/sh", "-c", "cd /tmp/dt && ar rcs libm.a m0.o m1.o && nm libm.a | grep -c ' T f'", NULL }, out, sizeof out) && !strcmp(out, "2\n"));
+}
+
 /* ---- pipes, poll, socketpair ---- */
 static void test_ipc(void) {
     int p[2]; pipe2(p, O_NONBLOCK);
@@ -388,6 +601,20 @@ static void test_volume(const char *dir) {
 }
 
 int main(int argc, char **argv) {
+    if (argc > 2 && !strcmp(argv[1], "posix")) {
+        setvbuf(stdout, NULL, _IOLBF, 0);
+        printf("systest: POSIX file checks in %s\n", argv[2]);
+        test_posix(argv[2]);
+        printf("systest: %d of %d checks passed\n", checks - failures, checks);
+        return failures;
+    }
+    if (argc > 1 && !strcmp(argv[1], "devtools")) {
+        setvbuf(stdout, NULL, _IOLBF, 0);
+        printf("systest: developer tools checks\n");
+        test_devtools();
+        printf("systest: %d of %d checks passed\n", checks - failures, checks);
+        return failures;
+    }
     if (argc > 2 && !strcmp(argv[1], "fs")) {
         setvbuf(stdout, NULL, _IOLBF, 0);
         printf("systest: checking the volume at %s\n", argv[2]);
@@ -403,8 +630,11 @@ int main(int argc, char **argv) {
     test_threads();
     test_files();
     test_symlinks();
+    test_exec();
+    test_posix("/tmp");
     test_ipc();
     test_time();
+    test_timers();
     test_loopback();
     if (argc > 1 && !strcmp(argv[1], "net")) test_net();
     printf("systest: %d of %d checks passed\n", checks - failures, checks);

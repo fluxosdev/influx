@@ -346,6 +346,7 @@ static int copy_tree_at(const char *src, const char *dst, int depth) {
     if (vfs_read_file(src, &data, &sz) < 0) return -1;
     int r = vfs_write_file(dst, data, sz);
     kfree(data);
+    if (r == 0) vfs_copy_mode(src, dst);
     return r;
 }
 static int copy_tree(const char *src, const char *dst) { return copy_tree_at(src, dst, 0); }

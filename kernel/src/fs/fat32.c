@@ -402,9 +402,10 @@ static int write_slot(struct fat *f, uint32_t *c, int *idx, const void *entry) {
     return 0;
 }
 
-static struct vnode *f_create(struct vnode *dirv, const char *name, int type) {
+static struct vnode *f_create(struct vnode *dirv, const char *name, int type, uint32_t mode) {
     struct fnode *d = (struct fnode *)dirv; struct fat *f = d->fs;
     size_t nl = strlen(name); if (!nl || nl > 255) return NULL;
+    if (type == VN_FIFO) return NULL;   /* FAT has no special files (the mode is not kept either) */
     mutex_lock(&f->lock);
     uint8_t short_name[11]; bool lfn; make_83(name, short_name, &lfn);
     /* make the short name unique (~1 .. ~9) */

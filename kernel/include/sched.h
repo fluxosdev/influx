@@ -97,6 +97,8 @@ struct process {
     int pgid, sid;
     bool execed;                  /* has called execve (setpgid rules) */
     uint64_t child_gen;           /* bumped when a child exits (exit_lock) */
+    uint64_t alarm_at_ms;         /* ITIMER_REAL: time_ms() when SIGALRM is due (0: not armed) */
+    uint64_t alarm_interval_ms;   /* and the period after that (0: one shot) */
 };
 void process_close_windows(struct process *p);
 static inline bool process_has_signal(struct process *p, struct thread *t) { return ((p->sig_pending | t->sig_pending) & ~t->sigmask) != 0; }
@@ -168,6 +170,7 @@ void sem_post(struct semaphore *s);
 
 /* user process execution (exec.c) */
 int process_spawn(const char *path, int argc, char **argv, struct file *stdio[3], const char *cwd);
+int process_spawn_env(const char *path, int argc, char **argv, char *const *envp, struct file *stdio[3], const char *cwd);
 int process_spawn_app(const char *path, int argc, char **argv, const char *cwd, int app_id);
 void syscall_init(void);
 

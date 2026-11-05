@@ -1,22 +1,31 @@
 # inFlux build system
-# Targets: all (ISO), kernel, initrd, run, run-kvm, disk, clean
+# Targets: all (ISO), system (kernel + initrd, no ISO tools needed), kernel, initrd, run, run-kvm, disk, clean
+# DEVTOOLS=1 puts the developer tools bundle (build/devtools, made by tools/toolchain/build-devtools.sh:
+# gcc, binutils, make, BusyBox) into the system image at /usr, with /bin/sh, so inFlux can build itself.
 
 CC      := gcc
 LD      := gcc
 AS      := gcc
 HOSTCC  := gcc
+HOST_LDFLAGS ?=   # e.g. -static for the host tools (tools/toolchain/hermetic-build.sh)
 BUILD   := build
 ISO     := $(BUILD)/influx.iso
 KERNEL  := $(BUILD)/influx.elf
 INITRD  := $(BUILD)/initrd.tar
 LIMINE  := third_party/limine
+# build paths stay out of the debug info, so a build is the same wherever the tree is (and on inFlux)
+PREFIX_MAP := -ffile-prefix-map=$(CURDIR)/=
+# building on inFlux itself (docs/self-hosting.md): there is no xorriso, so the default is the system image
+ifeq ($(shell uname -s 2>/dev/null),inFlux)
+.DEFAULT_GOAL := system
+endif
 
 KCFLAGS := -std=gnu11 -ffreestanding -fno-stack-protector -fno-stack-check \
            -fno-lto -fno-pic -fno-pie -m64 -march=x86-64 -mabi=sysv \
            -mno-80387 -mno-mmx -mno-sse -mno-sse2 -mno-red-zone \
            -mcmodel=kernel -mgeneral-regs-only -O2 -g -fno-omit-frame-pointer \
            -Wall -Wextra -Wno-unused-parameter -Wno-unused-function -Wno-misleading-indentation -Wno-type-limits -Wno-missing-field-initializers -Wno-sign-compare -Wno-address-of-packed-member \
-           -Ikernel/include -Ithird_party/limine -MMD -MP
+           -Ikernel/include -Ithird_party/limine -MMD -MP $(PREFIX_MAP)
 # Code that may use vector registers: the OpenGL software renderer and its demo,
 # the image decoder and the SIMD kernels. inFlux requires AVX (kmain halts at the
 # boot splash without it), so these assume it; vector state is saved per thread.
@@ -38,7 +47,7 @@ MUSL      := $(abspath $(BUILD))/musl
 MUSL_LIBC := $(MUSL)/lib/libc.a
 MUSL_GCC  := $(MUSL)/bin/musl-gcc
 UCFLAGS := -std=gnu11 -static -O2 -g -mavx -Wall -Wextra -Wno-unused-parameter -Wno-misleading-indentation \
-           -Iuser/include -Igl
+           -Iuser/include -Igl $(PREFIX_MAP)
 ULIB_SRC  := $(wildcard user/lib/*.c)
 ULIB_OBJ  := $(patsubst user/lib/%.c,$(BUILD)/user/lib/%.o,$(ULIB_SRC))
 ULIB      := $(BUILD)/user/libinflux.a
@@ -55,7 +64,7 @@ UI_CFLAGS := -std=gnu11 -O2 -g -mavx -DINFLUX_USERSPACE -D_GNU_SOURCE -MMD -MP \
              -iquote user/ui/shim -iquote kernel/include -iquote user/apps/browser -Ithird_party/bearssl/inc \
              -Wall -Wextra -Wno-unused-parameter -Wno-unused-function -Wno-misleading-indentation -Wno-type-limits \
              -Wno-missing-field-initializers -Wno-sign-compare -Wno-address-of-packed-member \
-             -Wno-unused-but-set-variable -Wno-implicit-fallthrough -Wno-format-truncation
+             -Wno-unused-but-set-variable -Wno-implicit-fallthrough -Wno-format-truncation $(PREFIX_MAP)
 UI_OBJ    := $(patsubst kernel/src/%.c,$(BUILD)/user/ui/k/%.o,$(UI_KSRC)) $(patsubst user/ui/%.c,$(BUILD)/user/ui/%.o,$(UI_SRC))
 UILIB     := $(BUILD)/user/libui.a
 BROWSER_OBJ := $(patsubst user/apps/browser/%.c,$(BUILD)/user/apps/browser/%.o,$(wildcard user/apps/browser/*.c))
@@ -69,6 +78,7 @@ CA_BUNDLE   := $(BUILD)/sysroot/etc/ssl/certs/ca-certificates.crt
 # ---- assets ----
 FONTGEN := $(BUILD)/tools/fontgen
 IMGCONV := $(BUILD)/tools/imgconv
+MKINITRD := $(BUILD)/tools/mkinitrd
 SYSROOT := $(BUILD)/sysroot
 
 # name:ttf:size  -> sysroot/sys/fonts/name-size.fnt
@@ -87,19 +97,26 @@ FONT_FILES := $(foreach s,$(FONT_SPECS),$(SYSROOT)/sys/fonts/$(word 1,$(subst :,
 ICON_PNGS  := $(wildcard assets/icons/png/*.png)
 ICON_FILES := $(patsubst assets/icons/png/%.png,$(SYSROOT)/sys/icons/%.img,$(ICON_PNGS))
 
-.PHONY: all kernel initrd run run-kvm run-nogui disk clean distclean tools test test-fs
+.PHONY: all system kernel initrd run run-kvm run-nogui disk clean distclean tools test test-fs test-btrfs test-devtools
 
 all: $(ISO)
 
-tools: $(FONTGEN) $(IMGCONV)
+# what boots, without the ISO around it: build/influx.elf and build/initrd.tar
+system: $(KERNEL) $(INITRD)
+
+tools: $(FONTGEN) $(IMGCONV) $(MKINITRD)
+
+$(MKINITRD): tools/mkinitrd.c
+	@mkdir -p $(dir $@)
+	$(HOSTCC) -O2 $(HOST_LDFLAGS) -o $@ $<
 
 $(FONTGEN): tools/fontgen.c third_party/stb/stb_truetype.h
 	@mkdir -p $(dir $@)
-	$(HOSTCC) -O2 -o $@ $< -lm
+	$(HOSTCC) -O2 $(HOST_LDFLAGS) -o $@ $< -lm
 
 $(IMGCONV): tools/imgconv.c third_party/stb/stb_image.h
 	@mkdir -p $(dir $@)
-	$(HOSTCC) -O2 -o $@ $< -lm
+	$(HOSTCC) -O2 $(HOST_LDFLAGS) -o $@ $< -lm
 
 # ---- kernel ----
 kernel: $(KERNEL)
@@ -135,7 +152,7 @@ $(KERNEL): $(KOBJ) kernel/linker.ld
 # ---- userland ----
 $(MUSL_LIBC): $(shell find $(MUSL_SRC)/src $(MUSL_SRC)/include $(MUSL_SRC)/arch/x86_64 -type f 2>/dev/null)
 	@mkdir -p $(BUILD)/musl-build
-	cd $(BUILD)/musl-build && CC=$(HOSTCC) CFLAGS="-O2 -g" $(abspath $(MUSL_SRC))/configure --prefix=$(MUSL) --syslibdir=/lib >/dev/null
+	cd $(BUILD)/musl-build && CC="$(HOSTCC)" CFLAGS="-O2 -g -ffile-prefix-map=$(abspath $(MUSL_SRC))/=musl/ $(PREFIX_MAP)" $(abspath $(MUSL_SRC))/configure --prefix=$(MUSL) --syslibdir=/lib --enable-wrapper=gcc >/dev/null
 	$(MAKE) -C $(BUILD)/musl-build >/dev/null
 	$(MAKE) -C $(BUILD)/musl-build install LDSO_PATHNAME=$(MUSL)/lib/ld-musl-x86_64.so.1 >/dev/null
 	touch $@
@@ -216,17 +233,28 @@ SKEL_FILES := $(shell find sysroot -type f 2>/dev/null)
 
 initrd: $(INITRD)
 
-$(INITRD): $(FONT_FILES) $(ICON_FILES) $(UPROGS) $(UPROGS_DYN) $(UAPPS) $(LDSO) $(CA_BUNDLE) $(SKEL_FILES) $(KERNEL)
+# DEVTOOLS=1: the toolchain bundle at /usr and BusyBox's sh as /bin/sh
+ifeq ($(DEVTOOLS),1)
+DEVTOOLS_DIR := $(BUILD)/devtools
+DEVTOOLS_OVERLAY := $(BUILD)/devtools-overlay
+INITRD_ROOTS_EXTRA := $(DEVTOOLS_DIR)=usr $(DEVTOOLS_OVERLAY)
+$(DEVTOOLS_DIR)/bin/gcc:
+	@echo "DEVTOOLS=1 needs $(DEVTOOLS_DIR): run tools/toolchain/build-devtools.sh first" >&2; exit 1
+endif
+
+$(INITRD): $(FONT_FILES) $(ICON_FILES) $(UPROGS) $(UPROGS_DYN) $(UAPPS) $(LDSO) $(CA_BUNDLE) $(SKEL_FILES) $(KERNEL) $(MKINITRD) $(if $(DEVTOOLS_DIR),$(DEVTOOLS_DIR)/bin/gcc) FORCE
 	@mkdir -p $(SYSROOT)/boot/limine
 	cp -r sysroot/. $(SYSROOT)/
 	cp $(KERNEL) $(SYSROOT)/boot/influx.elf
 	nm -n $(KERNEL) | grep -i ' t ' > $(SYSROOT)/boot/influx.map
 	cp $(LIMINE)/BOOTX64.EFI $(LIMINE)/BOOTIA32.EFI $(LIMINE)/limine-bios.sys $(SYSROOT)/boot/limine/
-	tar --format=ustar --owner=0 --group=0 --mtime='2026-01-01' -C $(SYSROOT) -cf $@ .
+	$(if $(DEVTOOLS_OVERLAY),rm -rf $(DEVTOOLS_OVERLAY) && mkdir -p $(DEVTOOLS_OVERLAY)/bin && ln -s /usr/bin/busybox $(DEVTOOLS_OVERLAY)/bin/sh)
+	$(MKINITRD) $@.tmp $(SYSROOT) $(INITRD_ROOTS_EXTRA)
+	@if cmp -s $@.tmp $@; then rm $@.tmp; else mv $@.tmp $@; fi
 
 # ---- ISO ----
 $(BUILD)/limine: $(LIMINE)/limine.c
-	$(HOSTCC) -O2 -o $@ $< -Wno-unused-result
+	$(HOSTCC) -O2 $(HOST_LDFLAGS) -o $@ $< -Wno-unused-result
 
 # $(call MKISO,dir,iso): a hybrid BIOS/UEFI ISO of a staged directory
 define MKISO
@@ -252,7 +280,7 @@ $(ISO): $(KERNEL) $(INITRD) limine.conf $(BUILD)/limine
 # make test: the host-side filesystem regressions, then a headless boot that runs /bin/systest
 # (boot option 'selftest'; SELFTEST_NET=1 adds the DNS/TCP checks, which need the internet)
 SELFTEST_ISO := $(BUILD)/influx-selftest.iso
-SELFTEST_CMDLINE := selftest$(if $(SELFTEST_NET), selftest-net)$(if $(SELFTEST_FS), selftest-fs)
+SELFTEST_CMDLINE := selftest$(if $(SELFTEST_NET), selftest-net)$(if $(SELFTEST_FS), selftest-fs)$(if $(SELFTEST_BTRFS), selftest-btrfs)$(if $(SELFTEST_DEVTOOLS), selftest-devtools)
 $(SELFTEST_ISO): $(ISO) FORCE
 	rm -rf $(BUILD)/iso-selftest
 	cp -r $(BUILD)/iso $(BUILD)/iso-selftest
@@ -262,6 +290,17 @@ $(SELFTEST_ISO): $(ISO) FORCE
 test: $(SELFTEST_ISO)
 	bash tests/run-fs-regressions.sh
 	bash tests/run-selftest.sh $(SELFTEST_ISO)
+
+# make test-btrfs: `systest posix` (links, rename, modes, times) on a blank disk the kernel formats as btrfs
+test-btrfs:
+	rm -f $(BUILD)/test-btrfs.img && truncate -s 256M $(BUILD)/test-btrfs.img
+	$(MAKE) $(SELFTEST_ISO) SELFTEST_BTRFS=1
+	SELFTEST_DISK=$(BUILD)/test-btrfs.img bash tests/run-selftest.sh $(SELFTEST_ISO)
+
+# make test-devtools: a DEVTOOLS=1 image runs gcc, g++, sh and make on inFlux (needs build/devtools)
+test-devtools:
+	$(MAKE) $(SELFTEST_ISO) DEVTOOLS=1 SELFTEST_DEVTOOLS=1
+	SELFTEST_MEM=4G bash tests/run-selftest.sh $(SELFTEST_ISO)
 
 # make test-fs: the read-only ext4 driver against a volume built by mkfs.ext4 (needs e2fsprogs)
 test-fs:

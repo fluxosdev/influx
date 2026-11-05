@@ -24,6 +24,8 @@ jobs:
         run: make -j"$(nproc)"
       - name: Test
         run: SELFTEST_TIMEOUT=600 make test
+      - name: Test on btrfs (links, rename, modes, times on a volume the kernel formats)
+        run: SELFTEST_TIMEOUT=600 make test-btrfs
       - name: Keep the ISO
         if: always()
         uses: actions/upload-artifact@v4

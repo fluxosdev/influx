@@ -26,11 +26,23 @@ void initrd_unpack(const void *tar, size_t size, const char *dest) {
         snprintf(path, sizeof path, "%s/%s", dest, n);
         size_t pl = strlen(path);
         while (pl > 1 && path[pl - 1] == '/') path[--pl] = 0;
-        if (h->typeflag == '5') { if (strcmp(n, "") && strcmp(n, ".")) { vfs_mkdir(path); dirs++; } }
+        uint32_t mode = (uint32_t)octal(h->mode, 8) & 07777;
+        if (h->typeflag == '5') {
+            if (strcmp(n, "") && strcmp(n, ".")) { if (vfs_mkdir_mode(path, mode) == -EEXIST) { struct vnode *v = vfs_lookup(path); if (v) { struct vattr a = { VA_MODE, mode, 0, 0 }; vfs_setattr(v, &a); vnode_unref(v); } } dirs++; }
+            else { struct vnode *v = vfs_lookup(dest); if (v) { struct vattr a = { VA_MODE, mode, 0, 0 }; vfs_setattr(v, &a); vnode_unref(v); } }
+        }
+        else if (h->typeflag == '2' || h->typeflag == '1') {   /* symbolic link, hard link (to an earlier entry) */
+            char target[PATH_MAX];
+            snprintf(target, sizeof target, "%.100s", h->linkname);
+            int r;
+            if (h->typeflag == '2') r = vfs_symlink(target, path);
+            else { char tp[PATH_MAX]; const char *t = target; if (t[0] == '.' && t[1] == '/') t += 2; snprintf(tp, sizeof tp, "%s/%s", dest, t); r = vfs_link(tp, path); }
+            if (r == 0) files++; else kprintf("initrd: %s: cannot create link (%d)\n", path, r);
+        }
         else if (h->typeflag == '0' || h->typeflag == 0) {
             if (vfs_write_file(path, p + 512, fsize) == 0) {
                 struct vnode *v = vfs_lookup(path);
-                if (v) { v->mode = (uint32_t)octal(h->mode, 8); v->mtime = octal(h->mtime, 12); vnode_unref(v); }
+                if (v) { v->mode = mode; v->mtime = octal(h->mtime, 12); v->mtime_nsec = 0; vnode_unref(v); }
                 files++;
             }
         }

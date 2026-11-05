@@ -54,7 +54,12 @@ in `third_party`).
 - **ELF loader**: static and position-independent executables, and
   dynamically linked ones through musl's dynamic linker (`PT_INTERP`,
   `/lib/ld-musl-x86_64.so.1`), with the System V initial stack and auxiliary
-  vector
+  vector. Segments are read straight from the file. `#!` interpreter scripts
+  work, and execve needs an execute bit
+- **POSIX files** for building software:
+  - modes (umask, `chmod`) and nanosecond timestamps (`utimensat`)
+  - hard links, `rename` that replaces its target in one step, and named pipes (`mkfifo`), on tmpfs and btrfs
+  - `alarm`/`setitimer`
 - Kernel CSPRNG (ChaCha20 seeded from RDSEED/RDRAND, timing jitter and
   interrupt timing): `getrandom`, `/dev/urandom`, TCP sequence numbers
 - Timekeeping: a nanosecond monotonic clock from the invariant TSC, the wall
@@ -336,6 +341,19 @@ make run-installed-uefi  # the same under OVMF UEFI
 make test                # host filesystem regressions + a headless boot that runs /bin/systest
 make test SELFTEST_NET=1 # also DNS, TCP and HTTPS checks (needs the internet)
 make test-fs             # the ext4 driver against a volume made by mkfs.ext4
+make test-btrfs          # the POSIX file checks on a disk the kernel formats as btrfs
+make system              # just build/influx.elf and build/initrd.tar (no xorriso needed)
+```
+
+### Developer tools (building inFlux on inFlux)
+
+`docs/self-hosting.md` is the roadmap.
+
+```sh
+tools/toolchain/build-devtools.sh      # gcc, g++, binutils, make, BusyBox for inFlux -> build/devtools (20-60 min)
+tools/toolchain/hermetic-build.sh      # build inFlux on Linux with only those tools on PATH
+make DEVTOOLS=1                        # an ISO with the tools at /usr and BusyBox as /bin/sh
+make test-devtools                     # boot it and run gcc, g++, sh and make -j4 on inFlux
 ```
 
 `make test` boots the ISO with the Limine option `cmdline: selftest`: the kernel runs

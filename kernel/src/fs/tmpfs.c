@@ -13,6 +13,7 @@ struct tnode {
     struct tnode *parent;
     struct mutex lock;
     uint8_t *data; size_t cap;
+    struct tnode *target;   /* a hard link: this entry names target, whose vnode lookup returns (holds a reference) */
 };
 static struct mutex tree_lock = MUTEX_INIT;
 static uint64_t next_ino = 1;
@@ -39,7 +40,8 @@ static struct tnode *tn_new(struct tnode *parent, const char *name, int type) {
     struct tnode *t = kzalloc(sizeof *t);
     strlcpy(t->vn.name, name, sizeof t->vn.name);
     t->vn.type = type; t->vn.ops = &tmpfs_ops; t->vn.refcount = 1;   /* held by the tree */
-    t->vn.ino = next_ino++; t->vn.mtime = time_unix(); t->vn.mode = type == VN_DIR ? 0755 : type == VN_LNK ? 0777 : 0644;
+    t->vn.ino = next_ino++; vnode_touch(&t->vn); t->vn.mode = type == VN_DIR ? 0755 : type == VN_LNK ? 0777 : 0644;
+    t->vn.nlink = type == VN_DIR ? 2 : 1;
     t->vn.parent = parent ? &parent->vn : NULL;
     t->vn.fs_name = "tmpfs";
     t->parent = parent;
@@ -67,7 +69,7 @@ static int64_t write_locked(struct tnode *t, uint64_t off, const void *buf, size
     if (off > v->size) memset(t->data + v->size, 0, off - v->size);
     memcpy(t->data + off, buf, n);
     if (off + n > v->size) v->size = off + n;
-    v->mtime = time_unix();
+    vnode_touch(v);
     return n;
 }
 static int64_t t_write(struct vnode *v, uint64_t off, const void *buf, size_t n) {
@@ -90,7 +92,7 @@ static int t_truncate(struct vnode *v, uint64_t size) {
     int r = grow(t, size);
     if (r == 0) {
         if (size > v->size) memset(t->data + v->size, 0, size - v->size);
-        v->size = size; v->mtime = time_unix();
+        v->size = size; vnode_touch(v);
     }
     mutex_unlock(&t->lock);
     return r;
@@ -99,7 +101,7 @@ static struct vnode *t_lookup(struct vnode *dir, const char *name) {
     struct tnode *d = (struct tnode *)dir, *c; struct vnode *r = NULL;
     mutex_lock(&tree_lock);
     /* the reference is taken under the lock, so a concurrent unlink can't drop the last one first */
-    list_for_each_entry(c, &d->children, sibling) if (!strcmp(c->vn.name, name)) { vnode_ref(&c->vn); r = &c->vn; break; }
+    list_for_each_entry(c, &d->children, sibling) if (!strcmp(c->vn.name, name)) { struct tnode *o = c->target ? c->target : c; vnode_ref(&o->vn); r = &o->vn; break; }
     mutex_unlock(&tree_lock);
     return r;
 }
@@ -108,18 +110,20 @@ static int t_readdir(struct vnode *dir, int index, struct dirent *out) {
     mutex_lock(&tree_lock);
     list_for_each_entry(c, &d->children, sibling) {
         if (i++ == index) {
+            struct tnode *o = c->target ? c->target : c;
             strlcpy(out->name, c->vn.name, sizeof out->name);
-            out->type = c->vn.mount_root ? VN_DIR : c->vn.type; out->size = c->vn.size; out->mtime = c->vn.mtime; out->ino = c->vn.ino;
+            out->type = c->vn.mount_root ? VN_DIR : o->vn.type; out->size = o->vn.size; out->mtime = o->vn.mtime; out->ino = o->vn.ino;
             r = 0; break;
         }
     }
     mutex_unlock(&tree_lock);
     return r;
 }
-static struct vnode *t_create(struct vnode *dir, const char *name, int type) {
+static struct vnode *t_create(struct vnode *dir, const char *name, int type, uint32_t mode) {
     mutex_lock(&tree_lock);
     struct tnode *t = tn_new((struct tnode *)dir, name, type);
-    dir->mtime = time_unix();
+    if (type != VN_LNK) t->vn.mode = mode & 07777;
+    vnode_touch(dir);
     vnode_ref(&t->vn);
     mutex_unlock(&tree_lock);
     return &t->vn;
@@ -131,7 +135,9 @@ static int t_unlink(struct vnode *dir, const char *name) {
         if (!strcmp(c->vn.name, name)) {
             if (c->vn.type == VN_DIR && !list_empty(&c->children)) { r = -ENOTEMPTY; break; }
             list_del(&c->sibling); list_init(&c->sibling);
-            dir->mtime = time_unix();
+            vnode_touch(dir);
+            struct tnode *o = c->target ? c->target : c;
+            if (o->vn.nlink > 1) { o->vn.nlink--; o->vn.ctime = dir->mtime; o->vn.ctime_nsec = dir->mtime_nsec; }
             victim = c; r = 0; break;
         }
     }
@@ -141,13 +147,67 @@ static int t_unlink(struct vnode *dir, const char *name) {
     if (victim) vnode_unref(&victim->vn);
     return r;
 }
+void fifo_release_node(struct vnode *v);
 static void t_release(struct vnode *v) {
     struct tnode *t = (struct tnode *)v;
     if (t->vn.type == VN_DEV || t->vn.type == VN_BLK) return;
+    if (t->target) vnode_unref(&t->target->vn);
+    else if (t->vn.type == VN_FIFO) fifo_release_node(v);
     kfree(t->data);
     kfree(t);
 }
-static const struct vnode_ops tmpfs_ops = { t_read, t_write, t_truncate, t_lookup, t_readdir, t_create, t_unlink, NULL, t_release, NULL, t_append };
+static int t_setattr(struct vnode *v, const struct vattr *a) {
+    struct tnode *t = (struct tnode *)v;
+    mutex_lock(&t->lock);
+    if (a->valid & VA_MODE) v->mode = a->mode & 07777;
+    if (a->valid & VA_MTIME) { v->mtime = a->mtime; v->mtime_nsec = a->mtime_nsec; }
+    vfs_now(&v->ctime, &v->ctime_nsec);
+    mutex_unlock(&t->lock);
+    return 0;
+}
+static const struct vnode_ops tmpfs_ops;
+static int t_link(struct vnode *dirv, const char *name, struct vnode *target) {
+    if (target->ops != &tmpfs_ops) return -EXDEV;
+    mutex_lock(&tree_lock);
+    struct tnode *t = tn_new((struct tnode *)dirv, name, target->type);
+    next_ino--;   /* the entry has no inode of its own */
+    t->target = (struct tnode *)target;
+    vnode_ref(target);
+    target->nlink = (target->nlink ? target->nlink : 1) + 1;
+    vfs_now(&target->ctime, &target->ctime_nsec);
+    vnode_touch(dirv);
+    mutex_unlock(&tree_lock);
+    return 0;
+}
+/* the vfs has checked the replacement (types, emptiness, not the same file) */
+static int t_rename(struct vnode *odirv, const char *oname, struct vnode *ndirv, const char *nname) {
+    struct tnode *od = (struct tnode *)odirv, *nd = (struct tnode *)ndirv, *c, *src = NULL, *dst = NULL;
+    if (strlen(nname) > NAME_MAX) return -ENAMETOOLONG;
+    mutex_lock(&tree_lock);
+    list_for_each_entry(c, &od->children, sibling) if (!strcmp(c->vn.name, oname)) { src = c; break; }
+    list_for_each_entry(c, &nd->children, sibling) if (!strcmp(c->vn.name, nname)) { dst = c; break; }
+    if (!src) { mutex_unlock(&tree_lock); return -ENOENT; }
+    if (src == dst) { mutex_unlock(&tree_lock); return 0; }
+    /* a directory may not move below itself (the vfs's path check misses routes through symlinks) */
+    if (src->vn.type == VN_DIR) for (struct tnode *a = nd; a; a = a->parent) if (a == src) { mutex_unlock(&tree_lock); return -EINVAL; }
+    if (dst) {
+        if (dst->vn.type == VN_DIR && !list_empty(&dst->children)) { mutex_unlock(&tree_lock); return -ENOTEMPTY; }
+        list_del(&dst->sibling); list_init(&dst->sibling);
+        struct tnode *o = dst->target ? dst->target : dst;
+        if (o->vn.nlink > 1) o->vn.nlink--;
+    }
+    list_del(&src->sibling);
+    strlcpy(src->vn.name, nname, sizeof src->vn.name);
+    list_add_tail(&src->sibling, &nd->children);
+    src->parent = nd; src->vn.parent = &nd->vn;
+    vnode_touch(&od->vn); if (nd != od) vnode_touch(&nd->vn);
+    struct tnode *o = src->target ? src->target : src;
+    vfs_now(&o->vn.ctime, &o->vn.ctime_nsec);
+    mutex_unlock(&tree_lock);
+    if (dst) vnode_unref(&dst->vn);   /* the tree's reference, outside the lock (as in t_unlink) */
+    return 0;
+}
+static const struct vnode_ops tmpfs_ops = { t_read, t_write, t_truncate, t_lookup, t_readdir, t_create, t_unlink, NULL, t_release, NULL, t_append, NULL, t_setattr, t_link, t_rename };
 
 struct vnode *tmpfs_create_root(const char *fsname) {
     mutex_lock(&tree_lock); struct tnode *r = tn_new(NULL, "", VN_DIR); mutex_unlock(&tree_lock);

@@ -6,7 +6,7 @@ iso=${1:?usage: run-selftest.sh influx-selftest.iso}
 log=$(mktemp "${TMPDIR:-/tmp}/influx-selftest.XXXXXX.log")
 accel=(-cpu max)
 [ -w /dev/kvm ] && accel=(-enable-kvm -cpu host)
-timeout "${SELFTEST_TIMEOUT:-180}" qemu-system-x86_64 "${accel[@]}" -M q35 -m 2G -smp 2 \
+timeout "${SELFTEST_TIMEOUT:-180}" qemu-system-x86_64 "${accel[@]}" -M q35 -m "${SELFTEST_MEM:-2G}" -smp "${SELFTEST_SMP:-2}" \
     -drive "file=$iso,media=cdrom,if=none,id=cd" -device ide-cd,drive=cd \
     -netdev user,id=n0 -device e1000e,netdev=n0 \
     ${SELFTEST_DISK:+-drive file=$SELFTEST_DISK,format=raw,if=none,id=d,snapshot=on -device ahci,id=ahci -device ide-hd,drive=d,bus=ahci.0} \

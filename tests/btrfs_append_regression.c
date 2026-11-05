@@ -14,6 +14,8 @@ void *kmalloc_try(size_t n) { return malloc(n); }
 void *krealloc_try(void *p,size_t n) { return realloc(p,n); }
 void kfree(void *p) { free(p); }
 uint64_t time_unix(void) { return 0; }
+int64_t time_realtime_ns(void) { return 0; }
+int fifo_open(struct vnode *v, int flags, struct file **out) { return -ENOSYS; }
 volatile uint64_t system_ticks;
 static void *writer(void *f) { int64_t r=vfs_write(f,"X",1); return (void *)(intptr_t)r; }
 int main(void) {
