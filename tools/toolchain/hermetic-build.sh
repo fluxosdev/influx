@@ -13,6 +13,6 @@ OUT=${1:-$TOP/build/hermetic}
 [ $# -gt 0 ] && shift
 [ $# -gt 0 ] || set -- system
 exec env -i HOME=/nonexistent TERM=dumb PATH="$DT/bin" "$DT/bin/make" -C "$TOP" -j"$(nproc)" \
-    SHELL="$DT/bin/sh" BUILD="$OUT" HOST_LDFLAGS=-static "$@"
+    SHELL="$DT/bin/sh" BUILD="$OUT" HOST_LDFLAGS=-static DEVTOOLS=0 "$@"
 # (the host tools static: the bundle's gcc links dynamically against inFlux's
 #  /lib/ld-musl-x86_64.so.1, which this Linux host does not have; on inFlux it is there)

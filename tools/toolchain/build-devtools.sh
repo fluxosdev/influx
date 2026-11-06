@@ -6,14 +6,16 @@
 #
 #   tools/toolchain/build-devtools.sh [workdir]      (default: build/devtools-work)
 #
-# Output: build/devtools/ (bin, include, lib, libexec, ...: the toolchain's root, which is
-# also its sysroot) and build/devtools.tar. Needs wget, a host gcc/g++ and about 6 GB of
-# disk; m4 is built from source when the host has none. Takes 20-60 minutes.
+# `make` runs this when build/devtools is missing (DEVTOOLS=0 skips it).
+# Output: build/devtools/, or $DEVTOOLS_OUT (bin, include, lib, libexec, ...: the toolchain's
+# root, which is also its sysroot); it appears only once complete. Needs wget, git, a host
+# gcc/g++, the network and about 6 GB of disk; m4 is built from source when the host has none.
+# Takes 20-60 minutes; finished stages are kept in the work directory and not redone.
 set -eu
 
 TOP=$(cd "$(dirname "$0")/../.." && pwd)
 WORK=$(mkdir -p "${1:-$TOP/build/devtools-work}" && cd "${1:-$TOP/build/devtools-work}" && pwd)
-OUT=$TOP/build/devtools
+OUT=${DEVTOOLS_OUT:-$TOP/build/devtools}
 JOBS=${JOBS:-$(nproc)}
 TARGET=x86_64-linux-musl
 
@@ -39,7 +41,7 @@ log() { printf '\n==> %s\n' "$*"; }
 fetch() {   # fetch URL SHA256 -> $WORK/sources/<name>
     f=$WORK/sources/$(basename "$1")
     mkdir -p "$WORK/sources"
-    if [ ! -f "$f" ]; then wget -q -O "$f.part" "$1"; mv "$f.part" "$f"; fi
+    if [ ! -f "$f" ]; then wget -q --tries=5 --retry-connrefused -O "$f.part" "$1"; mv "$f.part" "$f"; fi
     echo "$2  $f" | sha256sum -c --quiet - || { echo "checksum mismatch: $f" >&2; exit 1; }
 }
 
@@ -70,6 +72,7 @@ GMP_VER = $GMP_VER
 MPC_VER = $MPC_VER
 MPFR_VER = $MPFR_VER
 COMMON_CONFIG += --disable-nls
+DL_CMD = wget --tries=5 --retry-connrefused -c -O
 GCC_CONFIG += --disable-libquadmath --disable-libitm --disable-lto --disable-libgomp
 EOF
 
@@ -125,8 +128,10 @@ if [ ! -x "$BB/busybox" ]; then
         { tail -40 "$WORK/busybox.log"; exit 1; }
 fi
 
-# ---- assemble build/devtools ----
-log "assembling $OUT"
+# ---- assemble build/devtools (in a temporary directory: $OUT appears only when complete) ----
+FINAL=$OUT
+OUT=$FINAL.tmp
+log "assembling $FINAL"
 rm -rf "$OUT"
 cp -a "$WORK/native" "$OUT"
 # drop what nothing on inFlux uses: the target-prefixed duplicates and the docs
@@ -155,5 +160,5 @@ printf '#include <string>\n#include <cstdio>\nint main(){std::string s="c++ ok";
 env -i PATH="$OUT/bin" sh -c "cd '$T' && gcc -O2 -static hello.c -o hello && ./hello && g++ -static hello.cc -o hellocc && ./hellocc &&
     gcc -O2 hello.c -o hello-dyn && readelf -l hello-dyn | grep -q 'ld-musl-x86_64.so.1' && echo 'dynamic link ok' && make --version | head -1"
 
-tar --format=ustar --owner=0 --group=0 -C "$OUT" -cf "$TOP/build/devtools.tar" .
-log "done: $OUT ($(du -sh "$OUT" | cut -f1)), $TOP/build/devtools.tar"
+rm -rf "$FINAL" && mv "$OUT" "$FINAL"
+log "done: $FINAL ($(du -sh "$FINAL" | cut -f1))"

@@ -340,6 +340,9 @@ uses [Inter](https://fonts.google.com/specimen/Inter) and the terminal uses
 Requirements (Debian/Ubuntu package names):
 
 - `gcc`, `make`, `binutils`
+- `g++`, `wget` and `git`, plus the network and about 6 GB of disk, for the developer tools: the first
+  `make` builds gcc, binutils, GNU make and BusyBox for inFlux (20-60 minutes, once). `make DEVTOOLS=0`
+  builds without them
 - `xorriso` (ISO creation)
 - `qemu-system-x86` (to run it)
 - `btrfs-progs` and `util-linux` (`mkfs.btrfs`, `sfdisk`) to create the test disks
@@ -364,9 +367,10 @@ make system              # just build/influx.elf and build/initrd.tar (no xorris
 `docs/self-hosting.md` is the roadmap.
 
 ```sh
-tools/toolchain/build-devtools.sh      # gcc, g++, binutils, make, BusyBox for inFlux -> build/devtools (20-60 min)
+tools/toolchain/build-devtools.sh      # gcc, g++, binutils, make, BusyBox for inFlux -> build/devtools (make runs it when missing)
 tools/toolchain/hermetic-build.sh      # build inFlux on Linux with only those tools on PATH
-make DEVTOOLS=1                        # an ISO with the tools as a boot module: /usr and /bin/sh (the installer puts them on the disk)
+make                                   # the ISO carries the tools as a boot module: /usr and /bin/sh,
+                                       # put on the disk by the installer (DEVTOOLS=0: without)
 make test-devtools                     # boot it and run gcc, g++, sh and make -j4 on inFlux
 ```
 

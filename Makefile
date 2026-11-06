@@ -1,8 +1,10 @@
 # inFlux build system
 # Targets: all (ISO), system (kernel + initrd, no ISO tools needed), kernel, initrd, run, run-kvm, disk, clean
-# DEVTOOLS=1 adds the developer tools bundle (build/devtools, made by tools/toolchain/build-devtools.sh:
-# gcc, binutils, make, BusyBox) as a second boot module, build/devtools.tar: /usr and /bin/sh. The live
+# The developer tools bundle (build/devtools, made by tools/toolchain/build-devtools.sh: gcc, binutils,
+# make, BusyBox) goes into the ISO as a second boot module, build/devtools.tar: /usr and /bin/sh. The live
 # system unpacks it next to the system image; the installer puts it on the installed disk as a package.
+# `make` builds the bundle first when build/devtools is missing (20-60 minutes, once; it needs the
+# network); DEVTOOLS=0 leaves the tools out and skips that.
 
 CC      := gcc
 LD      := gcc
@@ -234,13 +236,16 @@ SKEL_FILES := $(shell find sysroot -type f 2>/dev/null)
 
 initrd: $(INITRD)
 
-# DEVTOOLS=1: the toolchain bundle at /usr and BusyBox's sh as /bin/sh, as a module of its own
+# the toolchain bundle at /usr and BusyBox's sh as /bin/sh, as a module of its own
+DEVTOOLS ?= 1
 ifeq ($(DEVTOOLS),1)
 DEVTOOLS_DIR := $(BUILD)/devtools
 DEVTOOLS_OVERLAY := $(BUILD)/devtools-overlay
 DEVTOOLS_IMG := $(BUILD)/devtools.tar
 $(DEVTOOLS_DIR)/bin/gcc:
-	@echo "DEVTOOLS=1 needs $(DEVTOOLS_DIR): run tools/toolchain/build-devtools.sh first" >&2; exit 1
+	@echo "building the developer tools (gcc, binutils, make, BusyBox) into $(DEVTOOLS_DIR):"
+	@echo "this takes 20-60 minutes, once. DEVTOOLS=0 builds inFlux without them."
+	DEVTOOLS_OUT=$(abspath $(DEVTOOLS_DIR)) sh tools/toolchain/build-devtools.sh $(abspath $(BUILD))/devtools-work
 $(DEVTOOLS_IMG): $(DEVTOOLS_DIR)/bin/gcc $(MKINITRD) FORCE
 	rm -rf $(DEVTOOLS_OVERLAY) && mkdir -p $(DEVTOOLS_OVERLAY)/bin && ln -s /usr/bin/busybox $(DEVTOOLS_OVERLAY)/bin/sh
 	$(MKINITRD) $@.tmp $(DEVTOOLS_DIR)=usr $(DEVTOOLS_OVERLAY)
@@ -275,6 +280,7 @@ define MKISO
 endef
 
 $(ISO): $(KERNEL) $(INITRD) $(DEVTOOLS_IMG) $(ISO_VARIANT) limine.conf $(BUILD)/limine
+	$(if $(DEVTOOLS_IMG),,@echo "note: DEVTOOLS=0: no developer tools in the ISO")
 	rm -rf $(BUILD)/iso
 	mkdir -p $(BUILD)/iso/boot/limine $(BUILD)/iso/EFI/BOOT
 	cp $(KERNEL) $(BUILD)/iso/boot/influx.elf
